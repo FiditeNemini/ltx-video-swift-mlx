@@ -14,14 +14,16 @@ public enum AudioExporter {
     /// - Parameters:
     ///   - waveform: Stereo waveform (B, 2, samples) or (2, samples), values in [-1, 1]
     ///   - sampleRate: Sample rate in Hz (e.g., 24000)
+    ///   - audioGain: Linear gain applied before export. 1.0 = no change, 0.5 = -6 dB.
     ///   - path: Output file path (.wav)
     public static func exportToWAV(
         waveform: MLXArray,
         sampleRate: Int,
+        audioGain: Float = 1.0,
         path: String
     ) throws {
         // Extract stereo samples
-        var audio = waveform
+        var audio = audioGain != 1.0 ? waveform * audioGain : waveform
         if audio.ndim == 3 {
             audio = audio.squeezed(axis: 0)  // (2, samples)
         }

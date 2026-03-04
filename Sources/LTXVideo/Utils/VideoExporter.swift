@@ -643,6 +643,8 @@ extension VideoExporter {
     ///   - outputURL: Output file URL (must end in `.mp4`)
     /// - Returns: URL to the exported video file
     /// - Throws: ``LTXError/exportFailed(_:)`` if conversion or encoding fails
+    /// - Parameter audioGain: Linear gain applied to audio waveform before export.
+    ///   1.0 = no change, 0.5 = -6 dB, 0.25 = -12 dB. Default 1.0.
     public static func exportVideo(
         frames tensor: MLXArray,
         width: Int,
@@ -650,6 +652,7 @@ extension VideoExporter {
         fps: Double = 24.0,
         audioWaveform: MLXArray? = nil,
         audioSampleRate: Int = 24000,
+        audioGain: Float = 1.0,
         to outputURL: URL
     ) async throws -> URL {
         LTXDebug.log("exportVideo: converting tensor \(tensor.shape) to images...")
@@ -664,8 +667,10 @@ extension VideoExporter {
         let audioSamples: Data?
         let audioChannels: Int
         if let waveform = audioWaveform {
-            LTXDebug.log("exportVideo: converting audio waveform \(waveform.shape) to PCM...")
-            let (pcm, channels) = waveformToInterleavedPCM(waveform)
+            // Apply gain before PCM conversion
+            let gained = audioGain != 1.0 ? waveform * audioGain : waveform
+            LTXDebug.log("exportVideo: converting audio waveform \(waveform.shape) to PCM (gain=\(audioGain))...")
+            let (pcm, channels) = waveformToInterleavedPCM(gained)
             LTXDebug.log("exportVideo: PCM data \(pcm.count) bytes, \(channels) channels")
             audioSamples = pcm
             audioChannels = channels
@@ -700,18 +705,21 @@ extension VideoExporter {
         let numChannels = audio.dim(0)
         let numSamples = audio.dim(1)
 
-        // Clamp, scale to Int16 range, transpose to interleaved (samples, channels)
-        let clamped = MLX.clip(audio, min: -1.0, max: 1.0)
-        let scaled = (clamped * 32767.0).asType(.int16)  // (C, samples)
-        let interleaved = scaled.transposed(0, 1)  // (samples, C) — interleaved layout
+        // Clamp and convert to float32 for sample extraction
+        let clamped = MLX.clip(audio, min: -1.0, max: 1.0).asType(.float32)
+        MLX.eval(clamped)
 
-        // Force contiguous layout via reshape (transpose creates a view, not contiguous memory)
-        let contiguous = interleaved.reshaped(numSamples * numChannels)
-        MLX.eval(contiguous)
-
-        // Bulk copy — MLX int16 is already little-endian on ARM
-        let mlxData = contiguous.asData(access: .copy)
-        let pcmData = Data(mlxData.data)
+        // Build interleaved PCM: [L0, R0, L1, R1, ...]
+        // Use explicit per-sample interleaving (matches AudioExporter.exportToWAV)
+        var pcmData = Data(capacity: numSamples * numChannels * 2)
+        for i in 0..<numSamples {
+            for ch in 0..<numChannels {
+                let sample = clamped[ch, i].item(Float.self)
+                let int16Val = Int16(max(-32768, min(32767, sample * 32767.0)))
+                var le = int16Val.littleEndian
+                pcmData.append(Data(bytes: &le, count: 2))
+            }
+        }
 
         return (pcmData, numChannels)
     }

@@ -104,6 +104,9 @@ struct Generate: AsyncParsableCommand {
     @Flag(name: .long, help: "Generate audio alongside video (dual video/audio denoising)")
     var audio: Bool = false
 
+    @Option(name: .long, help: "Audio gain (linear). 1.0=unchanged, 0.5=-6dB, 0.25=-12dB (default: 1.0)")
+    var audioGain: Float = 1.0
+
     @Flag(name: .long, help: "Enable debug output")
     var debug: Bool = false
 
@@ -330,6 +333,7 @@ struct Generate: AsyncParsableCommand {
                 fps: 24.0,
                 audioWaveform: audioResult.audioWaveform,
                 audioSampleRate: audioResult.audioSampleRate,
+                audioGain: audioGain,
                 to: outputURL
             )
             print("Video+audio saved to: \(videoURL.path)")
@@ -339,6 +343,7 @@ struct Generate: AsyncParsableCommand {
             try AudioExporter.exportToWAV(
                 waveform: audioResult.audioWaveform,
                 sampleRate: audioResult.audioSampleRate,
+                audioGain: audioGain,
                 path: wavPath
             )
             print("Audio WAV saved to: \(wavPath)")

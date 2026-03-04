@@ -299,8 +299,8 @@ class GELUProjection: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // Python connector uses nn.gelu() (exact erf-based), NOT nn.gelu_approx()
-        return MLXNN.gelu(proj(x))
+        // Python connector uses GELU(approximate="tanh") via activation_fn="gelu-approximate"
+        return geluApproximate(proj(x))
     }
 }
 
