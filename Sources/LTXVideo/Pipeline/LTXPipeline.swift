@@ -1179,6 +1179,33 @@ public actor LTXPipeline {
         LTXDebug.log("[DIAG] Audio text embed: mean=\(MLX.mean(audioTextEmbeddings).item(Float.self)), std=\(MLX.std(audioTextEmbeddings).item(Float.self))")
         LTXDebug.log("[DIAG] Audio == Video embeddings: \(MLX.allClose(videoTextEmbeddings, audioTextEmbeddings, atol: 1e-5).item(Bool.self))")
 
+        // Encode negative prompt for CFG (dev model)
+        let useCFG = config.cfgScale > 1.0
+        var negVideoEmbeddings: MLXArray? = nil
+        var negAudioEmbeddings: MLXArray? = nil
+        var negTextMask: MLXArray? = nil
+
+        if useCFG {
+            let negPrompt = config.negativePrompt ?? DEFAULT_NEGATIVE_PROMPT
+            LTXDebug.log("Encoding negative prompt for audio CFG (\(negPrompt.prefix(60))...)")
+            let (negIds, negAttnMask) = tokenizePrompt(negPrompt, maxLength: textMaxLength)
+            let (_, negAllHiddenStates) = gemma(negIds, attentionMask: negAttnMask, outputHiddenStates: true)
+            guard let negStates = negAllHiddenStates else {
+                throw LTXError.generationFailed("Failed to extract negative Gemma hidden states")
+            }
+            let negOutput = textEncoder.encodeFromHiddenStates(
+                hiddenStates: negStates,
+                attentionMask: negAttnMask,
+                paddingSide: "left"
+            )
+            negVideoEmbeddings = negOutput.videoEncoding
+            negAudioEmbeddings = negOutput.audioEncoding ?? negOutput.videoEncoding
+            negTextMask = negOutput.attentionMask
+            MLX.eval(negVideoEmbeddings!, negAudioEmbeddings!, negTextMask!)
+            LTXDebug.log("[DIAG] Neg video embed: mean=\(MLX.mean(negVideoEmbeddings!).item(Float.self)), std=\(MLX.std(negVideoEmbeddings!).item(Float.self))")
+            LTXDebug.log("[DIAG] Neg audio embed: mean=\(MLX.mean(negAudioEmbeddings!).item(Float.self)), std=\(MLX.std(negAudioEmbeddings!).item(Float.self))")
+        }
+
         // Unload Gemma
         self.gemmaModel = nil
         self.tokenizer = nil
@@ -1280,23 +1307,78 @@ public actor LTXPipeline {
             let audioPatchified = audioLatentPacked.asType(.bfloat16)
 
             // Forward pass through dual transformer
-            let (videoVelPred, audioVelPred) = ltx2(
-                videoLatent: videoPatchified,
-                audioLatent: audioPatchified,
-                videoContext: videoTextEmbeddings.asType(.bfloat16),
-                audioContext: audioTextEmbeddings.asType(.bfloat16),
-                videoTimesteps: videoTimestep,
-                audioTimesteps: audioTimestep,
-                videoContextMask: textMask,
-                audioContextMask: textMask,
-                videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
-                audioNumFrames: audioNumFrames
-            )
+            var videoVelocity: MLXArray
+            var audioVelocity: MLXArray
 
-            // Unpatchify video velocity
-            let videoVelocity = unpatchify(videoVelPred, shape: latentShape).asType(.float32)
-            // Audio velocity is already in packed form (B, T, 128)
-            let audioVelocity = audioVelPred.asType(.float32)
+            if useCFG {
+                // Positive (conditional) pass
+                let (posVideoPred, posAudioPred) = ltx2(
+                    videoLatent: videoPatchified,
+                    audioLatent: audioPatchified,
+                    videoContext: videoTextEmbeddings.asType(.bfloat16),
+                    audioContext: audioTextEmbeddings.asType(.bfloat16),
+                    videoTimesteps: videoTimestep,
+                    audioTimesteps: audioTimestep,
+                    videoContextMask: textMask,
+                    audioContextMask: textMask,
+                    videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
+                    audioNumFrames: audioNumFrames
+                )
+                let posVideoVel = unpatchify(posVideoPred, shape: latentShape).asType(.float32)
+                let posAudioVel = posAudioPred.asType(.float32)
+                MLX.eval(posVideoVel, posAudioVel)
+
+                // Negative (unconditional) pass
+                let (negVideoPred, negAudioPred) = ltx2(
+                    videoLatent: videoPatchified,
+                    audioLatent: audioPatchified,
+                    videoContext: negVideoEmbeddings!.asType(.bfloat16),
+                    audioContext: negAudioEmbeddings!.asType(.bfloat16),
+                    videoTimesteps: videoTimestep,
+                    audioTimesteps: audioTimestep,
+                    videoContextMask: negTextMask!,
+                    audioContextMask: negTextMask!,
+                    videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
+                    audioNumFrames: audioNumFrames
+                )
+                let negVideoVel = unpatchify(negVideoPred, shape: latentShape).asType(.float32)
+                let negAudioVel = negAudioPred.asType(.float32)
+                MLX.eval(negVideoVel, negAudioVel)
+
+                // Apply CFG to both video and audio
+                videoVelocity = applyCFG(uncond: negVideoVel, cond: posVideoVel, guidanceScale: config.cfgScale)
+                audioVelocity = applyCFG(uncond: negAudioVel, cond: posAudioVel, guidanceScale: config.cfgScale)
+
+                // Apply guidance rescale to video (matching generateVideo() — video only)
+                if config.guidanceRescale > 0 {
+                    videoVelocity = applyGuidanceRescale(
+                        cfgOutput: videoVelocity,
+                        condOutput: posVideoVel,
+                        phi: config.guidanceRescale
+                    )
+                }
+
+                if step == 0 {
+                    LTXDebug.log("[DIAG] CFG step 0: posVideo mean=\(MLX.mean(posVideoVel).item(Float.self)), negVideo mean=\(MLX.mean(negVideoVel).item(Float.self))")
+                    LTXDebug.log("[DIAG] CFG step 0: posAudio mean=\(MLX.mean(posAudioVel).item(Float.self)), negAudio mean=\(MLX.mean(negAudioVel).item(Float.self))")
+                }
+            } else {
+                // No CFG (distilled): single pass
+                let (videoVelPred, audioVelPred) = ltx2(
+                    videoLatent: videoPatchified,
+                    audioLatent: audioPatchified,
+                    videoContext: videoTextEmbeddings.asType(.bfloat16),
+                    audioContext: audioTextEmbeddings.asType(.bfloat16),
+                    videoTimesteps: videoTimestep,
+                    audioTimesteps: audioTimestep,
+                    videoContextMask: textMask,
+                    audioContextMask: textMask,
+                    videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
+                    audioNumFrames: audioNumFrames
+                )
+                videoVelocity = unpatchify(videoVelPred, shape: latentShape).asType(.float32)
+                audioVelocity = audioVelPred.asType(.float32)
+            }
 
             // Euler step for video
             if imageLatent != nil {
