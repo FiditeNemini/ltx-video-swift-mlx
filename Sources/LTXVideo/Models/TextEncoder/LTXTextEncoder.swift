@@ -17,23 +17,28 @@ struct TextEncoderConfig: Sendable {
     let connectorHeadDim: Int
     let connectorLayers: Int
     let numRegisters: Int
+    /// Audio connector head dim (audio dim = connectorHeads × audioConnectorHeadDim)
+    let audioConnectorHeadDim: Int
 
+    /// LTX-2.3 default: 8 layers, 32 heads × 128 = 4096 video, 32 heads × 64 = 2048 audio
     static let `default` = TextEncoderConfig(
         hiddenDim: 3840,
         numGemmaLayers: 49,  // 48 layers + 1 embedding
-        connectorHeads: 30,
+        connectorHeads: 32,
         connectorHeadDim: 128,
-        connectorLayers: 2,
-        numRegisters: 128
+        connectorLayers: 8,
+        numRegisters: 128,
+        audioConnectorHeadDim: 64
     )
 
     init(
         hiddenDim: Int = 3840,
         numGemmaLayers: Int = 49,
-        connectorHeads: Int = 30,
+        connectorHeads: Int = 32,
         connectorHeadDim: Int = 128,
-        connectorLayers: Int = 2,
-        numRegisters: Int = 128
+        connectorLayers: Int = 8,
+        numRegisters: Int = 128,
+        audioConnectorHeadDim: Int = 64
     ) {
         self.hiddenDim = hiddenDim
         self.numGemmaLayers = numGemmaLayers
@@ -41,6 +46,7 @@ struct TextEncoderConfig: Sendable {
         self.connectorHeadDim = connectorHeadDim
         self.connectorLayers = connectorLayers
         self.numRegisters = numRegisters
+        self.audioConnectorHeadDim = audioConnectorHeadDim
     }
 }
 
@@ -122,66 +128,154 @@ private func normAndConcatPaddedBatch(
     return normed
 }
 
+/// V2 normalization for LTX-2.3: per-token RMS norm + rescale
+///
+/// Matches Python `norm_and_concat_per_token_rms` + `_rescale_norm`:
+/// 1. Per-token RMS normalization: x / sqrt(mean(x^2) + eps)
+/// 2. Concatenate layers: [B, T, D, L] → [B, T, D*L]
+/// 3. Zero padded positions
+/// 4. Rescale: x * sqrt(target_dim / source_dim)
+private func normAndConcatPerTokenRMS(
+    encodedText: MLXArray,
+    attentionMask: MLXArray,
+    targetDim: Int
+) -> MLXArray {
+    let shape = encodedText.shape
+    let b = shape[0]
+    let t = shape[1]
+    let d = shape[2]
+    let numLayers = shape[3]
+    let inputDtype = encodedText.dtype
+
+    // Per-token RMS norm across hidden_dim (axis=2): [B, T, D, L]
+    let x32 = encodedText.asType(.float32)
+    let variance = MLX.mean(x32 * x32, axis: 2, keepDims: true)  // [B, T, 1, L]
+    let normed = x32 * MLX.rsqrt(variance + MLXArray(Float(1e-6)))
+
+    // Reshape: [B, T, D, L] → [B, T, D*L]
+    var result = normed.reshaped([b, t, d * numLayers]).asType(inputDtype)
+
+    // Zero padded positions using attention mask [B, T] → [B, T, 1]
+    let maskBool = attentionMask .> MLXArray(Float(0.5))
+    let mask3d = maskBool.reshaped([b, t, 1])
+    result = MLX.where(mask3d, result, MLXArray.zeros(like: result))
+
+    // Rescale: x * sqrt(target_dim / source_dim)
+    // source_dim = gemma hidden_size (3840), NOT d*L (188160)
+    // Reference: encoder_configurator.py → embedding_dim = gemma_text_config.hidden_size
+    let sourceDim = d  // 3840
+    let scale = sqrt(Float(targetDim) / Float(sourceDim))
+    result = result * MLXArray(scale)
+
+    return result
+}
+
 /// Feature extractor for Gemma hidden states
 /// Projects concatenated hidden states from all layers to fixed dimension
+///
+/// LTX-2.3: separate video and audio aggregate_embed projections
+/// LTX-2: single shared aggregate_embed
 class GemmaFeaturesExtractor: Module {
     let hiddenDim: Int
     let numLayers: Int
 
-    @ModuleInfo(key: "aggregate_embed") var aggregateEmbed: Linear
+    // LTX-2.3: split into video and audio projections
+    @ModuleInfo(key: "video_aggregate_embed") var videoAggregateEmbed: Linear?
+    @ModuleInfo(key: "audio_aggregate_embed") var audioAggregateEmbed: Linear?
 
-    init(hiddenDim: Int = 3840, numLayers: Int = 49) {
+    // LTX-2 legacy: single shared projection (loaded if video/audio not present)
+    @ModuleInfo(key: "aggregate_embed") var aggregateEmbed: Linear?
+
+    init(hiddenDim: Int = 3840, numLayers: Int = 49, splitModalities: Bool = true) {
         self.hiddenDim = hiddenDim
         self.numLayers = numLayers
 
-        // Linear projection: hidden_dim * num_layers -> hidden_dim
-        self._aggregateEmbed.wrappedValue = Linear(
-            hiddenDim * numLayers,
-            hiddenDim,
-            bias: false
-        )
+        let inputDim = hiddenDim * numLayers
+
+        if splitModalities {
+            // LTX-2.3: separate video (→4096) and audio (→2048) projections
+            self._videoAggregateEmbed.wrappedValue = Linear(inputDim, 4096, bias: true)
+            self._audioAggregateEmbed.wrappedValue = Linear(inputDim, 2048, bias: true)
+        } else {
+            // LTX-2 legacy: single projection (→3840)
+            self._aggregateEmbed.wrappedValue = Linear(inputDim, hiddenDim, bias: false)
+        }
     }
 
-    /// Project concatenated hidden states
+    /// Project concatenated hidden states (uses video projection by default)
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        return aggregateEmbed(x)
+        if let videoEmbed = videoAggregateEmbed {
+            return videoEmbed(x)
+        }
+        return aggregateEmbed!(x)
+    }
+
+    /// Project for audio modality
+    func projectAudio(_ x: MLXArray) -> MLXArray {
+        if let audioEmbed = audioAggregateEmbed {
+            return audioEmbed(x)
+        }
+        // Fallback to shared embed for LTX-2
+        return aggregateEmbed!(x)
     }
 
     /// Extract features from Gemma hidden states
     ///
-    /// Runs the FE matmul (188160→3840) in float32 for numerical stability,
-    /// then casts back to input dtype. This eliminates bf16 accumulation order
-    /// differences vs Python for the large dot products (188160 multiply-accumulates).
+    /// Runs the FE matmul (188160→dim) in float32 for numerical stability,
+    /// then casts back to input dtype.
     func extractFromHiddenStates(
         hiddenStates: [MLXArray],
         attentionMask: MLXArray,
-        paddingSide: String = "left"
+        paddingSide: String = "left",
+        modality: String = "video"
     ) -> MLXArray {
         let inputDtype = hiddenStates[0].dtype
 
         // Stack all hidden states: list of [B, T, 3840] -> [B, T, 3840, 49]
         let stacked = MLX.stacked(hiddenStates, axis: -1)
 
-        // Get sequence lengths from attention mask
-        let sequenceLengths = MLX.sum(attentionMask, axis: -1).asType(.int32)
+        let normedConcat: MLXArray
+        let isV2 = videoAggregateEmbed != nil  // LTX-2.3 uses V2 normalization
 
-        // Apply per-layer normalization and concatenation (internally uses float32)
-        let normedConcat = normAndConcatPaddedBatch(
-            encodedText: stacked,
-            sequenceLengths: sequenceLengths,
-            paddingSide: paddingSide
-        )
+        if isV2 {
+            // V2: per-token RMS norm + rescale (LTX-2.3)
+            let targetDim = modality == "audio"
+                ? (audioAggregateEmbed?.weight.dim(0) ?? 2048)
+                : (videoAggregateEmbed?.weight.dim(0) ?? 4096)
+            normedConcat = normAndConcatPerTokenRMS(
+                encodedText: stacked,
+                attentionMask: attentionMask,
+                targetDim: targetDim
+            )
+        } else {
+            // V1: per-segment normalization (LTX-2.0)
+            let sequenceLengths = MLX.sum(attentionMask, axis: -1).asType(.int32)
+            normedConcat = normAndConcatPaddedBatch(
+                encodedText: stacked,
+                sequenceLengths: sequenceLengths,
+                paddingSide: paddingSide
+            )
+        }
         MLX.eval(normedConcat)
-        let ncF32 = normedConcat.asType(.float32)
-        MLX.eval(ncF32)
-        let ncMean = ncF32.mean().item(Float.self)
-        let ncVar = (ncF32 * ncF32).mean().item(Float.self)
-        LTXDebug.log("[TextEnc] After norm_concat: dtype=\(normedConcat.dtype), shape=\(normedConcat.shape), mean=\(ncMean), std=\(sqrt(ncVar - ncMean*ncMean))")
+
+        do {
+            let ncF32 = normedConcat.asType(.float32)
+            MLX.eval(ncF32)
+            let ncMean = ncF32.mean().item(Float.self)
+            let ncVar = (ncF32 * ncF32).mean().item(Float.self)
+            LTXDebug.log("[TextEnc] After norm_concat (\(isV2 ? "V2" : "V1")): dtype=\(normedConcat.dtype), shape=\(normedConcat.shape), mean=\(ncMean), std=\(sqrt(ncVar - ncMean*ncMean))")
+        }
 
         // Run FE matmul in float32 for precision (188160 multiply-accumulates per output)
-        // Cast input to float32, project, then cast back to original dtype
         let normedF32 = normedConcat.asType(.float32)
-        let projected = aggregateEmbed(normedF32)
+        let projected: MLXArray
+        if modality == "audio", let audioEmbed = audioAggregateEmbed {
+            projected = audioEmbed(normedF32)
+        } else if let videoEmbed = videoAggregateEmbed {
+            projected = videoEmbed(normedF32)
+        } else {
+            projected = aggregateEmbed!(normedF32)
+        }
         return projected.asType(inputDtype)
     }
 }
@@ -207,11 +301,15 @@ class ConnectorAttention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
+    // Gated attention (LTX-2.3): per-head gate = 2 * sigmoid(gate_logits)
+    @ModuleInfo(key: "to_gate_logits") var toGateLogits: Linear?
+
     init(
         dim: Int,
         heads: Int = 30,
         dimHead: Int = 128,
-        normEps: Float = 1e-6
+        normEps: Float = 1e-6,
+        gatedAttention: Bool = false
     ) {
         self.heads = heads
         self.dimHead = dimHead
@@ -225,6 +323,10 @@ class ConnectorAttention: Module {
         // Full inner_dim norm (3840), NOT per-head (128) — matches Python connector
         self._qNorm.wrappedValue = RMSNorm(dims: innerDim, eps: normEps)
         self._kNorm.wrappedValue = RMSNorm(dims: innerDim, eps: normEps)
+
+        if gatedAttention {
+            self._toGateLogits.wrappedValue = Linear(dim, heads, bias: true)
+        }
     }
 
     func callAsFunction(
@@ -234,6 +336,12 @@ class ConnectorAttention: Module {
     ) -> MLXArray {
         let b = x.dim(0)
         let t = x.dim(1)
+
+        // Compute gate logits from original input
+        var gateLogits: MLXArray? = nil
+        if let gateProj = toGateLogits {
+            gateLogits = gateProj(x)
+        }
 
         // Project to Q, K, V — kept flat [B, T, innerDim]
         var q = toQ(x)
@@ -261,6 +369,13 @@ class ConnectorAttention: Module {
             queries: qT, keys: kT, values: vT,
             scale: scale, mask: mask
         )
+
+        // Apply gated attention (LTX-2.3)
+        if let gl = gateLogits {
+            let gate = 2.0 * sigmoid(gl)  // (B, T, H)
+            let gateR = gate.transposed(0, 2, 1).expandedDimensions(axis: -1)  // (B, H, T, 1)
+            output = output * gateR
+        }
 
         // Transpose back and project
         output = output.transposed(0, 2, 1, 3).reshaped([b, t, innerDim])
@@ -317,7 +432,8 @@ class BasicTransformerBlock1D: Module {
         dim: Int,
         heads: Int = 30,
         dimHead: Int = 128,
-        normEps: Float = 1e-6
+        normEps: Float = 1e-6,
+        gatedAttention: Bool = false
     ) {
         self.normEps = normEps
 
@@ -325,7 +441,8 @@ class BasicTransformerBlock1D: Module {
             dim: dim,
             heads: heads,
             dimHead: dimHead,
-            normEps: normEps
+            normEps: normEps,
+            gatedAttention: gatedAttention
         )
 
         self._ff.wrappedValue = ConnectorFeedForward(dim: dim, dimOut: dim)
@@ -390,7 +507,8 @@ class Embeddings1DConnector: Module {
         positionalEmbeddingTheta: Float = 10000.0,
         positionalEmbeddingMaxPos: [Int]? = nil,
         numLearnableRegisters: Int = 128,
-        normEps: Float = 1e-6
+        normEps: Float = 1e-6,
+        gatedAttention: Bool = false
     ) {
         let computedInnerDim = numAttentionHeads * attentionHeadDim
 
@@ -407,7 +525,8 @@ class Embeddings1DConnector: Module {
                 dim: computedInnerDim,
                 heads: numAttentionHeads,
                 dimHead: attentionHeadDim,
-                normEps: normEps
+                normEps: normEps,
+                gatedAttention: gatedAttention
             )
         }
 
@@ -684,10 +803,11 @@ class VideoGemmaTextEncoderModel: Module {
 
 // MARK: - Factory Functions
 
-/// Create a text encoder with default LTX-2 configuration
+/// Create a text encoder with default LTX-2.3 configuration
 func createTextEncoder(
     config: TextEncoderConfig = .default,
-    includeAudioConnector: Bool = false
+    includeAudioConnector: Bool = false,
+    gatedAttention: Bool = true
 ) -> VideoGemmaTextEncoderModel {
     let featureExtractor = GemmaFeaturesExtractor(
         hiddenDim: config.hiddenDim,
@@ -699,17 +819,19 @@ func createTextEncoder(
         numAttentionHeads: config.connectorHeads,
         numLayers: config.connectorLayers,
         positionalEmbeddingMaxPos: [4096],
-        numLearnableRegisters: config.numRegisters
+        numLearnableRegisters: config.numRegisters,
+        gatedAttention: gatedAttention
     )
 
-    // Audio connector uses the same architecture as video connector
-    // (same dims, heads, layers, registers) but independent weights
+    // Audio connector: same heads/layers but different head dim (64 vs 128 for video)
+    // Gives audio dim = 32 × 64 = 2048 vs video dim = 32 × 128 = 4096
     let audioConnector: Embeddings1DConnector? = includeAudioConnector ? Embeddings1DConnector(
-        attentionHeadDim: config.connectorHeadDim,
+        attentionHeadDim: config.audioConnectorHeadDim,
         numAttentionHeads: config.connectorHeads,
         numLayers: config.connectorLayers,
         positionalEmbeddingMaxPos: [4096],
-        numLearnableRegisters: config.numRegisters
+        numLearnableRegisters: config.numRegisters,
+        gatedAttention: gatedAttention
     ) : nil
 
     return VideoGemmaTextEncoderModel(

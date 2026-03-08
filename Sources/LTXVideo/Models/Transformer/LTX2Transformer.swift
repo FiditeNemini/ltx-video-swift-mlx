@@ -28,7 +28,7 @@ class LTX2Transformer: Module {
     // --- Video modules (same keys as LTXTransformer) ---
     @ModuleInfo(key: "patchify_proj") var patchifyProj: Linear
     @ModuleInfo(key: "adaln_single") var adalnSingle: AdaLayerNormSingle
-    @ModuleInfo(key: "caption_projection") var captionProjection: PixArtAlphaTextProjection
+    @ModuleInfo(key: "caption_projection") var captionProjection: PixArtAlphaTextProjection?
     @ModuleInfo(key: "norm_out") var normOut: LayerNorm
     @ModuleInfo(key: "proj_out") var projOut: Linear
     @ParameterInfo(key: "scale_shift_table") var scaleShiftTable: MLXArray
@@ -38,7 +38,7 @@ class LTX2Transformer: Module {
     @ModuleInfo(key: "audio_proj_out") var audioProjOut: Linear
     @ModuleInfo(key: "audio_norm_out") var audioNormOut: LayerNorm
     @ModuleInfo(key: "audio_adaln_single") var audioTimeEmbed: AdaLayerNormSingle
-    @ModuleInfo(key: "audio_caption_projection") var audioCaptionProjection: PixArtAlphaTextProjection
+    @ModuleInfo(key: "audio_caption_projection") var audioCaptionProjection: PixArtAlphaTextProjection?
     @ParameterInfo(key: "audio_scale_shift_table") var audioScaleShiftTable: MLXArray
 
     // --- Cross-modal timestep embeddings ---
@@ -46,6 +46,10 @@ class LTX2Transformer: Module {
     @ModuleInfo(key: "av_ca_a2v_gate_adaln_single") var avCrossAttnVideoA2VGate: AdaLayerNormSingle
     @ModuleInfo(key: "av_ca_audio_scale_shift_adaln_single") var avCrossAttnAudioScaleShift: AdaLayerNormSingle
     @ModuleInfo(key: "av_ca_v2a_gate_adaln_single") var avCrossAttnAudioV2AGate: AdaLayerNormSingle
+
+    // --- Prompt AdaLN for cross-attention (LTX-2.3) ---
+    @ModuleInfo(key: "prompt_adaln_single") var promptAdalnSingle: AdaLayerNormSingle?
+    @ModuleInfo(key: "audio_prompt_adaln_single") var audioPromptAdalnSingle: AdaLayerNormSingle?
 
     // --- Dual video/audio transformer blocks ---
     @ModuleInfo(key: "transformer_blocks") var transformerBlocks: [LTX2TransformerBlock]
@@ -68,13 +72,18 @@ class LTX2Transformer: Module {
 
         let videoDim = config.innerDim
         let audioDim = config.audioInnerDim
+        let gated = config.gatedAttention
+        let crossAttnAdaLN = config.crossAttentionAdaLN
+        let numEmb = crossAttnAdaLN ? 9 : 6
 
         // --- Video ---
         self._patchifyProj.wrappedValue = Linear(config.inChannels, videoDim, bias: true)
-        self._adalnSingle.wrappedValue = AdaLayerNormSingle(innerDim: videoDim, numEmbeddings: 6)
-        self._captionProjection.wrappedValue = PixArtAlphaTextProjection(
-            inFeatures: config.captionChannels, hiddenSize: videoDim
-        )
+        self._adalnSingle.wrappedValue = AdaLayerNormSingle(innerDim: videoDim, numEmbeddings: numEmb)
+        if config.captionChannels != videoDim {
+            self._captionProjection.wrappedValue = PixArtAlphaTextProjection(
+                inFeatures: config.captionChannels, hiddenSize: videoDim
+            )
+        }
         self._normOut.wrappedValue = LayerNorm(dimensions: videoDim, eps: config.normEps, affine: false)
         self._projOut.wrappedValue = Linear(videoDim, config.outChannels)
         self._scaleShiftTable.wrappedValue = MLXArray.zeros([2, videoDim])
@@ -83,10 +92,12 @@ class LTX2Transformer: Module {
         self._audioProjIn.wrappedValue = Linear(config.audioInChannels, audioDim, bias: true)
         self._audioProjOut.wrappedValue = Linear(audioDim, config.audioOutChannels)
         self._audioNormOut.wrappedValue = LayerNorm(dimensions: audioDim, eps: config.normEps, affine: false)
-        self._audioTimeEmbed.wrappedValue = AdaLayerNormSingle(innerDim: audioDim, numEmbeddings: 6)
-        self._audioCaptionProjection.wrappedValue = PixArtAlphaTextProjection(
-            inFeatures: config.captionChannels, hiddenSize: audioDim
-        )
+        self._audioTimeEmbed.wrappedValue = AdaLayerNormSingle(innerDim: audioDim, numEmbeddings: numEmb)
+        if config.captionChannels != audioDim {
+            self._audioCaptionProjection.wrappedValue = PixArtAlphaTextProjection(
+                inFeatures: config.captionChannels, hiddenSize: audioDim
+            )
+        }
         self._audioScaleShiftTable.wrappedValue = MLXArray.zeros([2, audioDim])
 
         // --- Cross-modal timestep embeddings ---
@@ -103,6 +114,12 @@ class LTX2Transformer: Module {
             innerDim: audioDim, numEmbeddings: 1
         )
 
+        // --- Prompt AdaLN (LTX-2.3) ---
+        if crossAttnAdaLN {
+            self._promptAdalnSingle.wrappedValue = AdaLayerNormSingle(innerDim: videoDim, numEmbeddings: 2)
+            self._audioPromptAdalnSingle.wrappedValue = AdaLayerNormSingle(innerDim: audioDim, numEmbeddings: 2)
+        }
+
         // --- Transformer blocks ---
         self._transformerBlocks.wrappedValue = (0..<config.numLayers).map { _ in
             LTX2TransformerBlock(
@@ -115,7 +132,9 @@ class LTX2Transformer: Module {
                 audioHeadDim: config.audioAttentionHeadDim,
                 audioCrossAttentionDim: config.audioCrossAttentionDim,
                 ropeType: ropeType,
-                normEps: config.normEps
+                normEps: config.normEps,
+                gatedAttention: gated,
+                crossAttentionAdaLN: crossAttnAdaLN
             )
         }
     }
@@ -267,19 +286,43 @@ class LTX2Transformer: Module {
         let videoDim = config.innerDim
         let audioDim = config.audioInnerDim
 
+        let numEmb = config.crossAttentionAdaLN ? 9 : 6
+
         // --- Video preparation ---
         let videoX = patchifyProj(videoLatent)
         let scaledVideoTs = videoTimesteps * Float(config.timestepScaleMultiplier)
         let (videoTemb, videoEmbeddedTs) = adalnSingle(scaledVideoTs.flattened())
-        let videoTembReshaped = videoTemb.reshaped([batchSize, -1, 6, videoDim])
-        let projectedVideoCtx = captionProjection(videoContext).reshaped([batchSize, -1, videoDim])
+        let videoTembReshaped = videoTemb.reshaped([batchSize, -1, numEmb, videoDim])
+        let projectedVideoCtx: MLXArray
+        if let proj = captionProjection {
+            projectedVideoCtx = proj(videoContext).reshaped([batchSize, -1, videoDim])
+        } else {
+            projectedVideoCtx = videoContext.reshaped([batchSize, -1, videoDim])
+        }
 
         // --- Audio preparation ---
         let audioX = audioProjIn(audioLatent)
         let scaledAudioTs = audioTimesteps * Float(config.timestepScaleMultiplier)
         let (audioTemb, audioEmbeddedTs) = audioTimeEmbed(scaledAudioTs.flattened())
-        let audioTembReshaped = audioTemb.reshaped([batchSize, -1, 6, audioDim])
-        let projectedAudioCtx = audioCaptionProjection(audioContext).reshaped([batchSize, -1, audioDim])
+        let audioTembReshaped = audioTemb.reshaped([batchSize, -1, numEmb, audioDim])
+        let projectedAudioCtx: MLXArray
+        if let proj = audioCaptionProjection {
+            projectedAudioCtx = proj(audioContext).reshaped([batchSize, -1, audioDim])
+        } else {
+            projectedAudioCtx = audioContext.reshaped([batchSize, -1, audioDim])
+        }
+
+        // --- Prompt AdaLN for cross-attention (LTX-2.3) ---
+        var videoPromptTs: MLXArray? = nil
+        var audioPromptTs: MLXArray? = nil
+        if let promptAdaln = promptAdalnSingle {
+            let (pEmb, _) = promptAdaln(scaledVideoTs.flattened())
+            videoPromptTs = pEmb.reshaped([batchSize, -1, 2, videoDim])
+        }
+        if let audioPromptAdaln = audioPromptAdalnSingle {
+            let (apEmb, _) = audioPromptAdaln(scaledAudioTs.flattened())
+            audioPromptTs = apEmb.reshaped([batchSize, -1, 2, audioDim])
+        }
 
         // --- Cross-modal timestep embeddings ---
         // Python Diffusers uses per-token timesteps for cross-modal (not scalar).
@@ -341,7 +384,8 @@ class LTX2Transformer: Module {
             timesteps: videoTembReshaped,
             positionalEmbeddings: videoRoPE,
             contextMask: preparedVideoMask,
-            embeddedTimestep: videoEmbeddedTs
+            embeddedTimestep: videoEmbeddedTs,
+            promptTimesteps: videoPromptTs
         )
 
         var audioArgs = AudioTransformerArgs(
@@ -354,7 +398,9 @@ class LTX2Transformer: Module {
             crossVideoScaleShift: crossVideoSSFull,
             crossAudioScaleShift: crossAudioSSFull,
             crossVideoRoPE: crossVideoRoPE,
-            crossAudioRoPE: crossAudioRoPE
+            crossAudioRoPE: crossAudioRoPE,
+            videoPromptTimesteps: videoPromptTs,
+            audioPromptTimesteps: audioPromptTs
         )
 
         // --- Process through transformer blocks ---

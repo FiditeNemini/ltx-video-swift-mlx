@@ -287,23 +287,29 @@ func loadSpatialUpscaler(from weightsPath: String) throws -> SpatialUpscaler {
     var sanitized: [(String, MLXArray)] = []
 
     for (key, value) in rawWeights {
+        var newKey = key
         var newValue = value
 
+        // Python uses nn.Sequential (index 0); Swift uses named "conv" attribute
+        if newKey.hasPrefix("upsampler.0.") {
+            newKey = newKey.replacingOccurrences(of: "upsampler.0.", with: "upsampler.conv.")
+        }
+
         // Conv3d weights (5D): PyTorch (O, I, D, H, W) → MLX (O, D, H, W, I)
-        if key.contains("conv") && key.hasSuffix(".weight") && value.ndim == 5 {
+        if newKey.contains("conv") && newKey.hasSuffix(".weight") && value.ndim == 5 {
             newValue = value.transposed(0, 2, 3, 4, 1)
         }
         // Conv2d weights (4D): PyTorch (O, I, H, W) → MLX (O, H, W, I)
-        else if key.contains("conv") && key.hasSuffix(".weight") && value.ndim == 4 {
+        else if newKey.contains("conv") && newKey.hasSuffix(".weight") && value.ndim == 4 {
             newValue = value.transposed(0, 2, 3, 1)
         }
 
         // Skip blur_down_kernel (it's a fixed constant, not a learnable parameter)
-        if key.contains("blur_down") {
+        if newKey.contains("blur_down") {
             continue
         }
 
-        sanitized.append((key, newValue))
+        sanitized.append((newKey, newValue))
     }
 
     // Cast all weights to float32 (safetensors may be bfloat16)

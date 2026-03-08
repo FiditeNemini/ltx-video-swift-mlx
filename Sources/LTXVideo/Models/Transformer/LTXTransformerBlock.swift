@@ -16,7 +16,7 @@ struct TransformerArgs {
     /// Text context for cross-attention (B, S, D_ctx)
     var context: MLXArray
 
-    /// Timestep embeddings for AdaLN (B, T, 6, D)
+    /// Timestep embeddings for AdaLN (B, T, numSST, D)
     var timesteps: MLXArray
 
     /// RoPE position embeddings (cos, sin)
@@ -31,6 +31,10 @@ struct TransformerArgs {
     /// Whether this modality is enabled
     var enabled: Bool
 
+    /// Prompt timestep embeddings for cross-attention AdaLN (LTX-2.3)
+    /// Shape: (B, 1, 2, D) — shift and scale for prompt modulation
+    var promptTimesteps: MLXArray?
+
     init(
         x: MLXArray,
         context: MLXArray,
@@ -38,7 +42,8 @@ struct TransformerArgs {
         positionalEmbeddings: (cos: MLXArray, sin: MLXArray),
         contextMask: MLXArray? = nil,
         embeddedTimestep: MLXArray? = nil,
-        enabled: Bool = true
+        enabled: Bool = true,
+        promptTimesteps: MLXArray? = nil
     ) {
         self.x = x
         self.context = context
@@ -47,6 +52,7 @@ struct TransformerArgs {
         self.contextMask = contextMask
         self.embeddedTimestep = embeddedTimestep
         self.enabled = enabled
+        self.promptTimesteps = promptTimesteps
     }
 
     /// Return a new TransformerArgs with specified fields replaced
@@ -58,7 +64,8 @@ struct TransformerArgs {
             positionalEmbeddings: positionalEmbeddings,
             contextMask: contextMask,
             embeddedTimestep: embeddedTimestep,
-            enabled: enabled
+            enabled: enabled,
+            promptTimesteps: promptTimesteps
         )
     }
 }
@@ -105,13 +112,19 @@ private func residualGate(
 ///     3. Feed-forward network with AdaLN
 class BasicTransformerBlock: Module {
     let normEps: Float
+    let numSSTValues: Int  // 6 for LTX-2, 9 for LTX-2.3
 
     @ModuleInfo(key: "attn1") var attn1: LTXAttention
     @ModuleInfo(key: "attn2") var attn2: LTXAttention
     @ModuleInfo(key: "ff") var ff: LTXFeedForward
 
-    /// AdaLN scale-shift table: 6 values (scale, shift, gate) x 2 (attn, ff)
+    /// AdaLN scale-shift table: 6 or 9 values
+    /// LTX-2: [6, dim] — (shift,scale,gate) x (self-attn, ffn)
+    /// LTX-2.3: [9, dim] — (shift,scale,gate) x (self-attn, cross-attn, ffn)
     @ParameterInfo(key: "scale_shift_table") var scaleShiftTable: MLXArray
+
+    /// Cross-attention prompt modulation (LTX-2.3)
+    @ParameterInfo(key: "prompt_scale_shift_table") var promptScaleShiftTable: MLXArray?
 
     /// Cross-attention output scaling factor (1.0 = no change, >1.0 = stronger prompt adherence)
     var crossAttentionScale: Float = 1.0
@@ -128,9 +141,12 @@ class BasicTransformerBlock: Module {
         headDim: Int,
         contextDim: Int,
         ropeType: LTXRopeType = .split,
-        normEps: Float = 1e-6
+        normEps: Float = 1e-6,
+        gatedAttention: Bool = false,
+        crossAttentionAdaLN: Bool = false
     ) {
         self.normEps = normEps
+        self.numSSTValues = crossAttentionAdaLN ? 9 : 6
 
         // Self-attention
         self._attn1.wrappedValue = LTXAttention(
@@ -139,7 +155,8 @@ class BasicTransformerBlock: Module {
             heads: numHeads,
             dimHead: headDim,
             normEps: normEps,
-            ropeType: ropeType
+            ropeType: ropeType,
+            gatedAttention: gatedAttention
         )
 
         // Cross-attention
@@ -149,14 +166,20 @@ class BasicTransformerBlock: Module {
             heads: numHeads,
             dimHead: headDim,
             normEps: normEps,
-            ropeType: ropeType
+            ropeType: ropeType,
+            gatedAttention: gatedAttention
         )
 
         // Feed-forward
         self._ff.wrappedValue = LTXFeedForward(dim: dim, dimOut: dim)
 
         // AdaLN scale-shift table (kept as float32 for numerical stability)
-        self._scaleShiftTable.wrappedValue = MLXArray.zeros([6, dim])
+        self._scaleShiftTable.wrappedValue = MLXArray.zeros([numSSTValues, dim])
+
+        // Cross-attention prompt modulation (LTX-2.3)
+        if crossAttentionAdaLN {
+            self._promptScaleShiftTable.wrappedValue = MLXArray.zeros([2, dim])
+        }
     }
 
     /// Get adaptive normalization values from timestep embedding
@@ -187,7 +210,7 @@ class BasicTransformerBlock: Module {
     func callAsFunction(_ args: TransformerArgs) -> TransformerArgs {
         var x = args.x
 
-        // Get AdaLN values for self-attention
+        // Get AdaLN values for self-attention (indices 0-2)
         let (shiftMSA, scaleMSA, gateMSA) = getAdaValues(
             batchSize: x.dim(0),
             timestep: args.timesteps,
@@ -202,23 +225,55 @@ class BasicTransformerBlock: Module {
             x = residualGate(x, residual: attnOut, gate: gateMSA)
         }
 
-        // Cross-attention (no pre-norm, matching Diffusers — qNorm inside attn2 handles Q normalization)
-        var crossOut = attn2(
-            x,
-            context: args.context,
-            mask: args.contextMask
-        )
-        if crossAttentionScale != 1.0 {
-            crossOut = crossOut * MLXArray(crossAttentionScale)
+        // Cross-attention
+        if numSSTValues == 9 {
+            // LTX-2.3: cross-attention with AdaLN on both query and context
+            // Reference: slice(6, 9) — cross-attention uses SST indices 6,7,8
+            let (shiftCA, scaleCA, gateCA) = getAdaValues(
+                batchSize: x.dim(0),
+                timestep: args.timesteps,
+                start: 6,
+                end: 9
+            )
+
+            // Modulate query with AdaLN
+            let normXCA = adaln(x, scale: scaleCA, shift: shiftCA, eps: normEps)
+
+            // Modulate context with prompt AdaLN
+            var ctx = args.context
+            if let promptSST = promptScaleShiftTable, let promptTs = args.promptTimesteps {
+                let promptMod = promptSST.reshaped([1, 1, 2, -1]) + promptTs
+                let promptShift = promptMod[0..., 0..., 0, 0...]
+                let promptScale = promptMod[0..., 0..., 1, 0...]
+                ctx = ctx * (1 + promptScale) + promptShift
+            }
+
+            var crossOut = attn2(normXCA, context: ctx, mask: args.contextMask)
+            if crossAttentionScale != 1.0 {
+                crossOut = crossOut * MLXArray(crossAttentionScale)
+            }
+            x = x + crossOut * gateCA
+        } else {
+            // LTX-2: cross-attention without AdaLN (qNorm inside attn2 handles Q normalization)
+            var crossOut = attn2(
+                x,
+                context: args.context,
+                mask: args.contextMask
+            )
+            if crossAttentionScale != 1.0 {
+                crossOut = crossOut * MLXArray(crossAttentionScale)
+            }
+            x = x + crossOut
         }
-        x = x + crossOut
 
         // Get AdaLN values for FFN
+        // Reference: slice(3, 6) — FFN uses SST indices 3,4,5 (both LTX-2 and LTX-2.3)
+        let ffStart = 3
         let (shiftMLP, scaleMLP, gateMLP) = getAdaValues(
             batchSize: x.dim(0),
             timestep: args.timesteps,
-            start: 3,
-            end: 6
+            start: ffStart,
+            end: ffStart + 3
         )
 
         // Feed-forward with AdaLN (skipped during STG perturbed pass if configured)

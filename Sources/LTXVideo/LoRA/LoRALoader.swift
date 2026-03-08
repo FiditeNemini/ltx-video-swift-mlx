@@ -242,6 +242,52 @@ struct LoRAKeyMapper {
         return key
     }
 
+    /// Inverse mapping: Swift model path → LoRA save key (ComfyUI/Diffusers format)
+    ///
+    /// This is the reverse of `loraKeyToModelKey()`, used when saving trained LoRA weights.
+    ///
+    /// Transformations applied:
+    ///   1. Remove trailing ".weight" suffix
+    ///   2. Replace ".ff.project_in.proj" with ".ff.net.0.proj"
+    ///   3. Replace ".ff.project_out" with ".ff.net.2"
+    ///   4. Replace ".to_out" with ".to_out.0" (add Sequential index)
+    ///   5. Replace ".emb." with ".emb.timestep_embedder."
+    ///   6. Add "diffusion_model." prefix
+    ///
+    /// For LoRALinear paths, strips the intermediate component names
+    /// (e.g., "transformer_blocks.0.attn1.to_q" from the full path).
+    static func modelKeyToLoraKey(_ swiftPath: String) -> String {
+        var key = swiftPath
+
+        // Strip ".lora_down" / ".lora_up" / ".base" suffixes from LoRALinear paths
+        // The path from extractLoRAWeights is the module path, not parameter path
+        // e.g., "transformer_blocks.0.attn1.to_q" (not "...to_q.lora_down")
+
+        // 1. Remove ".weight" suffix if present
+        if key.hasSuffix(".weight") {
+            key = String(key.dropLast(".weight".count))
+        }
+
+        // 2. ff.project_in.proj → ff.net.0.proj
+        key = key.replacingOccurrences(of: ".ff.project_in.proj", with: ".ff.net.0.proj")
+
+        // 3. ff.project_out → ff.net.2
+        key = key.replacingOccurrences(of: ".ff.project_out", with: ".ff.net.2")
+
+        // 4. to_out → to_out.0
+        key = key.replacingOccurrences(of: ".to_out", with: ".to_out.0")
+
+        // 5. emb. → emb.timestep_embedder.
+        key = key.replacingOccurrences(of: ".emb.", with: ".emb.timestep_embedder.")
+
+        // 6. Add diffusion_model. prefix
+        if !key.hasPrefix("diffusion_model.") {
+            key = "diffusion_model." + key
+        }
+
+        return key
+    }
+
     /// Legacy camelCase mapper (not used for LoRA fusion, kept for reference)
     static func mapKey(_ pythonKey: String) -> String {
         var key = pythonKey

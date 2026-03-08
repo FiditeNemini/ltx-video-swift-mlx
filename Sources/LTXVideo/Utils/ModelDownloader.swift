@@ -422,11 +422,8 @@ public actor ModelDownloader {
     /// Download all components needed for generation
     ///
     /// Downloads (if not already cached):
-    /// 1. Text encoder (Gemma 3 12B)
-    /// 2. Tokenizer
-    /// 3. Connector weights
-    /// 4. VAE weights
-    /// 5. Unified weights (for transformer)
+    /// 1. VLM Gemma (text encoder + tokenizer)
+    /// 2. Unified weights (transformer + VAE + connector in one file)
     ///
     /// - Parameters:
     ///   - model: The model variant
@@ -441,49 +438,37 @@ public actor ModelDownloader {
         let vlmDir = try await downloadVLMGemma { p in
             progress?(DownloadProgress(progress: p.progress * 0.4, currentFile: p.currentFile, message: p.message))
         }
-        let textEncoderDir = vlmDir
-        let tokenizerDir = vlmDir
-
-        let connectorPath = try await downloadConnector(model: model) { p in
-            progress?(DownloadProgress(progress: 0.45 + p.progress * 0.1, currentFile: p.currentFile, message: p.message))
-        }
-
-        let vaePath = try await downloadVAE(model: model) { p in
-            progress?(DownloadProgress(progress: 0.55 + p.progress * 0.05, currentFile: p.currentFile, message: p.message))
-        }
 
         let unifiedPath = try await downloadUnifiedWeights(model: model) { p in
-            progress?(DownloadProgress(progress: 0.6 + p.progress * 0.4, currentFile: p.currentFile, message: p.message))
+            progress?(DownloadProgress(progress: 0.4 + p.progress * 0.6, currentFile: p.currentFile, message: p.message))
         }
 
         progress?(DownloadProgress(progress: 1.0, message: "All components downloaded"))
 
         return LTXComponentPaths(
-            textEncoderDir: textEncoderDir,
-            tokenizerDir: tokenizerDir,
-            connectorPath: connectorPath,
-            vaePath: vaePath,
+            textEncoderDir: vlmDir,
+            tokenizerDir: vlmDir,
             unifiedWeightsPath: unifiedPath
         )
     }
 
     // MARK: - Upscaler & LoRA Downloads
 
-    /// Spatial upscaler filename on HuggingFace
-    public static let spatialUpscalerFilename = "latent_upsampler/diffusion_pytorch_model.safetensors"
+    /// Spatial upscaler filename on HuggingFace (LTX-2.3 x2 upscaler)
+    public static let spatialUpscalerFilename = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
 
     /// Distilled LoRA filename on HuggingFace
-    public static let distilledLoRAFilename = "ltx-2-19b-distilled-lora-384.safetensors"
+    public static let distilledLoRAFilename = "ltx-2.3-22b-distilled-lora-384.safetensors"
 
     /// Download spatial upscaler weights
     public func downloadUpscalerWeights(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
-        let repoId = "Lightricks/LTX-2"
+        let repoId = "Lightricks/LTX-2.3"
         let filename = Self.spatialUpscalerFilename
 
         let weightsDir = cacheDirectory.appendingPathComponent("ltx-upscaler")
-        let destination = weightsDir.appendingPathComponent("diffusion_pytorch_model.safetensors")
+        let destination = weightsDir.appendingPathComponent(filename)
 
         if FileManager.default.fileExists(atPath: destination.path) {
             progress?(DownloadProgress(progress: 1.0, message: "Upscaler weights already downloaded"))
@@ -498,7 +483,7 @@ public actor ModelDownloader {
 
     /// Check if spatial upscaler weights are downloaded
     public func isUpscalerDownloaded() -> Bool {
-        let destination = cacheDirectory.appendingPathComponent("ltx-upscaler/diffusion_pytorch_model.safetensors")
+        let destination = cacheDirectory.appendingPathComponent("ltx-upscaler/\(Self.spatialUpscalerFilename)")
         return FileManager.default.fileExists(atPath: destination.path)
     }
 
@@ -506,7 +491,7 @@ public actor ModelDownloader {
     public func downloadDistilledLoRA(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
-        let repoId = "Lightricks/LTX-2"
+        let repoId = "Lightricks/LTX-2.3"
         let filename = Self.distilledLoRAFilename
 
         let weightsDir = cacheDirectory.appendingPathComponent("ltx-lora")
@@ -556,17 +541,13 @@ public actor ModelDownloader {
 
 // MARK: - Component Paths
 
-/// Paths to all downloaded LTX-2 components
+/// Paths to all downloaded LTX-2.3 components
 public struct LTXComponentPaths: Sendable {
     /// Directory containing Gemma text encoder weights (VLM Gemma, shared)
     public let textEncoderDir: URL
     /// Directory containing tokenizer files (same as textEncoderDir for VLM Gemma)
     public let tokenizerDir: URL
-    /// Path to connector safetensors file
-    public let connectorPath: URL
-    /// Path to VAE safetensors file
-    public let vaePath: URL
-    /// Path to unified weights file (used for transformer)
+    /// Path to unified weights file (contains transformer + VAE + connector)
     public let unifiedWeightsPath: URL
 }
 
@@ -804,6 +785,7 @@ class LTXWeightLoader {
 
     /// Map VAE weight keys from safetensors to Swift module paths
     ///
+    /// LTX-2.3 format: flat `up_blocks.{0-8}` with dots → `up_blocks_{0-8}` with underscores
     /// Uses `removeValue(forKey:)` to free source weights progressively.
     static func mapVAEWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
         var source = weights
@@ -826,16 +808,6 @@ class LTXWeightLoader {
                 continue
             }
 
-            // Handle Diffusers latents_mean/latents_std
-            if key == "latents_mean" {
-                mapped["mean_of_means"] = value.squeezed()
-                continue
-            }
-            if key == "latents_std" {
-                mapped["std_of_means"] = value.squeezed()
-                continue
-            }
-
             var newKey = key
 
             // Remove decoder. prefix
@@ -843,40 +815,8 @@ class LTXWeightLoader {
                 newKey = String(newKey.dropFirst("decoder.".count))
             }
 
-            // Diffusers VAE structure has 3 up_blocks each containing resnets + upsamplers.
-            // Swift VideoDecoder has 7 flat blocks:
-            //   up_blocks_0 = VAEResBlockGroup (mid_block resnets)
-            //   up_blocks_1 = VAEDepthToSpaceUpsample3d (up_blocks.0 upsampler)
-            //   up_blocks_2 = VAEResBlockGroup (up_blocks.0 resnets)
-            //   up_blocks_3 = VAEDepthToSpaceUpsample3d (up_blocks.1 upsampler)
-            //   up_blocks_4 = VAEResBlockGroup (up_blocks.1 resnets)
-            //   up_blocks_5 = VAEDepthToSpaceUpsample3d (up_blocks.2 upsampler)
-            //   up_blocks_6 = VAEResBlockGroup (up_blocks.2 resnets)
-
-            // Map mid_block → up_blocks_0
-            if newKey.hasPrefix("mid_block.") {
-                newKey = "up_blocks_0." + String(newKey.dropFirst("mid_block.".count))
-            }
-            // Map Diffusers up_blocks.{i}.upsamplers.0.conv.* → up_blocks_{2i+1}.conv.*
-            // Map Diffusers up_blocks.{i}.resnets.* → up_blocks_{2i+2}.resnets.*
-            else {
-                for i in 0...2 {
-                    let upsamplerPrefix = "up_blocks.\(i).upsamplers.0."
-                    let resnetPrefix = "up_blocks.\(i).resnets."
-                    if newKey.hasPrefix(upsamplerPrefix) {
-                        let suffix = String(newKey.dropFirst(upsamplerPrefix.count))
-                        newKey = "up_blocks_\(2*i + 1).\(suffix)"
-                        break
-                    } else if newKey.hasPrefix(resnetPrefix) {
-                        let suffix = String(newKey.dropFirst(resnetPrefix.count))
-                        newKey = "up_blocks_\(2*i + 2).resnets.\(suffix)"
-                        break
-                    }
-                }
-            }
-
-            // Handle legacy format: up_blocks.{i}. → up_blocks_{i}. (for unified weights)
-            for i in 0...6 {
+            // LTX-2.3: flat up_blocks.{i}. → up_blocks_{i}. (9 blocks, 0-8)
+            for i in 0...8 {
                 let src = "up_blocks.\(i)."
                 if newKey.hasPrefix(src) {
                     newKey = "up_blocks_\(i)." + String(newKey.dropFirst(src.count))
@@ -884,7 +824,7 @@ class LTXWeightLoader {
                 }
             }
 
-            // Diffusers uses "resnets" but Swift VAEResBlockGroup uses @ModuleInfo(key: "res_blocks")
+            // "resnets" → "res_blocks" (weight key vs Swift @ModuleInfo key)
             newKey = newKey.replacingOccurrences(of: ".resnets.", with: ".res_blocks.")
 
             mapped[newKey] = value
@@ -1327,6 +1267,29 @@ class LTXWeightLoader {
 
         _ = model.update(parameters: ModuleParameters.unflattened(updates))
         LTXDebug.log("Applied \(updates.count) weights to VAE Encoder (\(notFound) unmatched)")
+    }
+
+    /// Load VAE encoder weights from the unified safetensors file
+    ///
+    /// Extracts keys with `vae.encoder.` prefix from the unified file.
+    static func loadVAEEncoderWeightsFromUnified(from path: String) throws -> [String: MLXArray] {
+        LTXDebug.log("Loading VAE encoder weights from unified file: \(path)")
+
+        let allWeights = try loadArrays(url: URL(fileURLWithPath: path))
+        LTXDebug.log("Loaded \(allWeights.count) total tensors")
+
+        // Extract vae.encoder.* keys and strip "vae." prefix so they become "encoder.*"
+        // which mapVAEEncoderWeights expects
+        var encoderWeights: [String: MLXArray] = [:]
+        for (key, value) in allWeights {
+            if key.hasPrefix("vae.encoder.") {
+                encoderWeights["encoder." + String(key.dropFirst("vae.encoder.".count))] = value
+            }
+        }
+
+        let mapped = mapVAEEncoderWeights(encoderWeights)
+        LTXDebug.log("Extracted \(mapped.count) VAE encoder weights from unified file")
+        return mapped
     }
 
     // MARK: - Unified File Splitting

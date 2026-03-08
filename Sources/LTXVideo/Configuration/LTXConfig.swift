@@ -5,25 +5,25 @@ import Foundation
 
 // MARK: - Model Selection
 
-/// LTX-2 model variants
+/// LTX-2.3 model variants
 ///
-/// Uses HuggingFace Diffusers format with per-component weight files:
-/// - `transformer/` — sharded safetensors for the diffusion transformer
-/// - `vae/` — standalone VAE decoder weights
-/// - `connectors/` — text encoder connector weights
-/// - `text_encoder/` — Gemma 3 12B sharded weights
-/// - `tokenizer/` — Gemma tokenizer files
+/// Uses unified safetensors format from `Lightricks/LTX-2.3`:
+/// - `ltx-2.3-22b-dev.safetensors` — Full dev model (transformer + VAE + connector)
+/// - `ltx-2.3-22b-distilled.safetensors` — Distilled model
+///
+/// Audio VAE and vocoder are downloaded from `Lightricks/LTX-2` (shared components).
+/// VLM Gemma is shared across all variants (`mlx-community/gemma-3-12b-it-qat-4bit`).
 public enum LTXModel: String, CaseIterable, Sendable {
-    /// LTX-2 Dev - Full model, 40 steps, CFG guidance, highest quality
+    /// LTX-2.3 Dev - Full model, 30 steps, CFG guidance, highest quality
     case dev = "dev"
 
-    /// LTX-2 Distilled - Faster model, 8 steps, no CFG
+    /// LTX-2.3 Distilled - Faster model, 8 steps, no CFG
     case distilled = "distilled"
 
     public var displayName: String {
         switch self {
-        case .dev: return "LTX-2 Dev (~25GB)"
-        case .distilled: return "LTX-2 Distilled (~16GB)"
+        case .dev: return "LTX-2.3 Dev (~46GB)"
+        case .distilled: return "LTX-2.3 Distilled (~46GB)"
         }
     }
 
@@ -35,7 +35,7 @@ public enum LTXModel: String, CaseIterable, Sendable {
     /// Default number of inference steps
     public var defaultSteps: Int {
         switch self {
-        case .dev: return 40
+        case .dev: return 30
         case .distilled: return 8
         }
     }
@@ -43,37 +43,43 @@ public enum LTXModel: String, CaseIterable, Sendable {
     /// Default guidance scale
     public var defaultGuidance: Float {
         switch self {
-        case .dev: return 4.0
+        case .dev: return 3.0
         case .distilled: return 1.0
+        }
+    }
+
+    /// Default STG scale
+    public var defaultSTGScale: Float {
+        switch self {
+        case .dev: return 1.0
+        case .distilled: return 0.0
         }
     }
 
     /// Estimated VRAM usage in GB (with 3-phase loading)
     public var estimatedVRAM: Int {
         switch self {
-        case .dev: return 25
-        case .distilled: return 16
+        case .dev: return 46
+        case .distilled: return 46
         }
     }
 
     /// HuggingFace repository for this model
-    /// Both variants use the official Lightricks repo — only the unified weights filename differs.
     public var huggingFaceRepo: String {
-        return "Lightricks/LTX-2"
+        return "Lightricks/LTX-2.3"
     }
 
     /// Unified weights filename (single file containing transformer, VAE, connector)
-    /// Used as a fallback when per-component files aren't available.
     public var unifiedWeightsFilename: String {
         switch self {
-        case .dev: return "ltx-2-19b-dev.safetensors"
-        case .distilled: return "ltx-2-19b-distilled.safetensors"
+        case .dev: return "ltx-2.3-22b-dev.safetensors"
+        case .distilled: return "ltx-2.3-22b-distilled.safetensors"
         }
     }
 
     /// Get the transformer configuration for this model
     public var transformerConfig: LTXTransformerConfig {
-        return .default
+        return .ltx23
     }
 }
 
@@ -119,6 +125,12 @@ public struct LTXTransformerConfig: Codable, Sendable {
     /// Layer norm epsilon
     public var normEps: Float
 
+    /// LTX-2.3: enable gated attention (to_gate_logits per attention head)
+    public var gatedAttention: Bool
+
+    /// LTX-2.3: enable cross-attention AdaLN (prompt_adaln_single + prompt_scale_shift_table)
+    public var crossAttentionAdaLN: Bool
+
     public init(
         numLayers: Int = 48,
         numAttentionHeads: Int = 32,
@@ -135,7 +147,9 @@ public struct LTXTransformerConfig: Codable, Sendable {
         audioAttentionHeadDim: Int = 64,
         audioInChannels: Int = 128,
         audioOutChannels: Int = 128,
-        audioMaxPos: [Int] = [20]
+        audioMaxPos: [Int] = [20],
+        gatedAttention: Bool = false,
+        crossAttentionAdaLN: Bool = false
     ) {
         self.numLayers = numLayers
         self.numAttentionHeads = numAttentionHeads
@@ -153,6 +167,8 @@ public struct LTXTransformerConfig: Codable, Sendable {
         self.audioInChannels = audioInChannels
         self.audioOutChannels = audioOutChannels
         self.audioMaxPos = audioMaxPos
+        self.gatedAttention = gatedAttention
+        self.crossAttentionAdaLN = crossAttentionAdaLN
     }
 
     // MARK: - Audio Configuration
@@ -172,8 +188,18 @@ public struct LTXTransformerConfig: Codable, Sendable {
     /// Audio RoPE max positions
     public var audioMaxPos: [Int]
 
-    /// Default LTX-2 configuration
-    public static let `default` = LTXTransformerConfig()
+    /// Default LTX-2 configuration (legacy, gated attention off)
+    public static let `default` = LTXTransformerConfig(
+        gatedAttention: false,
+        crossAttentionAdaLN: false
+    )
+
+    /// LTX-2.3 configuration (gated attention + cross-attention AdaLN, no caption projection)
+    public static let ltx23 = LTXTransformerConfig(
+        captionChannels: 4096,
+        gatedAttention: true,
+        crossAttentionAdaLN: true
+    )
 }
 
 extension LTXTransformerConfig: CustomStringConvertible {
@@ -278,11 +304,11 @@ public struct LTXVideoGenerationConfig: Sendable {
         cfgScale: Float = 1.0,
         seed: UInt64? = nil,
         negativePrompt: String? = nil,
-        guidanceRescale: Float = 0.0,
+        guidanceRescale: Float = 0.7,
         crossAttentionScale: Float = 1.0,
         geGamma: Float = 0.0,
         stgScale: Float = 0.0,
-        stgBlocks: [Int] = [29],
+        stgBlocks: [Int] = [28],
         twoStage: Bool = false,
         enhancePrompt: Bool = false,
         imagePath: String? = nil,
@@ -299,6 +325,47 @@ public struct LTXVideoGenerationConfig: Sendable {
         self.crossAttentionScale = crossAttentionScale
         self.geGamma = geGamma
         self.stgScale = stgScale
+        self.stgBlocks = stgBlocks
+        self.twoStage = twoStage
+        self.enhancePrompt = enhancePrompt
+        self.imagePath = imagePath
+        self.imageCondNoiseScale = imageCondNoiseScale
+    }
+
+    /// Convenience initializer that applies model-specific defaults for steps, CFG, and STG.
+    ///
+    /// Use this when building product integrations to get correct defaults per model variant.
+    /// Explicit parameter values override model defaults.
+    public init(
+        model: LTXModel,
+        width: Int = 704,
+        height: Int = 480,
+        numFrames: Int = 121,
+        numSteps: Int? = nil,
+        cfgScale: Float? = nil,
+        seed: UInt64? = nil,
+        negativePrompt: String? = nil,
+        guidanceRescale: Float = 0.7,
+        crossAttentionScale: Float = 1.0,
+        geGamma: Float = 0.0,
+        stgScale: Float? = nil,
+        stgBlocks: [Int] = [28],
+        twoStage: Bool = false,
+        enhancePrompt: Bool = false,
+        imagePath: String? = nil,
+        imageCondNoiseScale: Float = 0.0
+    ) {
+        self.width = width
+        self.height = height
+        self.numFrames = numFrames
+        self.numSteps = numSteps ?? model.defaultSteps
+        self.cfgScale = cfgScale ?? model.defaultGuidance
+        self.seed = seed
+        self.negativePrompt = negativePrompt
+        self.guidanceRescale = guidanceRescale
+        self.crossAttentionScale = crossAttentionScale
+        self.geGamma = geGamma
+        self.stgScale = stgScale ?? model.defaultSTGScale
         self.stgBlocks = stgBlocks
         self.twoStage = twoStage
         self.enhancePrompt = enhancePrompt

@@ -36,8 +36,8 @@ class LTXTransformer: Module {
     // AdaLN for timestep
     @ModuleInfo(key: "adaln_single") var adalnSingle: AdaLayerNormSingle
 
-    // Caption projection
-    @ModuleInfo(key: "caption_projection") var captionProjection: PixArtAlphaTextProjection
+    // Caption projection (nil for LTX-2.3 where connector already outputs innerDim)
+    @ModuleInfo(key: "caption_projection") var captionProjection: PixArtAlphaTextProjection?
 
     // Transformer blocks
     @ModuleInfo(key: "transformer_blocks") var transformerBlocks: [BasicTransformerBlock]
@@ -48,6 +48,9 @@ class LTXTransformer: Module {
 
     // Scale-shift table for output
     @ParameterInfo(key: "scale_shift_table") var scaleShiftTable: MLXArray
+
+    // Prompt AdaLN for cross-attention (LTX-2.3)
+    @ModuleInfo(key: "prompt_adaln_single") var promptAdalnSingle: AdaLayerNormSingle?
 
     init(
         config: LTXTransformerConfig = .default,
@@ -72,14 +75,23 @@ class LTXTransformer: Module {
         // Input projection: project latent channels to inner dimension
         self._patchifyProj.wrappedValue = Linear(config.inChannels, innerDim, bias: true)
 
-        // AdaLN for timestep (6 embeddings: scale, shift, gate for self-attn and ffn)
-        self._adalnSingle.wrappedValue = AdaLayerNormSingle(innerDim: innerDim, numEmbeddings: 6)
+        // AdaLN for timestep
+        let numEmb = config.crossAttentionAdaLN ? 9 : 6
+        self._adalnSingle.wrappedValue = AdaLayerNormSingle(innerDim: innerDim, numEmbeddings: numEmb)
 
-        // Caption projection: Gemma 3840 -> inner dim 4096
-        self._captionProjection.wrappedValue = PixArtAlphaTextProjection(
-            inFeatures: config.captionChannels,
-            hiddenSize: innerDim
-        )
+        // Caption projection: Gemma dim -> inner dim
+        // LTX-2.3: connector outputs 4096 directly (== innerDim), no projection needed
+        if config.captionChannels != innerDim {
+            self._captionProjection.wrappedValue = PixArtAlphaTextProjection(
+                inFeatures: config.captionChannels,
+                hiddenSize: innerDim
+            )
+        }
+
+        // Prompt AdaLN (LTX-2.3)
+        if config.crossAttentionAdaLN {
+            self._promptAdalnSingle.wrappedValue = AdaLayerNormSingle(innerDim: innerDim, numEmbeddings: 2)
+        }
 
         // Transformer blocks
         self._transformerBlocks.wrappedValue = (0..<config.numLayers).map { _ in
@@ -89,7 +101,9 @@ class LTXTransformer: Module {
                 headDim: config.attentionHeadDim,
                 contextDim: config.crossAttentionDim,
                 ropeType: ropeType,
-                normEps: config.normEps
+                normEps: config.normEps,
+                gatedAttention: config.gatedAttention,
+                crossAttentionAdaLN: config.crossAttentionAdaLN
             )
         }
 
@@ -114,7 +128,7 @@ class LTXTransformer: Module {
         let (emb, embeddedTimestep) = adalnSingle(scaledTimestep.flattened())
 
         // Reshape emb to (B, num_tokens, num_embeddings, inner_dim)
-        let numEmbeddings = 6
+        let numEmbeddings = config.crossAttentionAdaLN ? 9 : 6
         let reshapedEmb = emb.reshaped([batchSize, -1, numEmbeddings, config.innerDim])
 
         // Reshape embedded_timestep to (B, num_tokens, inner_dim)
@@ -128,7 +142,12 @@ class LTXTransformer: Module {
         context: MLXArray,
         batchSize: Int
     ) -> MLXArray {
-        var projected = captionProjection(context)
+        var projected: MLXArray
+        if let proj = captionProjection {
+            projected = proj(context)
+        } else {
+            projected = context
+        }
         projected = projected.reshaped([batchSize, -1, config.innerDim])
         return projected
     }
@@ -254,7 +273,7 @@ class LTXTransformer: Module {
         let dumpMode = LTXTransformer.dumpNextForwardPass
 
         // Project latents to inner dimension
-        var x = patchifyProj(latent)
+        let x = patchifyProj(latent)
         eval(x)
         var now = Date()
         LTXDebug.log("  [TIME] patchifyProj: \(String(format: "%.3f", now.timeIntervalSince(lastTime)))s")
@@ -346,6 +365,14 @@ class LTXTransformer: Module {
             print("[DUMP] RoPE sin [0,0,0,-5:]=\(sinH0Tail.asArray(Float.self))")
         }
 
+        // Compute prompt timestep embeddings for cross-attention AdaLN (LTX-2.3)
+        var promptTs: MLXArray? = nil
+        if let promptAdaln = promptAdalnSingle {
+            let scaledTs = timesteps * Float(config.timestepScaleMultiplier)
+            let (pEmb, _) = promptAdaln(scaledTs.flattened())
+            promptTs = pEmb.reshaped([batchSize, -1, 2, config.innerDim])
+        }
+
         // Create transformer args
         var args = TransformerArgs(
             x: x,
@@ -353,7 +380,8 @@ class LTXTransformer: Module {
             timesteps: timestepEmb,
             positionalEmbeddings: pe,
             contextMask: preparedMask,
-            embeddedTimestep: embeddedTimestep
+            embeddedTimestep: embeddedTimestep,
+            promptTimesteps: promptTs
         )
 
         // Process through transformer blocks

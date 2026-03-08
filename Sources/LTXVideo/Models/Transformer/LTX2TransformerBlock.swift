@@ -18,7 +18,7 @@ struct AudioTransformerArgs {
     /// Audio text context for cross-attention (B, S, D_audio)
     var context: MLXArray
 
-    /// Audio timestep embeddings for AdaLN (B, 1, 6, D_audio)
+    /// Audio timestep embeddings for AdaLN (B, 1, numSST, D_audio)
     var timesteps: MLXArray
 
     /// Audio RoPE position embeddings (cos, sin) — 1D temporal
@@ -45,6 +45,11 @@ struct AudioTransformerArgs {
 
     /// Cross-modal audio RoPE (for KV in a2v, Q in v2a cross-attention)
     var crossAudioRoPE: (cos: MLXArray, sin: MLXArray)
+
+    /// Prompt timestep embeddings for cross-attention AdaLN (LTX-2.3)
+    /// Video: (B, 1, 2, D_video), Audio: (B, 1, 2, D_audio)
+    var videoPromptTimesteps: MLXArray?
+    var audioPromptTimesteps: MLXArray?
 }
 
 // MARK: - LTX2 Transformer Block
@@ -66,6 +71,7 @@ class LTX2TransformerBlock: Module {
     let normEps: Float
     let videoDim: Int
     let audioDim: Int
+    let numSSTValues: Int  // 6 for LTX-2, 9 for LTX-2.3
 
     // --- Video modules ---
     @ModuleInfo(key: "norm1") var norm1: RMSNorm
@@ -95,6 +101,10 @@ class LTX2TransformerBlock: Module {
     @ParameterInfo(key: "scale_shift_table_a2v_ca_video") var videoA2VCrossAttnSST: MLXArray
     @ParameterInfo(key: "scale_shift_table_a2v_ca_audio") var audioA2VCrossAttnSST: MLXArray
 
+    // --- Prompt modulation (LTX-2.3) ---
+    @ParameterInfo(key: "prompt_scale_shift_table") var promptScaleShiftTable: MLXArray?
+    @ParameterInfo(key: "audio_prompt_scale_shift_table") var audioPromptScaleShiftTable: MLXArray?
+
     init(
         videoDim: Int,
         videoNumHeads: Int,
@@ -105,68 +115,78 @@ class LTX2TransformerBlock: Module {
         audioHeadDim: Int,
         audioCrossAttentionDim: Int,
         ropeType: LTXRopeType = .split,
-        normEps: Float = 1e-6
+        normEps: Float = 1e-6,
+        gatedAttention: Bool = false,
+        crossAttentionAdaLN: Bool = false
     ) {
         self.normEps = normEps
         self.videoDim = videoDim
         self.audioDim = audioDim
+        self.numSSTValues = crossAttentionAdaLN ? 9 : 6
 
         // --- Video ---
         self._norm1.wrappedValue = RMSNorm(dims: videoDim, eps: normEps)
         self._attn1.wrappedValue = LTXAttention(
             queryDim: videoDim, contextDim: nil,
             heads: videoNumHeads, dimHead: videoHeadDim,
-            normEps: normEps, ropeType: ropeType
+            normEps: normEps, ropeType: ropeType,
+            gatedAttention: gatedAttention
         )
         self._norm2.wrappedValue = RMSNorm(dims: videoDim, eps: normEps)
         self._attn2.wrappedValue = LTXAttention(
             queryDim: videoDim, contextDim: videoCrossAttentionDim,
             heads: videoNumHeads, dimHead: videoHeadDim,
-            normEps: normEps, ropeType: ropeType
+            normEps: normEps, ropeType: ropeType,
+            gatedAttention: gatedAttention
         )
         self._norm3.wrappedValue = RMSNorm(dims: videoDim, eps: normEps)
         self._ff.wrappedValue = LTXFeedForward(dim: videoDim, dimOut: videoDim)
-        self._scaleShiftTable.wrappedValue = MLXArray.zeros([6, videoDim])
+        self._scaleShiftTable.wrappedValue = MLXArray.zeros([numSSTValues, videoDim])
 
         // --- Audio ---
         self._audioNorm1.wrappedValue = RMSNorm(dims: audioDim, eps: normEps)
         self._audioAttn1.wrappedValue = LTXAttention(
             queryDim: audioDim, contextDim: nil,
             heads: audioNumHeads, dimHead: audioHeadDim,
-            normEps: normEps, ropeType: ropeType
+            normEps: normEps, ropeType: ropeType,
+            gatedAttention: gatedAttention
         )
         self._audioNorm2.wrappedValue = RMSNorm(dims: audioDim, eps: normEps)
         self._audioAttn2.wrappedValue = LTXAttention(
             queryDim: audioDim, contextDim: audioCrossAttentionDim,
             heads: audioNumHeads, dimHead: audioHeadDim,
-            normEps: normEps, ropeType: ropeType
+            normEps: normEps, ropeType: ropeType,
+            gatedAttention: gatedAttention
         )
         self._audioNorm3.wrappedValue = RMSNorm(dims: audioDim, eps: normEps)
         self._audioFf.wrappedValue = LTXFeedForward(dim: audioDim, dimOut: audioDim)
-        self._audioScaleShiftTable.wrappedValue = MLXArray.zeros([6, audioDim])
+        self._audioScaleShiftTable.wrappedValue = MLXArray.zeros([numSSTValues, audioDim])
 
         // --- Cross-modal ---
-        // A2V: Q from video (videoDim), KV from audio (audioDim), uses audio head dims
         self._audioToVideoNorm.wrappedValue = RMSNorm(dims: videoDim, eps: normEps)
         self._audioToVideoAttn.wrappedValue = LTXAttention(
             queryDim: videoDim, contextDim: audioDim,
             heads: audioNumHeads, dimHead: audioHeadDim,
-            normEps: normEps, ropeType: ropeType
+            normEps: normEps, ropeType: ropeType,
+            gatedAttention: gatedAttention
         )
-
-        // V2A: Q from audio (audioDim), KV from video (videoDim), uses audio head dims
         self._videoToAudioNorm.wrappedValue = RMSNorm(dims: audioDim, eps: normEps)
         self._videoToAudioAttn.wrappedValue = LTXAttention(
             queryDim: audioDim, contextDim: videoDim,
             heads: audioNumHeads, dimHead: audioHeadDim,
-            normEps: normEps, ropeType: ropeType
+            normEps: normEps, ropeType: ropeType,
+            gatedAttention: gatedAttention
         )
 
         // Cross-modal scale-shift tables
-        // Video: 5 values [a2v_scale, a2v_shift, v2a_scale, v2a_shift, a2v_gate]
         self._videoA2VCrossAttnSST.wrappedValue = MLXArray.zeros([5, videoDim])
-        // Audio: 5 values [a2v_scale, a2v_shift, v2a_scale, v2a_shift, v2a_gate]
         self._audioA2VCrossAttnSST.wrappedValue = MLXArray.zeros([5, audioDim])
+
+        // Prompt modulation (LTX-2.3)
+        if crossAttentionAdaLN {
+            self._promptScaleShiftTable.wrappedValue = MLXArray.zeros([2, videoDim])
+            self._audioPromptScaleShiftTable.wrappedValue = MLXArray.zeros([2, audioDim])
+        }
     }
 
     // MARK: - Forward Pass
@@ -178,30 +198,33 @@ class LTX2TransformerBlock: Module {
         var videoX = videoArgs.x
         var audioX = audioArgs.x
 
-        // Get video AdaLN values (6 values from SST + timestep)
-        let videoSST = scaleShiftTable.reshaped([1, 1, 6, videoDim]) + videoArgs.timesteps
+        // Get video AdaLN values from SST + timestep
+        let videoSST = scaleShiftTable.reshaped([1, 1, numSSTValues, videoDim]) + videoArgs.timesteps
         let (vShiftMSA, vScaleMSA, vGateMSA) = (
             videoSST[0..., 0..., 0, 0...],
             videoSST[0..., 0..., 1, 0...],
             videoSST[0..., 0..., 2, 0...]
         )
+
+        // FFN always uses SST indices 3,4,5 (matching Lightricks reference: slice(3, 6))
+        let ffIdx = 3
         let (vShiftMLP, vScaleMLP, vGateMLP) = (
-            videoSST[0..., 0..., 3, 0...],
-            videoSST[0..., 0..., 4, 0...],
-            videoSST[0..., 0..., 5, 0...]
+            videoSST[0..., 0..., ffIdx, 0...],
+            videoSST[0..., 0..., ffIdx + 1, 0...],
+            videoSST[0..., 0..., ffIdx + 2, 0...]
         )
 
         // Get audio AdaLN values
-        let audioSST = audioScaleShiftTable.reshaped([1, 1, 6, audioDim]) + audioArgs.timesteps
+        let audioSST = audioScaleShiftTable.reshaped([1, 1, numSSTValues, audioDim]) + audioArgs.timesteps
         let (aShiftMSA, aScaleMSA, aGateMSA) = (
             audioSST[0..., 0..., 0, 0...],
             audioSST[0..., 0..., 1, 0...],
             audioSST[0..., 0..., 2, 0...]
         )
         let (aShiftMLP, aScaleMLP, aGateMLP) = (
-            audioSST[0..., 0..., 3, 0...],
-            audioSST[0..., 0..., 4, 0...],
-            audioSST[0..., 0..., 5, 0...]
+            audioSST[0..., 0..., ffIdx, 0...],
+            audioSST[0..., 0..., ffIdx + 1, 0...],
+            audioSST[0..., 0..., ffIdx + 2, 0...]
         )
 
         // Phase 1: Video self-attention
@@ -214,15 +237,50 @@ class LTX2TransformerBlock: Module {
         let aSelfOut = audioAttn1(normA1, pe: audioArgs.positionalEmbeddings)
         audioX = audioX + aSelfOut * aGateMSA
 
-        // Phase 3: Video text cross-attention (no RoPE)
-        let normV2 = norm2(videoX)
-        let vCrossOut = attn2(normV2, context: videoArgs.context, mask: videoArgs.contextMask)
-        videoX = videoX + vCrossOut
+        // Phase 3-4: Text cross-attention
+        if numSSTValues == 9 {
+            // LTX-2.3: cross-attention with AdaLN on query and prompt
+            // Reference: slice(6, 9) — cross-attention uses SST indices 6,7,8
+            let (vShiftCA, vScaleCA, vGateCA) = (
+                videoSST[0..., 0..., 6, 0...],
+                videoSST[0..., 0..., 7, 0...],
+                videoSST[0..., 0..., 8, 0...]
+            )
+            let (aShiftCA, aScaleCA, aGateCA) = (
+                audioSST[0..., 0..., 6, 0...],
+                audioSST[0..., 0..., 7, 0...],
+                audioSST[0..., 0..., 8, 0...]
+            )
 
-        // Phase 4: Audio text cross-attention (no RoPE)
-        let normA2 = audioNorm2(audioX)
-        let aCrossOut = audioAttn2(normA2, context: audioArgs.context, mask: audioArgs.contextMask)
-        audioX = audioX + aCrossOut
+            // Video cross-attention with AdaLN
+            let normV2 = norm2(videoX) * (1 + vScaleCA) + vShiftCA
+            var videoCtx = videoArgs.context
+            if let pSST = promptScaleShiftTable, let pTs = audioArgs.videoPromptTimesteps {
+                let pMod = pSST.reshaped([1, 1, 2, videoDim]) + pTs
+                videoCtx = videoCtx * (1 + pMod[0..., 0..., 1, 0...]) + pMod[0..., 0..., 0, 0...]
+            }
+            let vCrossOut = attn2(normV2, context: videoCtx, mask: videoArgs.contextMask)
+            videoX = videoX + vCrossOut * vGateCA
+
+            // Audio cross-attention with AdaLN
+            let normA2 = audioNorm2(audioX) * (1 + aScaleCA) + aShiftCA
+            var audioCtx = audioArgs.context
+            if let apSST = audioPromptScaleShiftTable, let apTs = audioArgs.audioPromptTimesteps {
+                let apMod = apSST.reshaped([1, 1, 2, audioDim]) + apTs
+                audioCtx = audioCtx * (1 + apMod[0..., 0..., 1, 0...]) + apMod[0..., 0..., 0, 0...]
+            }
+            let aCrossOut = audioAttn2(normA2, context: audioCtx, mask: audioArgs.contextMask)
+            audioX = audioX + aCrossOut * aGateCA
+        } else {
+            // LTX-2: cross-attention without AdaLN
+            let normV2 = norm2(videoX)
+            let vCrossOut = attn2(normV2, context: videoArgs.context, mask: videoArgs.contextMask)
+            videoX = videoX + vCrossOut
+
+            let normA2 = audioNorm2(audioX)
+            let aCrossOut = audioAttn2(normA2, context: audioArgs.context, mask: audioArgs.contextMask)
+            audioX = audioX + aCrossOut
+        }
 
         // Phase 5-6: Cross-modal attention (A2V and V2A)
         // Compute cross-modal modulation from per-block SST + global timestep embeddings
@@ -291,7 +349,9 @@ class LTX2TransformerBlock: Module {
                 crossVideoScaleShift: audioArgs.crossVideoScaleShift,
                 crossAudioScaleShift: audioArgs.crossAudioScaleShift,
                 crossVideoRoPE: audioArgs.crossVideoRoPE,
-                crossAudioRoPE: audioArgs.crossAudioRoPE
+                crossAudioRoPE: audioArgs.crossAudioRoPE,
+                videoPromptTimesteps: audioArgs.videoPromptTimesteps,
+                audioPromptTimesteps: audioArgs.audioPromptTimesteps
             )
         )
     }

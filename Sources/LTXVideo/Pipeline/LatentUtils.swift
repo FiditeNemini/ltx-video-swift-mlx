@@ -152,34 +152,33 @@ func applyCFG(
 /// Apply guidance rescale to reduce overexposure from CFG
 ///
 /// Rescales the CFG output so its per-channel standard deviation matches
-/// the conditional output's std, then blends with the original CFG output.
+/// the conditional velocity's std, then blends with the original.
 ///
-/// Formula: rescaled = cfgOutput * (condStd / cfgStd), result = phi * rescaled + (1 - phi) * cfgOutput
+/// Matches Lightricks Python guiders.py exactly:
+///   factor = rescale_scale * (cond.std() / pred.std()) + (1 - rescale_scale)
+///   pred = pred * factor
+///
+/// Uses global scalar std (over ALL dimensions), NOT per-sample keepDims.
+/// Must be called AFTER both CFG and STG are applied (matching Python order).
 ///
 /// - Parameters:
-///   - cfgOutput: Output after CFG application (B, C, F, H, W)
-///   - condOutput: Conditional-only output (B, C, F, H, W)
+///   - guidedVelocity: Guided velocity after CFG+STG (B, C, F, H, W)
+///   - condVelocity: Conditional-only velocity (B, C, F, H, W)
 ///   - phi: Rescale factor (0.0 = no rescale, 0.7 = recommended)
-/// - Returns: Rescaled output
+/// - Returns: Rescaled velocity
 func applyGuidanceRescale(
-    cfgOutput: MLXArray,
-    condOutput: MLXArray,
+    guidedVelocity: MLXArray,
+    condVelocity: MLXArray,
     phi: Float
 ) -> MLXArray {
-    guard phi > 0.0 else { return cfgOutput }
+    guard phi > 0.0 else { return guidedVelocity }
 
-    let eps: Float = 1e-8
+    // Global scalar std matching Python cond.std() / pred.std()
+    let condStd = MLX.sqrt(MLX.variance(condVelocity) + 1e-8)
+    let predStd = MLX.sqrt(MLX.variance(guidedVelocity) + 1e-8)
+    let factor = MLXArray(phi) * (condStd / predStd) + MLXArray(1.0 - phi)
 
-    // Std over all dims except batch (axes: 1=C, 2=F, 3=H, 4=W), matching Diffusers
-    // rescale_noise_cfg: std(dim=list(range(1, ndim)), keepdim=True)
-    let cfgStd = MLX.sqrt(MLX.variance(cfgOutput, axes: [1, 2, 3, 4], keepDims: true) + eps)
-    let condStd = MLX.sqrt(MLX.variance(condOutput, axes: [1, 2, 3, 4], keepDims: true) + eps)
-
-    // Rescale CFG output to match conditional std
-    let rescaled = cfgOutput * (condStd / cfgStd)
-
-    // Blend between rescaled and original
-    return MLXArray(phi) * rescaled + MLXArray(1.0 - phi) * cfgOutput
+    return guidedVelocity * factor
 }
 
 // MARK: - AdaIN Filtering

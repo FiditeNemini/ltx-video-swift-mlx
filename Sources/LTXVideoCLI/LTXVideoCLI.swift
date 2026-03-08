@@ -1,4 +1,4 @@
-// LTXVideoCLI.swift - Command-line interface for LTX-2 video generation
+// LTXVideoCLI.swift - Command-line interface for LTX-2.3 video generation
 // Copyright 2025
 
 import ArgumentParser
@@ -9,9 +9,9 @@ import LTXVideo
 struct LTXVideoCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ltx-video",
-        abstract: "LTX-2 video generation on Mac with MLX",
+        abstract: "LTX-2.3 video generation on Mac with MLX",
         version: "0.1.0",
-        subcommands: [Generate.self, Download.self, Info.self],
+        subcommands: [Generate.self, Download.self, Train.self, Info.self],
         defaultSubcommand: Info.self
     )
 }
@@ -65,7 +65,7 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "Path to local Gemma3 model directory")
     var gemmaPath: String?
 
-    @Option(name: .long, help: "Path to unified LTX-2 weights file (.safetensors)")
+    @Option(name: .long, help: "Path to unified LTX-2.3 weights file (.safetensors)")
     var ltxWeights: String?
 
     @Option(name: .long, help: "Input image path for image-to-video generation")
@@ -78,7 +78,7 @@ struct Generate: AsyncParsableCommand {
     var negativePrompt: String?
 
     @Option(name: .long, help: "Guidance rescale (phi). 0.0=off, 0.7=recommended with CFG")
-    var guidanceRescale: Float = 0.0
+    var guidanceRescale: Float = 0.7
 
     @Option(name: .long, help: "Cross-attention scale. 1.0=default, >1=stronger prompt adherence")
     var crossAttnScale: Float = 1.0
@@ -86,11 +86,11 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "GE velocity correction gamma. 0.0=off")
     var geGamma: Float = 0.0
 
-    @Option(name: .long, help: "STG (Spatio-Temporal Guidance) scale. 0.0=off, 0.5=recommended")
-    var stgScale: Float = 0.0
+    @Option(name: .long, help: "STG (Spatio-Temporal Guidance) scale. 0.0=off, 1.0=default for dev. Omit to use model default")
+    var stgScale: Float?
 
     @Option(name: .long, help: "STG block indices (comma-separated, e.g. \"29\" or \"28,29\")")
-    var stgBlocks: String = "29"
+    var stgBlocks: String = "28"
 
     @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8 (8-bit), int4 (4-bit)")
     var transformerQuant: String = "bf16"
@@ -135,7 +135,7 @@ struct Generate: AsyncParsableCommand {
 
         let isI2V = image != nil
 
-        print("LTX-2 Video Generation")
+        print("LTX-2.3 Video Generation")
         print("======================")
         print("Mode: \(isI2V ? "image-to-video" : "text-to-video")")
         if let imagePath = image {
@@ -153,7 +153,7 @@ struct Generate: AsyncParsableCommand {
         if guidanceRescale > 0 { print("Guidance rescale: \(guidanceRescale)") }
         if crossAttnScale != 1.0 { print("Cross-attention scale: \(crossAttnScale)") }
         if geGamma > 0 { print("GE gamma: \(geGamma)") }
-        if stgScale > 0 { print("STG scale: \(stgScale), blocks: \(parsedStgBlocks)") }
+        if let stg = stgScale { print("STG scale: \(stg) (explicit)") }
         if twoStage { print("Two-stage: enabled") }
         if enhancePrompt {
             if image != nil {
@@ -280,6 +280,18 @@ struct Generate: AsyncParsableCommand {
             effectiveCFG = guidance ?? modelVariant.defaultGuidance
         }
 
+        // STG: use explicit value if provided, otherwise model default
+        // (distilled-lora forces distilled defaults → STG off)
+        let effectiveSTGScale: Float
+        if let explicitSTG = stgScale {
+            effectiveSTGScale = explicitSTG
+        } else if distilledLora {
+            effectiveSTGScale = 0.0
+        } else {
+            effectiveSTGScale = modelVariant.defaultSTGScale
+        }
+        if effectiveSTGScale > 0 { print("STG scale: \(effectiveSTGScale), blocks: \(parsedStgBlocks)") }
+
         let config = LTXVideoGenerationConfig(
             width: width,
             height: height,
@@ -290,7 +302,7 @@ struct Generate: AsyncParsableCommand {
             guidanceRescale: guidanceRescale,
             crossAttentionScale: crossAttnScale,
             geGamma: geGamma,
-            stgScale: stgScale,
+            stgScale: effectiveSTGScale,
             stgBlocks: parsedStgBlocks,
             twoStage: twoStage,
             enhancePrompt: enhancePrompt,
@@ -473,7 +485,7 @@ struct Download: AsyncParsableCommand {
             LTXModelRegistry.customModelsDirectory = URL(fileURLWithPath: dir)
         }
 
-        print("LTX-2 Model Download")
+        print("LTX-2.3 Model Download")
         print("====================")
 
         // Parse model variant
@@ -500,8 +512,6 @@ struct Download: AsyncParsableCommand {
         print()
         print("Text encoder: \(paths.textEncoderDir.path)")
         print("Tokenizer: \(paths.tokenizerDir.path)")
-        print("Connector: \(paths.connectorPath.path)")
-        print("VAE: \(paths.vaePath.path)")
         print("Unified weights: \(paths.unifiedWeightsPath.path)")
     }
 }
@@ -510,13 +520,13 @@ struct Download: AsyncParsableCommand {
 
 struct Info: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Show information about LTX-2 implementation"
+        abstract: "Show information about LTX-2.3 implementation"
     )
 
     mutating func run() throws {
         print(
             """
-            LTX-2 Video Generation for Apple Silicon
+            LTX-2.3 Video Generation for Apple Silicon
             =========================================
 
             Version: \(LTXVideo.version)
@@ -524,7 +534,7 @@ struct Info: ParsableCommand {
 
             Model Variants:
               distilled     - ~16GB RAM, 8 steps
-              dev           - ~25GB RAM, 40 steps (best quality)
+              dev           - ~25GB RAM, 30 steps (best quality)
 
             Constraints:
               Frame count: Must be 8n+1 (9, 17, 25, 33, 41, 49, ...)

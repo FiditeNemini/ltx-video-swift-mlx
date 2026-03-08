@@ -118,6 +118,7 @@ class LTXAttention: Module {
     let ropeType: LTXRopeType
     let heads: Int
     let dimHead: Int
+    let useGatedAttention: Bool
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
@@ -127,17 +128,22 @@ class LTXAttention: Module {
     @ModuleInfo(key: "to_v") var toV: Linear
     @ModuleInfo(key: "to_out") var toOut: Linear
 
+    // Gated attention (LTX-2.3): per-head gate = 2 * sigmoid(gate_logits)
+    @ModuleInfo(key: "to_gate_logits") var toGateLogits: Linear?
+
     init(
         queryDim: Int,
         contextDim: Int? = nil,
         heads: Int = 8,
         dimHead: Int = 64,
         normEps: Float = 1e-6,
-        ropeType: LTXRopeType = .split
+        ropeType: LTXRopeType = .split,
+        gatedAttention: Bool = false
     ) {
         self.ropeType = ropeType
         self.heads = heads
         self.dimHead = dimHead
+        self.useGatedAttention = gatedAttention
         let innerDim = dimHead * heads
 
         let ctxDim = contextDim ?? queryDim
@@ -155,6 +161,11 @@ class LTXAttention: Module {
 
         // Output projection
         self._toOut.wrappedValue = Linear(innerDim, queryDim, bias: true)
+
+        // Gated attention: Linear(queryDim, heads) → per-head scaling
+        if gatedAttention {
+            self._toGateLogits.wrappedValue = Linear(queryDim, heads, bias: true)
+        }
     }
 
     func callAsFunction(
@@ -166,6 +177,13 @@ class LTXAttention: Module {
     ) -> MLXArray {
         let b = x.dim(0)
         let tQ = x.dim(1)
+
+        // Compute gate logits from original input (before Q/K/V projection)
+        // gate_logits: (B, T, heads)
+        var gateLogits: MLXArray? = nil
+        if let gateProj = toGateLogits {
+            gateLogits = gateProj(x)
+        }
 
         // Project to Q, K, V → (B, T, innerDim)
         var q = toQ(x)
@@ -206,9 +224,17 @@ class LTXAttention: Module {
 
         // Scaled dot-product attention (Flash Attention)
         let scale = 1.0 / sqrt(Float(dimHead))
-        let out = MLXFast.scaledDotProductAttention(
+        var out = MLXFast.scaledDotProductAttention(
             queries: qR, keys: kR, values: vR, scale: scale, mask: attnMask
         )
+
+        // Apply gated attention (LTX-2.3): per-head gate = 2 * sigmoid(gate_logits)
+        // gate_logits: (B, T, H) → (B, H, T, 1) to broadcast with (B, H, T, D)
+        if let gl = gateLogits {
+            let gate = 2.0 * sigmoid(gl)  // (B, T, H), range [0, 2]
+            let gateR = gate.transposed(0, 2, 1).expandedDimensions(axis: -1)  // (B, H, T, 1)
+            out = out * gateR
+        }
 
         // Reshape back: (B, H, T, D) → (B, T, H*D)
         let combined = out.transposed(0, 2, 1, 3).reshaped([b, tQ, heads * dimHead])

@@ -3,7 +3,7 @@
 
 import Foundation
 
-/// Registry for LTX-2 model components and paths
+/// Registry for LTX-2.3 model components and paths
 public enum LTXModelRegistry {
     // MARK: - Model Components
 
