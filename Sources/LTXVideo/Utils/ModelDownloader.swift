@@ -157,7 +157,7 @@ public actor ModelDownloader {
     ///   - progress: Optional progress callback
     /// - Returns: Path to the connector safetensors file
     public func downloadConnector(
-        model: LTXModel = .dev,
+        model: LTXModel = .distilled,
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
         let repoId = model.huggingFaceRepo
@@ -188,7 +188,7 @@ public actor ModelDownloader {
     ///   - progress: Optional progress callback
     /// - Returns: Path to the VAE safetensors file
     public func downloadVAE(
-        model: LTXModel = .dev,
+        model: LTXModel = .distilled,
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
         let repoId = model.huggingFaceRepo
@@ -396,7 +396,7 @@ public actor ModelDownloader {
     /// Returns the VLM Gemma directory which contains both model weights and tokenizer.
     /// The `model` parameter is ignored since all variants share the same Gemma weights.
     public func downloadGemma(
-        model: LTXModel = .dev,
+        model: LTXModel = .distilled,
         progress: DownloadProgressCallback? = nil
     ) async throws -> (modelDir: URL, tokenizerDir: URL) {
         let vlmDir = try await downloadVLMGemma(progress: progress)
@@ -404,14 +404,14 @@ public actor ModelDownloader {
     }
 
     /// Check if VLM Gemma is downloaded (shared across all model variants)
-    public func isGemmaDownloaded(model: LTXModel = .dev) -> Bool {
+    public func isGemmaDownloaded(model: LTXModel = .distilled) -> Bool {
         return FileManager.default.fileExists(
             atPath: vlmGemmaCacheDir.appendingPathComponent("config.json").path)
     }
 
     /// Get the Gemma model and tokenizer directories (downloads if needed)
     public func getGemmaPaths(
-        model: LTXModel = .dev,
+        model: LTXModel = .distilled,
         progress: DownloadProgressCallback? = nil
     ) async throws -> (modelDir: URL, tokenizerDir: URL) {
         return try await downloadGemma(model: model, progress: progress)

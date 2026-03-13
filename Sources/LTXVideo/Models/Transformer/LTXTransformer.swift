@@ -541,27 +541,6 @@ extension LTXTransformer {
         LTXDebug.log("Set cross-attention scale to \(scale) for blocks \(range)")
     }
 
-    /// Set STG skip flags on specified blocks
-    ///
-    /// - Parameters:
-    ///   - skipSelfAttention: Whether to skip self-attention
-    ///   - skipFeedForward: Whether to skip feed-forward
-    ///   - blockIndices: Which block indices to modify
-    func setSTGSkipFlags(skipSelfAttention: Bool, skipFeedForward: Bool = false, blockIndices: [Int]) {
-        for i in blockIndices {
-            guard i >= 0 && i < transformerBlocks.count else { continue }
-            transformerBlocks[i].skipSelfAttention = skipSelfAttention
-            transformerBlocks[i].skipFeedForward = skipFeedForward
-        }
-    }
-
-    /// Reset all STG skip flags to false
-    func clearSTGSkipFlags() {
-        for block in transformerBlocks {
-            block.skipSelfAttention = false
-            block.skipFeedForward = false
-        }
-    }
 }
 
 // MARK: - Convenience Initializers

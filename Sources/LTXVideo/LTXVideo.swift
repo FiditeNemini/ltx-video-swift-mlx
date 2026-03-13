@@ -16,42 +16,24 @@ import MLXNN
 ///
 /// let pipeline = LTXPipeline(model: .distilled)
 /// try await pipeline.loadModels()
-/// let result = try await pipeline.generateVideo(
-///     prompt: "A cat walking in a garden",
-///     config: LTXVideoGenerationConfig(width: 512, height: 512, numFrames: 25)
-/// )
-/// try await VideoExporter.exportVideo(
-///     frames: result.frames, width: 512, height: 512, to: URL(fileURLWithPath: "output.mp4")
-/// )
-/// ```
-///
-/// ## Two-Stage Pipeline (Higher Quality)
-/// ```swift
-/// let pipeline = LTXPipeline(model: .dev)
-/// try await pipeline.loadModels()
-/// let loraPath = try await pipeline.downloadDistilledLoRA()
-/// try await pipeline.fuseLoRA(from: loraPath)
 /// let upscalerPath = try await pipeline.downloadUpscalerWeights()
 ///
 /// let config = LTXVideoGenerationConfig(
-///     width: 768, height: 512, numFrames: 241,
-///     numSteps: 8, cfgScale: 1.0, twoStage: true
+///     width: 768, height: 512, numFrames: 121
 /// )
 /// let result = try await pipeline.generateVideo(
-///     prompt: "Ocean waves at sunset",
+///     prompt: "A cat walking in a garden",
 ///     config: config,
 ///     upscalerWeightsPath: upscalerPath
 /// )
+/// try await VideoExporter.exportVideo(
+///     frames: result.frames, width: 768, height: 512, to: URL(fileURLWithPath: "output.mp4")
+/// )
 /// ```
-///
-/// ## Model Variants
-/// - ``LTXModel/distilled``: Fast generation (~16 GB RAM, 8 steps)
-/// - ``LTXModel/dev``: Best quality (~25 GB RAM, 40 steps)
 ///
 /// ## Constraints
 /// - **Frame count**: Must be `8n + 1` (9, 17, 25, 33, 41, ...)
-/// - **Resolution**: Width and height must be divisible by 32
-/// - **Two-stage**: Width and height must be divisible by 64
+/// - **Resolution**: Width and height must be divisible by 64
 public enum LTXVideo {
     /// Framework version
     public static let version = "0.1.0"

@@ -142,13 +142,8 @@ public enum LTXModelRegistry {
         return Int(bytes / 1_073_741_824)  // Convert to GB
     }
 
-    /// Recommended model based on available RAM
+    /// Recommended model
     public static var recommendedModel: LTXModel {
-        let ram = systemRAMGB
-        if ram >= 32 {
-            return .dev
-        } else {
-            return .distilled
-        }
+        return .distilled
     }
 }

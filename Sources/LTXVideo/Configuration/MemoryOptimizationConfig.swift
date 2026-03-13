@@ -20,7 +20,7 @@ import Foundation
 /// ## Example
 /// ```swift
 /// let pipeline = LTXPipeline(
-///     model: .dev,
+///     model: .distilled,
 ///     memoryOptimization: .moderate
 /// )
 /// ```

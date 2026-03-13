@@ -129,12 +129,6 @@ class BasicTransformerBlock: Module {
     /// Cross-attention output scaling factor (1.0 = no change, >1.0 = stronger prompt adherence)
     var crossAttentionScale: Float = 1.0
 
-    /// STG: skip self-attention when true (for perturbed forward pass)
-    var skipSelfAttention: Bool = false
-
-    /// STG: skip feed-forward when true (for perturbed forward pass)
-    var skipFeedForward: Bool = false
-
     init(
         dim: Int,
         numHeads: Int,
@@ -218,12 +212,10 @@ class BasicTransformerBlock: Module {
             end: 3
         )
 
-        // Self-attention with AdaLN (skipped during STG perturbed pass)
-        if !skipSelfAttention {
-            let normX = adaln(x, scale: scaleMSA, shift: shiftMSA, eps: normEps)
-            let attnOut = attn1(normX, pe: args.positionalEmbeddings)
-            x = residualGate(x, residual: attnOut, gate: gateMSA)
-        }
+        // Self-attention with AdaLN
+        let normX = adaln(x, scale: scaleMSA, shift: shiftMSA, eps: normEps)
+        let attnOut = attn1(normX, pe: args.positionalEmbeddings)
+        x = residualGate(x, residual: attnOut, gate: gateMSA)
 
         // Cross-attention
         if numSSTValues == 9 {
@@ -276,12 +268,10 @@ class BasicTransformerBlock: Module {
             end: ffStart + 3
         )
 
-        // Feed-forward with AdaLN (skipped during STG perturbed pass if configured)
-        if !skipFeedForward {
-            let xScaled = adaln(x, scale: scaleMLP, shift: shiftMLP, eps: normEps)
-            let ffOut = ff(xScaled)
-            x = residualGate(x, residual: ffOut, gate: gateMLP)
-        }
+        // Feed-forward with AdaLN
+        let xScaled = adaln(x, scale: scaleMLP, shift: shiftMLP, eps: normEps)
+        let ffOut = ff(xScaled)
+        x = residualGate(x, residual: ffOut, gate: gateMLP)
 
         return args.replacing(x: x)
     }

@@ -8,60 +8,26 @@ import Foundation
 /// LTX-2.3 model variants
 ///
 /// Uses unified safetensors format from `Lightricks/LTX-2.3`:
-/// - `ltx-2.3-22b-dev.safetensors` — Full dev model (transformer + VAE + connector)
-/// - `ltx-2.3-22b-distilled.safetensors` — Distilled model
+/// - `ltx-2.3-22b-distilled.safetensors` — Distilled model (transformer + VAE + connector)
 ///
 /// Audio VAE and vocoder are downloaded from `Lightricks/LTX-2` (shared components).
 /// VLM Gemma is shared across all variants (`mlx-community/gemma-3-12b-it-qat-4bit`).
 public enum LTXModel: String, CaseIterable, Sendable {
-    /// LTX-2.3 Dev - Full model, 30 steps, CFG guidance, highest quality
-    case dev = "dev"
-
-    /// LTX-2.3 Distilled - Faster model, 8 steps, no CFG
+    /// LTX-2.3 Distilled - 8 steps, no CFG, two-stage pipeline
     case distilled = "distilled"
 
     public var displayName: String {
-        switch self {
-        case .dev: return "LTX-2.3 Dev (~46GB)"
-        case .distilled: return "LTX-2.3 Distilled (~46GB)"
-        }
-    }
-
-    /// Whether this model uses the distilled sigma schedule
-    public var isDistilled: Bool {
-        self == .distilled
+        return "LTX-2.3 Distilled (~46GB)"
     }
 
     /// Default number of inference steps
     public var defaultSteps: Int {
-        switch self {
-        case .dev: return 30
-        case .distilled: return 8
-        }
-    }
-
-    /// Default guidance scale
-    public var defaultGuidance: Float {
-        switch self {
-        case .dev: return 3.0
-        case .distilled: return 1.0
-        }
-    }
-
-    /// Default STG scale
-    public var defaultSTGScale: Float {
-        switch self {
-        case .dev: return 1.0
-        case .distilled: return 0.0
-        }
+        return 8
     }
 
     /// Estimated VRAM usage in GB (with 3-phase loading)
     public var estimatedVRAM: Int {
-        switch self {
-        case .dev: return 46
-        case .distilled: return 46
-        }
+        return 46
     }
 
     /// HuggingFace repository for this model
@@ -71,10 +37,7 @@ public enum LTXModel: String, CaseIterable, Sendable {
 
     /// Unified weights filename (single file containing transformer, VAE, connector)
     public var unifiedWeightsFilename: String {
-        switch self {
-        case .dev: return "ltx-2.3-22b-dev.safetensors"
-        case .distilled: return "ltx-2.3-22b-distilled.safetensors"
-        }
+        return "ltx-2.3-22b-distilled.safetensors"
     }
 
     /// Get the transformer configuration for this model
@@ -226,13 +189,11 @@ extension LTXTransformerConfig: CustomStringConvertible {
 
 /// Parameters controlling video generation output.
 ///
-/// Configure resolution, frame count, inference steps, guidance, and advanced
-/// features like STG (Spatio-Temporal Guidance) and two-stage upscaling.
+/// Configure resolution, frame count, and features like two-stage upscaling.
 ///
 /// ## Constraints
-/// - **Width/Height**: Must be divisible by 32 (or 64 for two-stage)
+/// - **Width/Height**: Must be divisible by 64 (for two-stage)
 /// - **Frame count**: Must be `8n + 1` (9, 17, 25, ..., 241)
-/// - **CFG scale**: 1.0 disables classifier-free guidance (required for distilled)
 ///
 /// ## Example
 /// ```swift
@@ -240,17 +201,15 @@ extension LTXTransformerConfig: CustomStringConvertible {
 ///     width: 768,
 ///     height: 512,
 ///     numFrames: 121,    // 5 seconds at 24fps
-///     numSteps: 8,
-///     cfgScale: 1.0,
 ///     seed: 42
 /// )
 /// try config.validate()
 /// ```
 public struct LTXVideoGenerationConfig: Sendable {
-    /// Video width in pixels (must be divisible by 32)
+    /// Video width in pixels (must be divisible by 64)
     public var width: Int
 
-    /// Video height in pixels (must be divisible by 32)
+    /// Video height in pixels (must be divisible by 64)
     public var height: Int
 
     /// Number of frames (must be 8n + 1)
@@ -259,37 +218,8 @@ public struct LTXVideoGenerationConfig: Sendable {
     /// Number of inference steps
     public var numSteps: Int
 
-    /// Classifier-free guidance scale
-    public var cfgScale: Float
-
     /// Random seed (nil for random)
     public var seed: UInt64?
-
-    /// Negative prompt for CFG
-    public var negativePrompt: String?
-
-    /// Guidance rescale factor (phi). 0.0 = disabled, 0.7 = recommended with CFG.
-    /// Rescales CFG output to match the standard deviation of the conditional output,
-    /// reducing overexposure artifacts.
-    public var guidanceRescale: Float
-
-    /// Cross-attention scaling factor. 1.0 = no change, >1.0 = stronger prompt adherence.
-    /// Applied to the output of cross-attention layers in the transformer.
-    public var crossAttentionScale: Float
-
-    /// GE velocity correction gamma. 0.0 = disabled.
-    /// Applies momentum on the velocity prediction: v' = gamma * (v - v_prev) + v_prev
-    public var geGamma: Float
-
-    /// STG (Spatio-Temporal Guidance) scale. 0.0 = disabled.
-    /// Higher values improve spatial/temporal coherence at the cost of ~2x denoise time.
-    public var stgScale: Float
-
-    /// Transformer block indices where STG skips self-attention.
-    public var stgBlocks: [Int]
-
-    /// Whether to use two-stage generation (half-res + upscale + refine).
-    public var twoStage: Bool
 
     /// Whether to enhance the prompt using Gemma before generation.
     public var enhancePrompt: Bool
@@ -303,93 +233,89 @@ public struct LTXVideoGenerationConfig: Sendable {
     /// 0.15 = optional for natural motion.
     public var imageCondNoiseScale: Float
 
+    /// Source video path for retake (video-to-video) mode. nil = generate from scratch.
+    public var videoPath: String?
+
+    /// Retake strength: how much of the source to change.
+    /// 0.0 = keep original (no change), 1.0 = full regeneration (source ignored).
+    /// Controls where the truncated sigma schedule starts. Default: 0.8.
+    public var retakeStrength: Float
+
+    /// Start time (seconds) for partial retake. nil = retake all frames.
+    /// Only the region [retakeStartTime, retakeEndTime] is regenerated; outside frames are kept.
+    public var retakeStartTime: Float?
+
+    /// End time (seconds) for partial retake. nil = retake all frames.
+    public var retakeEndTime: Float?
+
     public init(
         width: Int = 704,
         height: Int = 480,
         numFrames: Int = 121,
         numSteps: Int = 8,
-        cfgScale: Float = 1.0,
         seed: UInt64? = nil,
-        negativePrompt: String? = nil,
-        guidanceRescale: Float = 0.7,
-        crossAttentionScale: Float = 1.0,
-        geGamma: Float = 0.0,
-        stgScale: Float = 0.0,
-        stgBlocks: [Int] = [28],
-        twoStage: Bool = false,
         enhancePrompt: Bool = false,
         imagePath: String? = nil,
-        imageCondNoiseScale: Float = 0.0
+        imageCondNoiseScale: Float = 0.0,
+        videoPath: String? = nil,
+        retakeStrength: Float = 0.8,
+        retakeStartTime: Float? = nil,
+        retakeEndTime: Float? = nil
     ) {
         self.width = width
         self.height = height
         self.numFrames = numFrames
         self.numSteps = numSteps
-        self.cfgScale = cfgScale
         self.seed = seed
-        self.negativePrompt = negativePrompt
-        self.guidanceRescale = guidanceRescale
-        self.crossAttentionScale = crossAttentionScale
-        self.geGamma = geGamma
-        self.stgScale = stgScale
-        self.stgBlocks = stgBlocks
-        self.twoStage = twoStage
         self.enhancePrompt = enhancePrompt
         self.imagePath = imagePath
         self.imageCondNoiseScale = imageCondNoiseScale
+        self.videoPath = videoPath
+        self.retakeStrength = retakeStrength
+        self.retakeStartTime = retakeStartTime
+        self.retakeEndTime = retakeEndTime
     }
 
-    /// Convenience initializer that applies model-specific defaults for steps, CFG, and STG.
-    ///
-    /// Use this when building product integrations to get correct defaults per model variant.
-    /// Explicit parameter values override model defaults.
+    /// Convenience initializer that applies model-specific defaults.
     public init(
         model: LTXModel,
         width: Int = 704,
         height: Int = 480,
         numFrames: Int = 121,
         numSteps: Int? = nil,
-        cfgScale: Float? = nil,
         seed: UInt64? = nil,
-        negativePrompt: String? = nil,
-        guidanceRescale: Float = 0.7,
-        crossAttentionScale: Float = 1.0,
-        geGamma: Float = 0.0,
-        stgScale: Float? = nil,
-        stgBlocks: [Int] = [28],
-        twoStage: Bool = false,
         enhancePrompt: Bool = false,
         imagePath: String? = nil,
-        imageCondNoiseScale: Float = 0.0
+        imageCondNoiseScale: Float = 0.0,
+        videoPath: String? = nil,
+        retakeStrength: Float = 0.8,
+        retakeStartTime: Float? = nil,
+        retakeEndTime: Float? = nil
     ) {
         self.width = width
         self.height = height
         self.numFrames = numFrames
         self.numSteps = numSteps ?? model.defaultSteps
-        self.cfgScale = cfgScale ?? model.defaultGuidance
         self.seed = seed
-        self.negativePrompt = negativePrompt
-        self.guidanceRescale = guidanceRescale
-        self.crossAttentionScale = crossAttentionScale
-        self.geGamma = geGamma
-        self.stgScale = stgScale ?? model.defaultSTGScale
-        self.stgBlocks = stgBlocks
-        self.twoStage = twoStage
         self.enhancePrompt = enhancePrompt
         self.imagePath = imagePath
         self.imageCondNoiseScale = imageCondNoiseScale
+        self.videoPath = videoPath
+        self.retakeStrength = retakeStrength
+        self.retakeStartTime = retakeStartTime
+        self.retakeEndTime = retakeEndTime
     }
 
     /// Validate the configuration
     public func validate() throws {
-        // Width must be divisible by 32
-        guard width % 32 == 0 else {
-            throw LTXError.invalidConfiguration("Width must be divisible by 32, got \(width)")
+        // Width must be divisible by 64
+        guard width % 64 == 0 else {
+            throw LTXError.invalidConfiguration("Width must be divisible by 64, got \(width)")
         }
 
-        // Height must be divisible by 32
-        guard height % 32 == 0 else {
-            throw LTXError.invalidConfiguration("Height must be divisible by 32, got \(height)")
+        // Height must be divisible by 64
+        guard height % 64 == 0 else {
+            throw LTXError.invalidConfiguration("Height must be divisible by 64, got \(height)")
         }
 
         // Frames must be 8n + 1
@@ -414,14 +340,20 @@ public struct LTXVideoGenerationConfig: Sendable {
             throw LTXError.invalidConfiguration("Number of steps must be between 1 and 100, got \(numSteps)")
         }
 
-        guard cfgScale >= 1.0 && cfgScale <= 20.0 else {
-            throw LTXError.invalidConfiguration("CFG scale must be between 1.0 and 20.0, got \(cfgScale)")
-        }
-
         // Validate image path exists if provided
         if let imagePath = imagePath {
             guard FileManager.default.fileExists(atPath: imagePath) else {
                 throw LTXError.fileNotFound("Input image not found: \(imagePath)")
+            }
+        }
+
+        // Validate video path exists if provided
+        if let videoPath = videoPath {
+            guard FileManager.default.fileExists(atPath: videoPath) else {
+                throw LTXError.fileNotFound("Input video not found: \(videoPath)")
+            }
+            guard retakeStrength > 0.0 && retakeStrength <= 1.0 else {
+                throw LTXError.invalidConfiguration("Retake strength must be in (0.0, 1.0], got \(retakeStrength)")
             }
         }
     }

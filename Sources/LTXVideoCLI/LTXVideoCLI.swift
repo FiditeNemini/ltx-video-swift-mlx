@@ -11,7 +11,7 @@ struct LTXVideoCLI: AsyncParsableCommand {
         commandName: "ltx-video",
         abstract: "LTX-2.3 video generation on Mac with MLX",
         version: "0.1.0",
-        subcommands: [Generate.self, Download.self, Train.self, Info.self],
+        subcommands: [Generate.self, Retake.self, Download.self, Train.self, Info.self],
         defaultSubcommand: Info.self
     )
 }
@@ -177,10 +177,7 @@ struct Generate: AsyncParsableCommand {
             height: height,
             numFrames: frames,
             numSteps: 8,
-            cfgScale: 1.0,
             seed: seed,
-            guidanceRescale: 0.0,
-            stgScale: 0.0,
             enhancePrompt: enhancePrompt,
             imagePath: image
         )
@@ -281,15 +278,238 @@ struct Generate: AsyncParsableCommand {
     }
 }
 
+// MARK: - Retake Command
+
+struct Retake: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Retake (video-to-video): regenerate a video with a new prompt"
+    )
+
+    @Argument(help: "The new text prompt for the retaken video")
+    var prompt: String
+
+    @Option(name: .long, help: "Source video path (required)")
+    var video: String
+
+    @Option(name: .long, help: "Retake strength: 0.0=keep original, 1.0=full regeneration (default: 0.8)")
+    var strength: Float = 0.8
+
+    @Option(name: .long, help: "Start time in seconds for partial retake (default: retake all frames)")
+    var startTime: Float?
+
+    @Option(name: .long, help: "End time in seconds for partial retake (default: retake all frames)")
+    var endTime: Float?
+
+    @Option(name: .shortAndLong, help: "Output file path (default: retake.mp4)")
+    var output: String = "retake.mp4"
+
+    @Option(name: .shortAndLong, help: "Video width in pixels (must be divisible by 64)")
+    var width: Int = 768
+
+    @Option(name: .shortAndLong, help: "Video height in pixels (must be divisible by 64)")
+    var height: Int = 512
+
+    @Option(name: .shortAndLong, help: "Number of frames (must be 8n+1, e.g., 9, 17, 25, 33...)")
+    var frames: Int = 121
+
+    @Option(name: .long, help: "Random seed for reproducibility")
+    var seed: UInt64?
+
+    @Flag(name: .long, help: "Enhance prompt using Gemma before generation")
+    var enhancePrompt: Bool = false
+
+    @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
+    var transformerQuant: String = "bf16"
+
+    @Option(name: .long, help: "Video bitrate in kbps (e.g., 1000 for 1 Mbps). Default: quality-based encoding")
+    var bitrate: Int?
+
+    @Flag(name: .long, help: "Enable debug output")
+    var debug: Bool = false
+
+    @Flag(name: .long, help: "Enable performance profiling")
+    var profile: Bool = false
+
+    @Option(name: .long, help: "HuggingFace token for gated models")
+    var hfToken: String?
+
+    @Option(name: .long, help: "Custom directory for model storage")
+    var modelsDir: String?
+
+    @Option(name: .long, help: "Path to local Gemma model directory")
+    var gemmaPath: String?
+
+    @Option(name: .long, help: "Path to local LTX unified weights file")
+    var ltxWeights: String?
+
+    mutating func run() async throws {
+        if let dir = modelsDir {
+            LTXModelRegistry.customModelsDirectory = URL(fileURLWithPath: dir)
+        }
+
+        if debug {
+            LTXDebug.enableDebugMode()
+        }
+
+        print("LTX-2.3 Video Retake (Two-Stage Distilled)")
+        print("============================================")
+        print("Source video: \(video)")
+        print("Prompt: \(prompt)")
+        print("Strength: \(strength)")
+        if let st = startTime, let et = endTime {
+            print("Partial retake: \(st)s - \(et)s")
+        } else if let st = startTime {
+            print("Partial retake: \(st)s - end")
+        } else if let et = endTime {
+            print("Partial retake: start - \(et)s")
+        }
+        print("Output: \(output)")
+        print("Resolution: \(width)x\(height) (stage 1: \(width/2)x\(height/2))")
+        print("Frames: \(frames)")
+        if let seed = seed {
+            print("Seed: \(seed)")
+        }
+        if enhancePrompt { print("Prompt enhancement: enabled") }
+        if transformerQuant != "bf16" { print("Transformer quantization: \(transformerQuant)") }
+        print()
+
+        // Validate
+        guard (frames - 1) % 8 == 0 else {
+            throw ValidationError("Frame count must be 8n+1 (e.g., 9, 17, 25, 33, ...). Got \(frames)")
+        }
+        guard width % 64 == 0 && height % 64 == 0 else {
+            throw ValidationError("Width and height must be divisible by 64. Got \(width)x\(height)")
+        }
+        guard FileManager.default.fileExists(atPath: video) else {
+            throw ValidationError("Source video not found: \(video)")
+        }
+        guard strength > 0.0 && strength <= 1.0 else {
+            throw ValidationError("Strength must be in (0.0, 1.0]. Got \(strength)")
+        }
+
+        // Parse quantization
+        guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
+            throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
+        }
+        let quantConfig = LTXQuantizationConfig(transformer: quantOption)
+
+        // Create pipeline
+        print("Creating pipeline...")
+        fflush(stdout)
+        let pipeline = LTXPipeline(
+            model: .distilled,
+            quantization: quantConfig,
+            hfToken: hfToken
+        )
+        print("Pipeline created")
+        fflush(stdout)
+
+        // Load models
+        print("Loading models (this may take a while)...")
+        fflush(stdout)
+        let startLoad = Date()
+        try await pipeline.loadModels(
+            progressCallback: { progress in
+                print("  \(progress.message) (\(Int(progress.progress * 100))%)")
+            },
+            gemmaModelPath: gemmaPath,
+            ltxWeightsPath: ltxWeights
+        )
+        let loadTime = Date().timeIntervalSince(startLoad)
+        print("Models loaded in \(String(format: "%.1f", loadTime))s")
+
+        // Download upscaler
+        print("Downloading upscaler weights (if needed)...")
+        fflush(stdout)
+        let upscalerPath = try await pipeline.downloadUpscalerWeights()
+        print("Upscaler weights ready")
+
+        // Build config
+        let config = LTXVideoGenerationConfig(
+            width: width,
+            height: height,
+            numFrames: frames,
+            numSteps: 8,
+            seed: seed,
+            enhancePrompt: enhancePrompt,
+            videoPath: video,
+            retakeStrength: strength,
+            retakeStartTime: startTime,
+            retakeEndTime: endTime
+        )
+
+        // Generate retake
+        print("\nGenerating retake (strength=\(strength))...")
+        fflush(stdout)
+        let startGen = Date()
+
+        let result = try await pipeline.generateRetake(
+            prompt: prompt,
+            config: config,
+            upscalerWeightsPath: upscalerPath,
+            onProgress: { progress in
+                print("  \(progress.status)")
+            },
+            profile: profile
+        )
+
+        let genTime = Date().timeIntervalSince(startGen)
+        print("Retake completed in \(String(format: "%.1f", genTime))s")
+        fflush(stdout)
+
+        // Export video
+        print("\nExporting to \(output)...")
+        fflush(stdout)
+        let outputURL = URL(fileURLWithPath: output)
+
+        var exportConfig = VideoExportConfig.default
+        if let kbps = bitrate {
+            exportConfig.averageBitRate = kbps * 1000
+            print("Using target bitrate: \(kbps) kbps")
+        }
+
+        let videoURL = try await VideoExporter.exportVideo(
+            frames: result.frames,
+            width: width,
+            height: height,
+            fps: 24.0,
+            config: exportConfig,
+            to: outputURL
+        )
+        print("Video saved to: \(videoURL.path)")
+
+        // Print summary
+        print("\n--- Summary ---")
+        print("Seed: \(result.seed)")
+        print("Strength: \(strength)")
+        print("Generation time: \(String(format: "%.1f", result.generationTime))s")
+
+        if profile, let t = result.timings {
+            let f = { (v: Double) -> String in String(format: "%.1f", v) }
+            print("\n--- Profiling ---")
+            print("Text Encoding (Gemma + FE + Connector): \(f(t.textEncoding))s")
+            print("Denoising (\(t.denoiseSteps.count) steps):                 \(f(t.totalDenoise))s")
+            for (i, stepTime) in t.denoiseSteps.enumerated() {
+                print("  Step \(i): \(f(stepTime))s")
+            }
+            print("  Average per step:                      \(f(t.avgStepTime))s")
+            print("VAE Decoding:                            \(f(t.vaeDecode))s")
+            print("Model Loading:                           \(f(loadTime))s")
+            let pipelineTotal = t.textEncoding + t.totalDenoise + t.vaeDecode
+            print("Pipeline total (excl. loading/export):   \(f(pipelineTotal))s")
+            print("\n--- Memory ---")
+            print("Peak GPU memory:                         \(t.peakMemoryMB) MB")
+            print("Mean GPU memory (denoising):              \(t.meanMemoryMB) MB")
+        }
+    }
+}
+
 // MARK: - Download Command
 
 struct Download: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Download model weights from HuggingFace"
     )
-
-    @Option(name: .shortAndLong, help: "Model variant: distilled or dev")
-    var model: String = "distilled"
 
     @Option(name: .long, help: "HuggingFace token for gated models")
     var hfToken: String?
@@ -306,14 +526,10 @@ struct Download: AsyncParsableCommand {
             LTXModelRegistry.customModelsDirectory = URL(fileURLWithPath: dir)
         }
 
+        let modelVariant = LTXModel.distilled
+
         print("LTX-2.3 Model Download")
         print("====================")
-
-        // Parse model variant
-        guard let modelVariant = LTXModel(rawValue: model) else {
-            throw ValidationError("Invalid model: \(model). Use: distilled or dev")
-        }
-
         print("Model: \(modelVariant.displayName)")
         print("Repository: \(modelVariant.huggingFaceRepo)")
         print("Estimated RAM: ~\(modelVariant.estimatedVRAM)GB")
@@ -321,7 +537,7 @@ struct Download: AsyncParsableCommand {
 
         let downloader = ModelDownloader(hfToken: hfToken)
 
-        // Download all components (Diffusers per-component format)
+        // Download all components
         print("Downloading all components for \(modelVariant.displayName)...")
         let paths = try await downloader.downloadAllComponents(model: modelVariant) { progress in
             if let file = progress.currentFile {
@@ -366,6 +582,7 @@ struct Info: ParsableCommand {
 
             Commands:
               generate      - Generate video (T2V or I2V, optional audio)
+              retake        - Retake: regenerate a video with a new prompt (V2V)
               download      - Download model weights
               train         - Fine-tune models with LoRA
               info          - Show this information
@@ -382,6 +599,10 @@ struct Info: ParsableCommand {
 
               # Image-to-video
               ltx-video generate "Make this come alive" --image photo.jpg -w 768 -h 512 -f 25
+
+              # Retake: change a beaver to a cat
+              ltx-video retake "A cat playing in a forest stream" \
+                --video beaver.mp4 --strength 0.8 -w 768 -h 512 -f 121
 
               # With prompt enhancement
               ltx-video generate "A beaver" -w 768 -h 512 -f 121 --enhance-prompt

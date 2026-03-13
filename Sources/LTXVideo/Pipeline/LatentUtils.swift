@@ -1,6 +1,7 @@
 // LatentUtils.swift - Latent Space Utilities for LTX-2
 // Copyright 2025
 
+import AVFoundation
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -93,105 +94,6 @@ func generateScaledNoise(
     return noise * sigma
 }
 
-// MARK: - CFG Preparation
-
-/// Prepare latents for Classifier-Free Guidance by doubling the batch
-///
-/// Creates [unconditional_latent, conditional_latent] for CFG computation.
-///
-/// - Parameter latent: Input latent tensor
-/// - Returns: Doubled latent tensor for CFG
-func prepareForCFG(_ latent: MLXArray) -> MLXArray {
-    return MLX.concatenated([latent, latent], axis: 0)
-}
-
-/// Split CFG output back into unconditional and conditional parts
-///
-/// - Parameter output: Combined output from CFG forward pass
-/// - Returns: Tuple of (unconditional, conditional) outputs
-func splitCFGOutput(_ output: MLXArray) -> (uncond: MLXArray, cond: MLXArray) {
-    let batchSize = output.dim(0) / 2
-    let uncond = output[0..<batchSize]
-    let cond = output[batchSize...]
-    return (uncond, cond)
-}
-
-/// Apply Classifier-Free Guidance
-///
-/// output = uncond + guidance_scale * (cond - uncond)
-///
-/// Matches Python behavior where the scalar * bfloat16 stays bfloat16
-/// (Python float scalars don't promote MLX array dtype).
-///
-/// - Parameters:
-///   - uncond: Unconditional output
-///   - cond: Conditional output
-///   - guidanceScale: CFG scale factor
-/// - Returns: Guided output (same dtype as inputs)
-func applyCFG(
-    uncond: MLXArray,
-    cond: MLXArray,
-    guidanceScale: Float
-) -> MLXArray {
-    // Match Python formula exactly: vel_pos + (cfg_scale - 1.0) * (vel_pos - vel_neg)
-    // This is algebraically identical to uncond + scale * (cond - uncond)
-    // but uses different intermediate values, producing identical bfloat16 rounding.
-    let scaleMinus1 = MLXArray(guidanceScale - 1.0).asType(cond.dtype)
-    return cond + scaleMinus1 * (cond - uncond)
-}
-
-/// Combined CFG application from concatenated output
-func applyCFG(
-    output: MLXArray,
-    guidanceScale: Float
-) -> MLXArray {
-    let (uncond, cond) = splitCFGOutput(output)
-    return applyCFG(uncond: uncond, cond: cond, guidanceScale: guidanceScale)
-}
-
-/// Apply guidance rescale to reduce overexposure from CFG
-///
-/// Operates in denoised (x₀) space matching the Lightricks Python pipeline:
-/// 1. Convert velocities to x₀ = x_t - σ·v (matching X0Model)
-/// 2. Rescale: factor = phi * (cond_x0.std() / pred_x0.std()) + (1 - phi)
-/// 3. Convert back to velocity: v = (x_t - x₀) / σ
-///
-/// Uses global scalar std (over ALL dimensions), NOT per-sample keepDims.
-/// Must be called AFTER both CFG and STG are applied (matching Python order).
-///
-/// - Parameters:
-///   - guidedVelocity: Guided velocity after CFG+STG (B, C, F, H, W)
-///   - condVelocity: Conditional-only velocity (B, C, F, H, W)
-///   - latent: Current noisy sample x_t
-///   - sigma: Current noise level
-///   - phi: Rescale factor (0.0 = no rescale, 0.7 = recommended)
-/// - Returns: Rescaled velocity
-func applyGuidanceRescale(
-    guidedVelocity: MLXArray,
-    condVelocity: MLXArray,
-    latent: MLXArray,
-    sigma: Float,
-    phi: Float
-) -> MLXArray {
-    guard phi > 0.0 else { return guidedVelocity }
-
-    let s = MLXArray(sigma).asType(.float32)
-    let lat = latent.asType(.float32)
-
-    // Convert to x₀ space (matching X0Model: x₀ = x_t - σ·v)
-    let condX0 = lat - s * condVelocity.asType(.float32)
-    let guidedX0 = lat - s * guidedVelocity.asType(.float32)
-
-    // Rescale in x₀ space (matching Python guiders.py)
-    let condStd = MLX.sqrt(MLX.variance(condX0) + 1e-8)
-    let predStd = MLX.sqrt(MLX.variance(guidedX0) + 1e-8)
-    let factor = MLXArray(phi) * (condStd / predStd) + MLXArray(1.0 - phi)
-    let rescaledX0 = guidedX0 * factor
-
-    // Convert back to velocity: v = (x_t - x₀) / σ
-    return ((lat - rescaledX0) / s).asType(guidedVelocity.dtype)
-}
-
 // MARK: - Latent Normalization
 
 /// Normalize latent to have zero mean and unit variance per channel
@@ -260,19 +162,13 @@ func adjustDimensions(
 func estimateMemoryUsage(
     shape: VideoLatentShape,
     numSteps: Int,
-    cfg: Bool = true,
     dtype: DType = .float32
 ) -> Int64 {
     let bytesPerElement: Int64 = (dtype == .float16 || dtype == .bfloat16) ? 2 : 4
 
     // Latent memory
     let latentElements = Int64(shape.batch * shape.channels * shape.frames * shape.height * shape.width)
-    var latentMemory = latentElements * bytesPerElement
-
-    // Double for CFG
-    if cfg {
-        latentMemory *= 2
-    }
+    let latentMemory = latentElements * bytesPerElement
 
     // Token memory (patchified)
     let tokenMemory = Int64(shape.batch * shape.tokenCount * shape.channels) * bytesPerElement
@@ -353,6 +249,105 @@ func loadImage(from path: String, width: Int, height: Int) throws -> MLXArray {
     let result = chw.reshaped([1, 3, 1, height, width])
 
     LTXDebug.log("Image tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+
+    return result
+}
+
+// MARK: - Video Loading
+
+/// Load a video from disk, extract frames at target resolution, and normalize to [-1, 1]
+///
+/// Returns shape (1, 3, numFrames, H, W) — batch, channels, temporal, height, width
+///
+/// Uses AVFoundation to extract uniformly-spaced frames from the video file,
+/// resize each frame to the target dimensions, and normalize pixel values.
+///
+/// - Parameters:
+///   - path: Path to the video file (MP4, MOV, etc.)
+///   - width: Target width in pixels
+///   - height: Target height in pixels
+///   - numFrames: Number of frames to extract (must be 8n+1)
+/// - Returns: Normalized video tensor ready for VAE encoding
+/// - Throws: LTXError.fileNotFound if video cannot be loaded
+func loadVideo(from path: String, width: Int, height: Int, numFrames: Int) async throws -> MLXArray {
+    let url = URL(fileURLWithPath: path)
+    guard FileManager.default.fileExists(atPath: path) else {
+        throw LTXError.fileNotFound("Video file not found: \(path)")
+    }
+
+    let asset = AVURLAsset(url: url)
+    let duration = try await asset.load(.duration)
+    let durationSeconds = CMTimeGetSeconds(duration)
+
+    guard durationSeconds > 0 else {
+        throw LTXError.videoProcessingFailed("Video has zero duration: \(path)")
+    }
+
+    LTXDebug.log("Loading video: \(path), duration=\(String(format: "%.2f", durationSeconds))s, extracting \(numFrames) frames at \(width)x\(height)")
+
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.requestedTimeToleranceBefore = .zero
+    generator.requestedTimeToleranceAfter = .zero
+    generator.maximumSize = CGSize(width: width, height: height)
+
+    // Uniformly sample numFrames times from the video duration
+    var requestTimes: [CMTime] = []
+    for i in 0..<numFrames {
+        let fraction = Double(i) / Double(max(numFrames - 1, 1))
+        let seconds = fraction * durationSeconds
+        requestTimes.append(CMTime(seconds: seconds, preferredTimescale: 600))
+    }
+
+    // Extract and process frames
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    var allPixels = [Float]()
+    allPixels.reserveCapacity(numFrames * height * width * 3)
+
+    for (frameIdx, time) in requestTimes.enumerated() {
+        let cgImage: CGImage
+        do {
+            let (image, _) = try await generator.image(at: time)
+            cgImage = image
+        } catch {
+            throw LTXError.videoProcessingFailed("Failed to extract frame \(frameIdx) at \(CMTimeGetSeconds(time))s: \(error)")
+        }
+
+        // Resize to exact target dimensions using CoreGraphics
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else {
+            throw LTXError.videoProcessingFailed("Failed to create graphics context for frame \(frameIdx)")
+        }
+
+        context.interpolationQuality = .high
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        guard let data = context.data else {
+            throw LTXError.videoProcessingFailed("Failed to get pixel data from frame \(frameIdx)")
+        }
+
+        // Convert RGBA to float RGB normalized to [-1, 1]
+        let ptr = data.bindMemory(to: UInt8.self, capacity: height * width * 4)
+        for i in 0..<(height * width) {
+            allPixels.append(Float(ptr[i * 4 + 0]) / 127.5 - 1.0)  // R
+            allPixels.append(Float(ptr[i * 4 + 1]) / 127.5 - 1.0)  // G
+            allPixels.append(Float(ptr[i * 4 + 2]) / 127.5 - 1.0)  // B
+        }
+    }
+
+    // Build tensor: (F, H, W, 3) -> (3, F, H, W) -> (1, 3, F, H, W)
+    let fhwc = MLXArray(allPixels, [numFrames, height, width, 3])
+    let cfhw = fhwc.transposed(3, 0, 1, 2)  // (3, F, H, W)
+    let result = cfhw.reshaped([1, 3, numFrames, height, width])
+
+    LTXDebug.log("Video tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
 
     return result
 }

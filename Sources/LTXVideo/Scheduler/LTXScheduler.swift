@@ -225,6 +225,34 @@ class LTXScheduler: @unchecked Sendable {
         stepIndex = 0
     }
 
+    /// Truncate the current sigma schedule for retake based on strength.
+    ///
+    /// Returns a sub-schedule starting at `strength`, followed by the remaining sigmas
+    /// in the current schedule that are strictly less than `strength`, ending at 0.0.
+    ///
+    /// For example, with distilled sigmas `[1.0, 0.994, ..., 0.909, 0.725, 0.422, 0.0]`
+    /// and `strength=0.8`, the result is `[0.8, 0.725, 0.422, 0.0]` (3 denoising steps).
+    ///
+    /// - Parameter strength: Retake strength in (0.0, 1.0]. Determines how much noise
+    ///   is added to the source and where the schedule starts.
+    /// - Returns: Truncated sigma schedule including the terminal 0.0.
+    func truncatedSigmas(forStrength strength: Float) -> [Float] {
+        guard !sigmas.isEmpty else { return [strength, 0.0] }
+
+        // Find sigmas in the current schedule that are strictly less than strength
+        var truncated: [Float] = [strength]
+        for sigma in sigmas {
+            if sigma < strength && sigma > 0 {
+                truncated.append(sigma)
+            }
+        }
+        // Ensure terminal 0.0
+        if truncated.last != 0.0 {
+            truncated.append(0.0)
+        }
+        return truncated
+    }
+
     /// Get sigma schedule for the given number of steps
     ///
     /// - Parameter numSteps: Number of denoising steps

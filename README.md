@@ -1,28 +1,16 @@
 # LTX-Video-Swift-MLX
 
-> **MAJOR CHANGE — WORK IN PROGRESS: LTX 2.3 Support**
->
-> This project is being upgraded from LTX-2.0 to **LTX-2.3** (Lightricks, March 2026). The codebase is under active development. Some features are validated, others are pending adaptation.
-
 Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video generation, optimized for Apple Silicon using [MLX](https://github.com/ml-explore/mlx-swift). Runs entirely on-device.
 
-## LTX 2.3 Migration Status
+## Features
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Text-to-Video (two-stage distilled) | **Done** | Matches HuggingFace Space quality |
 | Image-to-Video (two-stage distilled) | **Done** | Condition on first frame |
-| Video-to-Video (Retake) | Pending | |
+| Video-to-Video (Retake) | **Done** | Full + partial temporal retake |
 | Audio generation (I2V + audio) | **Done** | Dual video/audio denoising |
 | Quantization (qint8/int4) | **Done** | [Benchmarked](docs/benchmarks/) — int4 halves memory |
-
-## What's New in LTX 2.3
-
-- **Unified Gemma VLM**: Single `gemma-3-12b-it-qat-4bit` (~7.5 GB) replaces per-variant bf16 text encoders (~24 GB each)
-- **22B Transformer**: 48 blocks with gated attention, cross-attention AdaLN, SST (9 values)
-- **Unified weights**: Single `.safetensors` file per variant, split at load time
-- **Feature Extractor V2**: Per-token RMS norm + rescale (replaces V1 per-segment normalization)
-- **Two-stage pipeline**: Built-in half-res generation + 2x spatial upscaling + refinement
 
 ## Requirements
 
@@ -61,6 +49,19 @@ ltx-video generate "A beaver building a dam" -w 768 -h 512 -f 121 --enhance-prom
 
 # With quantization (lower memory)
 ltx-video generate "A sunset over mountains" -w 768 -h 512 -f 121 --transformer-quant qint8
+```
+
+### Retake (Video-to-Video)
+
+```bash
+# Full retake: regenerate entire video with new prompt
+ltx-video retake "A cat building a dam in a forest stream" \
+    --video source.mp4 --strength 0.8 -w 768 -h 512 -f 121
+
+# Partial retake: regenerate only seconds 7-10
+ltx-video retake "The vase explodes into colorful smoke" \
+    --video source.mp4 --strength 0.75 \
+    --start-time 7.0 --end-time 10.0 -w 768 -h 512 -f 241
 ```
 
 Models (~30 GB total) are downloaded automatically on first run from [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) and [mlx-community/gemma-3-12b-it-qat-4bit](https://huggingface.co/mlx-community/gemma-3-12b-it-qat-4bit).
@@ -108,6 +109,23 @@ flowchart TD
 | `--debug` | off | Debug output |
 | `--profile` | off | Timing/memory breakdown |
 
+### `ltx-video retake`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<prompt>` | required | New text prompt |
+| `--video` | required | Source video path |
+| `--strength` | `0.8` | How much to change (0.0 = keep, 1.0 = full regen) |
+| `--start-time` | none | Start of region to regenerate (seconds) |
+| `--end-time` | none | End of region to regenerate (seconds) |
+| `-o, --output` | `retake.mp4` | Output file path |
+| `-w, --width` | `768` | Video width (divisible by 64) |
+| `-h, --height` | `512` | Video height (divisible by 64) |
+| `-f, --frames` | `121` | Frame count (must be 8n+1) |
+| `--seed` | random | Random seed |
+| `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
+| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+
 ### `ltx-video download`
 
 Pre-download model weights.
@@ -137,6 +155,18 @@ See [docs/examples/](docs/examples/) for generation examples with parameters and
 [![Audio 1024x576 10s preview](docs/examples/audio/i2v-audio-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/audio/i2v-audio-1024x576-10s.mp4)
 
 *Red 2CV engine start with synchronized audio — dual video/audio denoising, 241 frames. [Full details →](docs/examples/audio/)*
+
+### Full Retake — Beaver to Cat (5 seconds, 768x512)
+
+[![Full retake preview](docs/examples/retake/retake-full-768x512-5s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/retake/retake-full-768x512-5s.mp4)
+
+*Source beaver video regenerated as a cat — strength 0.8, prompt enhanced, 121 frames. [Full details →](docs/examples/retake/)*
+
+### Partial Retake — Vase Explodes (10 seconds, 768x512)
+
+[![Partial retake preview](docs/examples/retake/retake-partial-768x512-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/retake/retake-partial-768x512-10s.mp4)
+
+*Last 3 seconds regenerated with exploding vase — first 7s preserved from source, 241 frames. [Full details →](docs/examples/retake/)*
 
 ## Performance
 
