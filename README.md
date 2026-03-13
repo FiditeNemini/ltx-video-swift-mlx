@@ -14,7 +14,7 @@ Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video gen
 | Image-to-Video (two-stage distilled) | **Done** | Condition on first frame |
 | Video-to-Video (Retake) | Pending | |
 | Audio generation (I2V + audio) | **Done** | Dual video/audio denoising |
-| Quantization (qint8/int4) | Pending validation | |
+| Quantization (qint8/int4) | **Done** | [Benchmarked](docs/benchmarks/) — int4 halves memory |
 
 ## What's New in LTX 2.3
 
@@ -140,9 +140,21 @@ See [docs/examples/](docs/examples/) for generation examples with parameters and
 
 ## Performance
 
-*Work in progress — full benchmarks pending complete LTX 2.3 adaptation.*
+Benchmarked on Apple Silicon **M3 Max 96GB**, macOS 26.3 (Tahoe).
 
-Hardware: Apple Silicon M3 Max 96GB.
+### I2V + Audio — 1024x576, 241 frames (10s)
+
+| Quantization | Generation Time | Peak GPU | Mean GPU (denoise) | Audio Quality |
+|---|---|---|---|---|
+| **bf16** (default) | 1145s | 54.8 GB | 49.7 GB | -11.7 dBFS peak |
+| **qint8** | 1458s | 44.6 GB | 32.7 GB | -12.2 dBFS peak |
+| **int4** | 1294s | 38.4 GB | 23.7 GB | -11.9 dBFS peak |
+
+- **bf16** is fastest when the model fits in memory (96GB+)
+- **int4** halves denoising memory (24 GB vs 50 GB) — enables 32-64 GB machines
+- Audio quality is preserved across all quantization levels
+
+See [docs/benchmarks/](docs/benchmarks/) for full benchmark details and methodology.
 
 ## Constraints
 
