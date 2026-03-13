@@ -53,6 +53,12 @@ struct Generate: AsyncParsableCommand {
     @Flag(name: .long, help: "Enhance prompt using Gemma before generation")
     var enhancePrompt: Bool = false
 
+    @Option(name: .long, help: "Path to LoRA .safetensors file to apply during generation")
+    var lora: String?
+
+    @Option(name: .long, help: "LoRA scale factor (default: 1.0)")
+    var loraScale: Float = 1.0
+
     @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
     var transformerQuant: String = "bf16"
 
@@ -110,6 +116,9 @@ struct Generate: AsyncParsableCommand {
                 print("Prompt enhancement: enabled (text-only T2V)")
             }
         }
+        if let loraPath = lora {
+            print("LoRA: \(loraPath) (scale: \(loraScale))")
+        }
         if audio { print("Audio: enabled (dual video/audio generation)") }
         if transformerQuant != "bf16" { print("Transformer quantization: \(transformerQuant)") }
         print()
@@ -163,6 +172,14 @@ struct Generate: AsyncParsableCommand {
                 print("  \(progress.message) (\(Int(progress.progress * 100))%)")
             }
             print("Audio models loaded")
+        }
+
+        // Fuse LoRA if specified (after model loading, before generation)
+        if let loraPath = lora {
+            print("Fusing LoRA weights...")
+            fflush(stdout)
+            let fusedCount = try await pipeline.fuseLoRA(from: loraPath, scale: loraScale)
+            print("LoRA fused (\(fusedCount) weight updates)")
         }
 
         // Download upscaler (always needed for two-stage)
