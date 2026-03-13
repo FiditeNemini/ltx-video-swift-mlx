@@ -42,15 +42,15 @@ struct LoRAConfig: Codable, Sendable {
 /// Scheduler configuration overrides for specialized LoRAs (e.g., Turbo)
 public struct LoRASchedulerOverrides: Codable, Sendable {
     /// Override number of inference steps
-    let numSteps: Int?
+    public let numSteps: Int?
 
     /// Override guidance scale
-    let guidanceScale: Float?
+    public let guidanceScale: Float?
 
     /// Custom sigma schedule
-    let sigmas: [Float]?
+    public let sigmas: [Float]?
 
-    init(
+    public init(
         numSteps: Int? = nil,
         guidanceScale: Float? = nil,
         sigmas: [Float]? = nil

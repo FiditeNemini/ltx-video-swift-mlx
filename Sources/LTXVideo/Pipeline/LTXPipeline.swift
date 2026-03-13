@@ -63,9 +63,9 @@ public typealias FramePreviewCallback = @Sendable (Int, CGImage) -> Void
 /// across actor isolation boundaries for training.
 ///
 /// - Warning: The caller must ensure single-threaded access to the wrapped module.
-public final class TransformerRef: @unchecked Sendable {
-    public let module: Module
-    public init(_ module: Module) { self.module = module }
+final class TransformerRef: @unchecked Sendable {
+    let module: Module
+    init(_ module: Module) { self.module = module }
 }
 
 // MARK: - LTX Pipeline
@@ -1678,13 +1678,6 @@ public actor LTXPipeline {
         LTXDebug.log("VAE encoder loaded (\(encoderWeights.count) weights)")
     }
 
-    /// Unload VAE encoder to free memory
-    private func unloadVAEEncoder() {
-        self.vaeEncoder = nil
-        eval([MLXArray]())
-        Memory.clearCache()
-        LTXDebug.log("VAE encoder unloaded")
-    }
 
     /// Encode an image into latent space using the VAE encoder
     ///
@@ -2159,7 +2152,7 @@ public actor LTXPipeline {
     ///
     /// - Warning: The caller is responsible for ensuring single-threaded access
     ///   to the returned module during training.
-    public func getTransformerForTraining() throws -> TransformerRef {
+    func getTransformerForTraining() throws -> TransformerRef {
         if let t = ltx2Transformer { return TransformerRef(t) }
         if let t = transformer { return TransformerRef(t) }
         throw LTXError.modelNotLoaded("Transformer not loaded. Call loadModels() first.")
@@ -2225,9 +2218,11 @@ public actor LTXPipeline {
         )
     }
 
-    /// Unload VAE encoder (public for training pipeline)
-    public func unloadVAEEncoderPublic() {
-        unloadVAEEncoder()
+    /// Unload VAE encoder to free memory.
+    public func unloadVAEEncoder() {
+        vaeEncoder = nil
+        Memory.clearCache()
+        LTXDebug.log("VAE encoder unloaded")
     }
 
     // MARK: - Memory Management
@@ -2393,10 +2388,3 @@ extension VideoLatentShape {
 
 // MARK: - Convenience Functions
 
-/// Create and configure an LTX pipeline
-public func createPipeline(
-    model: LTXModel = .distilled,
-    hfToken: String? = nil
-) -> LTXPipeline {
-    return LTXPipeline(model: model, hfToken: hfToken)
-}

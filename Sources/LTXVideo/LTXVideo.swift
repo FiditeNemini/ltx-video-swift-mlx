@@ -345,12 +345,3 @@ public struct VideoGenerationResult: @unchecked Sendable {
     }
 }
 
-// MARK: - Re-exports
-
-// Re-export configuration types
-public typealias Model = LTXModel
-public typealias TransformerConfig = LTXTransformerConfig
-public typealias VideoConfig = LTXVideoGenerationConfig
-public typealias ModelRegistry = LTXModelRegistry
-public typealias QuantizationConfig = LTXQuantizationConfig
-public typealias Encoder = VideoEncoder

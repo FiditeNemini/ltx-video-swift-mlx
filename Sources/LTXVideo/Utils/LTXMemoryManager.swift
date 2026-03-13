@@ -59,7 +59,7 @@ public enum LTXMemoryManager {
     // MARK: - Phase-Based Cache Limits
 
     /// Pipeline phases with recommended cache limits
-    public enum Phase {
+    enum Phase {
         case textEncoding
         case denoising
         case vaeDecode
@@ -79,7 +79,7 @@ public enum LTXMemoryManager {
     /// Set cache limit for a specific pipeline phase
     ///
     /// - Parameter phase: The pipeline phase to configure for
-    public static func setPhase(_ phase: Phase) {
+    static func setPhase(_ phase: Phase) {
         let limit = phase.recommendedCacheLimit
         if limit > 0 {
             Memory.cacheLimit = limit

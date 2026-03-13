@@ -45,9 +45,6 @@ let package = Package(
             dependencies: [
                 "LTXVideo",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
         // MARK: - Tests

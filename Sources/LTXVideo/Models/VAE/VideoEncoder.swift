@@ -212,7 +212,7 @@ class EncoderDownBlock: Module {
 /// Safetensors flat block layout (0-8):
 ///   0=res(128,4), 1=ds(1,2,2), 2=res(256,6), 3=ds(2,1,1),
 ///   4=res(512,4), 5=ds(2,2,2), 6=res(1024,2), 7=ds(2,2,2), 8=mid_res(1024,2)
-public class VideoEncoder: Module {
+class VideoEncoder: Module {
     @ModuleInfo(key: "conv_in") var convIn: CausalConv3dFull
     @ModuleInfo(key: "conv_out") var convOut: CausalConv3dFull
 

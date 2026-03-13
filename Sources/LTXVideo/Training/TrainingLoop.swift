@@ -130,7 +130,7 @@ public class LoRATrainer {
         // Step 4: Unload Gemma and VAE encoder to free memory
         print("Unloading Gemma and VAE encoder...")
         await pipeline.clearGemma()
-        await pipeline.unloadVAEEncoderPublic()
+        await pipeline.unloadVAEEncoder()
         Memory.clearCache()
 
         // Step 5: Get transformer and inject LoRA

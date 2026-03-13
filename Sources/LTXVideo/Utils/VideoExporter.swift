@@ -59,7 +59,7 @@ public struct VideoExportConfig: Sendable {
 // MARK: - Video Exporter Result
 
 /// Result of video export containing CGImage frames
-public struct VideoExportFrames: Sendable {
+struct VideoExportFrames: Sendable {
     /// Generated frames as CGImages
     public let frames: [CGImage]
 
@@ -131,7 +131,7 @@ public actor VideoExporter {
     ///   - result: Video export frames
     ///   - outputURL: Output file URL
     /// - Returns: URL to the exported video
-    public func export(
+    func export(
         _ result: VideoExportFrames,
         to outputURL: URL
     ) async throws -> URL {

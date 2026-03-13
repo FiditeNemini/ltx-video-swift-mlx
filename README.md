@@ -10,6 +10,7 @@ Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video gen
 | Image-to-Video (two-stage distilled) | **Done** | Condition on first frame |
 | Video-to-Video (Retake) | **Done** | Full + partial temporal retake |
 | Audio generation (I2V + audio) | **Done** | Dual video/audio denoising |
+| LoRA inference | **Done** | Fuse any LTX-2.3 compatible LoRA |
 | Quantization (qint8/int4) | **Done** | [Benchmarked](docs/benchmarks/) — int4 halves memory |
 
 ## Requirements
@@ -51,6 +52,27 @@ ltx-video generate "A beaver building a dam" -w 768 -h 512 -f 121 --enhance-prom
 ltx-video generate "A sunset over mountains" -w 768 -h 512 -f 121 --transformer-quant qint8
 ```
 
+### Image-to-Video
+
+```bash
+ltx-video generate "The car drives away into the sunset" \
+    --image photo.png -w 768 -h 512 -f 121 --enhance-prompt
+```
+
+### LoRA
+
+```bash
+# Apply a LoRA during generation
+ltx-video generate "arc shot, camera orbiting the subject, a red car on a road" \
+    --image photo.png \
+    --lora /path/to/lora.safetensors \
+    -w 768 -h 512 -f 121
+
+# Adjust LoRA strength
+ltx-video generate "arc shot, camera orbiting the subject" \
+    --lora /path/to/lora.safetensors --lora-scale 0.5
+```
+
 ### Retake (Video-to-Video)
 
 ```bash
@@ -64,7 +86,44 @@ ltx-video retake "The vase explodes into colorful smoke" \
     --start-time 7.0 --end-time 10.0 -w 768 -h 512 -f 241
 ```
 
-Models (~30 GB total) are downloaded automatically on first run from [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) and [mlx-community/gemma-3-12b-it-qat-4bit](https://huggingface.co/mlx-community/gemma-3-12b-it-qat-4bit).
+### Audio
+
+```bash
+ltx-video generate "A car engine starting" \
+    --image car.png --audio -w 768 -h 512 -f 121
+```
+
+Models (~30 GB total) are downloaded automatically on first run from [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) and [mlx-community/gemma-3-12b-it-qat-4bit](https://huggingface.co/mlx-community/gemma-3-12b-it-qat-4bit).
+
+## Swift Package Integration
+
+Add to your `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/VincentGourbin/ltx-video-swift-mlx.git", branch: "main")
+]
+```
+
+```swift
+import LTXVideo
+
+let pipeline = LTXPipeline(model: .distilled)
+try await pipeline.loadModels()
+let upscalerPath = try await pipeline.downloadUpscalerWeights()
+
+let config = LTXVideoGenerationConfig(width: 768, height: 512, numFrames: 121)
+let result = try await pipeline.generateVideo(
+    prompt: "A cat walking in a garden",
+    config: config,
+    upscalerWeightsPath: upscalerPath
+)
+
+try await VideoExporter.exportVideo(
+    frames: result.frames, width: 768, height: 512,
+    to: URL(fileURLWithPath: "output.mp4")
+)
+```
 
 ## Pipeline Architecture
 
@@ -103,9 +162,13 @@ flowchart TD
 | `-f, --frames` | `121` | Frame count (must be 8n+1) |
 | `--seed` | random | Random seed |
 | `--image` | none | Input image for I2V |
+| `--lora` | none | Path to LoRA .safetensors file |
+| `--lora-scale` | `1.0` | LoRA strength (0.0–1.0) |
 | `--audio` | off | Enable audio generation |
+| `--audio-gain` | `1.0` | Audio gain (linear) |
 | `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
 | `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+| `--bitrate` | auto | Video bitrate in kbps |
 | `--debug` | off | Debug output |
 | `--profile` | off | Timing/memory breakdown |
 
@@ -149,6 +212,14 @@ See [docs/examples/](docs/examples/) for generation examples with parameters and
 [![I2V 1024x576 10s preview](docs/examples/image-to-video/i2v-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/image-to-video/i2v-1024x576-10s.mp4)
 
 *Red 2CV taking off Back to the Future style — from input image, 241 frames, prompt enhanced. [Full details →](docs/examples/image-to-video/)*
+
+### LoRA — Camera Arcshot (5 seconds, 768x512)
+
+| With arcshot LoRA | Without LoRA |
+|---|---|
+| [![With LoRA](docs/examples/lora/arcshot-lora-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/lora/i2v-arcshot-v2-lora.mp4) | [![Without LoRA](docs/examples/lora/arcshot-nolora-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/lora/i2v-arcshot-v2-nolora.mp4) |
+
+*Same prompt and seed — the LoRA adds arc shot camera movement. [Full details →](docs/examples/lora/)*
 
 ### Image-to-Video + Audio (10 seconds, 1024x576)
 
