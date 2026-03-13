@@ -762,11 +762,11 @@ public actor LTXPipeline {
                     videoLatent: videoPatchified,
                     audioLatent: audioPatchified,
                     videoContext: videoTextEmbeddings.asType(.bfloat16),
-                    audioContext: videoTextEmbeddings.asType(.bfloat16),
+                    audioContext: audioTextEmbeddings.asType(.bfloat16),
                     videoTimesteps: videoTimestep,
                     audioTimesteps: audioTimestep,
                     videoContextMask: textMask,
-                    audioContextMask: textMask,
+                    audioContextMask: nil,
                     videoLatentShape: (frames: stage1Shape.frames, height: stage1Shape.height, width: stage1Shape.width),
                     audioNumFrames: audioNumFrames
                 )
@@ -955,11 +955,11 @@ public actor LTXPipeline {
                     videoLatent: videoPatchified,
                     audioLatent: audioPatchified,
                     videoContext: videoTextEmbeddings.asType(.bfloat16),
-                    audioContext: videoTextEmbeddings.asType(.bfloat16),
+                    audioContext: audioTextEmbeddings.asType(.bfloat16),
                     videoTimesteps: videoTimestep,
                     audioTimesteps: audioTimestep,
                     videoContextMask: textMask,
-                    audioContextMask: textMask,
+                    audioContextMask: nil,
                     videoLatentShape: (frames: stage2Shape.frames, height: stage2Shape.height, width: stage2Shape.width),
                     audioNumFrames: audioNumFrames
                 )

@@ -13,7 +13,7 @@ Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video gen
 | Text-to-Video (two-stage distilled) | **Done** | Matches HuggingFace Space quality |
 | Image-to-Video (two-stage distilled) | **Done** | Condition on first frame |
 | Video-to-Video (Retake) | Pending | |
-| Audio generation | Pending | |
+| Audio generation (I2V + audio) | **Done** | Dual video/audio denoising |
 | Quantization (qint8/int4) | Pending validation | |
 
 ## What's New in LTX 2.3
@@ -131,6 +131,12 @@ See [docs/examples/](docs/examples/) for generation examples with parameters and
 [![I2V 1024x576 10s preview](docs/examples/image-to-video/i2v-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/image-to-video/i2v-1024x576-10s.mp4)
 
 *Red 2CV taking off Back to the Future style — from input image, 241 frames, prompt enhanced. [Full details →](docs/examples/image-to-video/)*
+
+### Image-to-Video + Audio (10 seconds, 1024x576)
+
+[![Audio 1024x576 10s preview](docs/examples/audio/i2v-audio-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/audio/i2v-audio-1024x576-10s.mp4)
+
+*Red 2CV engine start with synchronized audio — dual video/audio denoising, 241 frames. [Full details →](docs/examples/audio/)*
 
 ## Performance
 

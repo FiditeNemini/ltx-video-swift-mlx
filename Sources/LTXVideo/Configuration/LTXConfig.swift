@@ -131,6 +131,10 @@ public struct LTXTransformerConfig: Codable, Sendable {
     /// LTX-2.3: enable cross-attention AdaLN (prompt_adaln_single + prompt_scale_shift_table)
     public var crossAttentionAdaLN: Bool
 
+    /// LTX-2.3 22B: caption projection is done in the connector, not the transformer.
+    /// When true, both `captionProjection` and `audioCaptionProjection` are skipped.
+    public var captionProjBeforeConnector: Bool
+
     public init(
         numLayers: Int = 48,
         numAttentionHeads: Int = 32,
@@ -149,7 +153,8 @@ public struct LTXTransformerConfig: Codable, Sendable {
         audioOutChannels: Int = 128,
         audioMaxPos: [Int] = [20],
         gatedAttention: Bool = false,
-        crossAttentionAdaLN: Bool = false
+        crossAttentionAdaLN: Bool = false,
+        captionProjBeforeConnector: Bool = false
     ) {
         self.numLayers = numLayers
         self.numAttentionHeads = numAttentionHeads
@@ -169,6 +174,7 @@ public struct LTXTransformerConfig: Codable, Sendable {
         self.audioMaxPos = audioMaxPos
         self.gatedAttention = gatedAttention
         self.crossAttentionAdaLN = crossAttentionAdaLN
+        self.captionProjBeforeConnector = captionProjBeforeConnector
     }
 
     // MARK: - Audio Configuration
@@ -198,7 +204,8 @@ public struct LTXTransformerConfig: Codable, Sendable {
     public static let ltx23 = LTXTransformerConfig(
         captionChannels: 4096,
         gatedAttention: true,
-        crossAttentionAdaLN: true
+        crossAttentionAdaLN: true,
+        captionProjBeforeConnector: true
     )
 }
 

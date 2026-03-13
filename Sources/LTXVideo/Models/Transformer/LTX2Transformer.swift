@@ -79,7 +79,7 @@ class LTX2Transformer: Module {
         // --- Video ---
         self._patchifyProj.wrappedValue = Linear(config.inChannels, videoDim, bias: true)
         self._adalnSingle.wrappedValue = AdaLayerNormSingle(innerDim: videoDim, numEmbeddings: numEmb)
-        if config.captionChannels != videoDim {
+        if !config.captionProjBeforeConnector && config.captionChannels != videoDim {
             self._captionProjection.wrappedValue = PixArtAlphaTextProjection(
                 inFeatures: config.captionChannels, hiddenSize: videoDim
             )
@@ -93,7 +93,7 @@ class LTX2Transformer: Module {
         self._audioProjOut.wrappedValue = Linear(audioDim, config.audioOutChannels)
         self._audioNormOut.wrappedValue = LayerNorm(dimensions: audioDim, eps: config.normEps, affine: false)
         self._audioTimeEmbed.wrappedValue = AdaLayerNormSingle(innerDim: audioDim, numEmbeddings: numEmb)
-        if config.captionChannels != audioDim {
+        if !config.captionProjBeforeConnector && config.captionChannels != audioDim {
             self._audioCaptionProjection.wrappedValue = PixArtAlphaTextProjection(
                 inFeatures: config.captionChannels, hiddenSize: audioDim
             )
@@ -313,14 +313,30 @@ class LTX2Transformer: Module {
         }
 
         // --- Prompt AdaLN for cross-attention (LTX-2.3) ---
+        // Prompt AdaLN modulates text context, so use scalar timestep
+        // even when video uses per-token timesteps (I2V conditioning mask)
         var videoPromptTs: MLXArray? = nil
         var audioPromptTs: MLXArray? = nil
         if let promptAdaln = promptAdalnSingle {
-            let (pEmb, _) = promptAdaln(scaledVideoTs.flattened())
+            let scalarVideoTs: MLXArray
+            if videoTimesteps.ndim > 1 {
+                scalarVideoTs = videoTimesteps.max(axis: 1)  // (B,)
+            } else {
+                scalarVideoTs = videoTimesteps  // Already scalar (B,)
+            }
+            let scaledTs = scalarVideoTs * Float(config.timestepScaleMultiplier)
+            let (pEmb, _) = promptAdaln(scaledTs.flattened())
             videoPromptTs = pEmb.reshaped([batchSize, -1, 2, videoDim])
         }
         if let audioPromptAdaln = audioPromptAdalnSingle {
-            let (apEmb, _) = audioPromptAdaln(scaledAudioTs.flattened())
+            let scalarAudioTs: MLXArray
+            if audioTimesteps.ndim > 1 {
+                scalarAudioTs = audioTimesteps.max(axis: 1)
+            } else {
+                scalarAudioTs = audioTimesteps
+            }
+            let scaledTs = scalarAudioTs * Float(config.timestepScaleMultiplier)
+            let (apEmb, _) = audioPromptAdaln(scaledTs.flattened())
             audioPromptTs = apEmb.reshaped([batchSize, -1, 2, audioDim])
         }
 
