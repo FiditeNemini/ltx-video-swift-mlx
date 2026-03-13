@@ -53,5 +53,5 @@ MLX products used: `MLX`, `MLXNN`, `MLXRandom`, `Transformers`
 
 - Use MLX lazy evaluation to minimize memory usage
 - The Python reference uses JAX-style operations; MLX has similar APIs
-- Target platform: macOS 15+ (Apple Silicon)
+- Target platform: macOS 26.3+ (Tahoe, Apple Silicon)
 - Reference: INSTRUCTIONS.md contains detailed API signatures and implementation guidance

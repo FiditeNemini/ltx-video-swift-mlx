@@ -26,10 +26,10 @@ Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video gen
 
 ## Requirements
 
-- macOS 15+ (Sequoia)
+- macOS 26.3+ (Tahoe)
 - Apple Silicon Mac (M1/M2/M3/M4)
 - 32 GB+ unified memory recommended
-- Xcode 16+
+- Xcode 26+
 
 ## Quick Start
 
@@ -69,35 +69,24 @@ Models (~30 GB total) are downloaded automatically on first run from [Lightricks
 
 The `generate` command runs a **two-stage distilled pipeline** matching the [LTX-2 HuggingFace Space](https://huggingface.co/spaces/Lightricks/LTX-2):
 
-```
-Text Prompt
-    │
-    ▼
-Gemma 3 12B (4-bit QAT) ──► 49 hidden states
-    │
-    ▼
-Feature Extractor V2 + Connector ──► text embeddings [1, 1024, 4096]
-    │  ◄── Gemma unloaded
-    ▼
-┌── Stage 1: Half resolution (W/2 × H/2)
-│   LTX-2.3 Transformer (22B) + Distilled LoRA
-│   8 Euler steps, no CFG
-└── Output: latents at half resolution
-    │
-    ▼
-Spatial Upscaler: 2x (denormalize → upscale → renormalize → AdaIN)
-    │
-    ▼
-┌── Stage 2: Full resolution (W × H)
-│   Same transformer, 3 refinement steps
-│   Sigmas: [0.909, 0.725, 0.422]
-└── Output: refined latents
-    │  ◄── Transformer unloaded
-    ▼
-VAE Decoder ──► video frames (temporal tiling for long videos)
-    │
-    ▼
-MP4 Export (AVFoundation, 24fps)
+```mermaid
+flowchart TD
+    A["Text Prompt"] --> B["Gemma 3 12B\n4-bit QAT · ~7.5 GB"]
+    B --> C["Feature Extractor V2 + Connector\n→ text embeddings 1024 × 4096"]
+    C -->|"⚡ Gemma unloaded"| D
+
+    D["Stage 1: LTX-2.3 Transformer (22B)\n+ Distilled LoRA · 8 Euler steps\nhalf resolution W/2 × H/2"]
+    D --> E["Spatial Upscaler 2x\ndenormalize → upscale → renormalize → AdaIN"]
+    E --> F["Stage 2: 3 refinement steps\nfull resolution W × H\nσ = 0.909 → 0.725 → 0.422"]
+    F -->|"⚡ Transformer unloaded"| G["VAE Decoder\ntemporal tiling for long videos"]
+    G --> H["MP4 Export · 24fps"]
+
+    style B fill:#f3e8ff,stroke:#7c3aed
+    style C fill:#e0f2fe,stroke:#0284c7
+    style D fill:#fef3c7,stroke:#d97706
+    style E fill:#d1fae5,stroke:#059669
+    style F fill:#fef3c7,stroke:#d97706
+    style G fill:#fee2e2,stroke:#dc2626
 ```
 
 ## CLI Reference
@@ -133,7 +122,7 @@ See [docs/examples/](docs/examples/) for generation examples with parameters and
 
 ### Text-to-Video (10 seconds, 1024x576)
 
-<video src="https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/text-to-video/t2v-1024x576-10s.mp4" controls width="640"></video>
+[![T2V 1024x576 10s preview](docs/examples/text-to-video/t2v-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/text-to-video/t2v-1024x576-10s.mp4)
 
 *"A beaver building a dam in a peaceful forest stream, golden hour lighting" — 241 frames, two-stage distilled, prompt enhanced. [Full details →](docs/examples/text-to-video/)*
 

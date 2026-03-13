@@ -16,4 +16,4 @@
 | Video-to-Video (Retake) | Temporal mask + regenerate | Pending |
 | Audio | Dual video/audio denoising | Pending |
 
-*Hardware: Apple Silicon M3 Max 96GB, macOS 15.*
+*Hardware: Apple Silicon M3 Max 96GB, macOS 26.3 (Tahoe).*

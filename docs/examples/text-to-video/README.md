@@ -4,67 +4,52 @@ First validated use case of the LTX-2.3 Swift/MLX port.
 
 ## Pipeline Architecture
 
-```
-Text Prompt
-    │
-    ▼
-┌─────────────────────────────────────────────────┐
-│  Prompt Enhancement (optional)                  │
-│  Gemma 3 12B VLM (4-bit QAT, ~7.5 GB)          │
-│  Rewrites short prompt into detailed scene      │
-└───────────────┬─────────────────────────────────┘
-                │
-                ▼
-┌─────────────────────────────────────────────────┐
-│  Text Encoding                                  │
-│  Gemma 3 12B → 49 hidden states (layers 1-47    │
-│    + norm(layer_47))                            │
-│  → Feature Extractor V2 (RMS norm + rescale)    │
-│  → Connector (attention + MLP, 3840 → 4096)     │
-│  Output: text embeddings [1, 1024, 4096]        │
-└───────────────┬─────────────────────────────────┘
-                │  ◄── Gemma unloaded from memory
-                ▼
-┌─────────────────────────────────────────────────┐
-│  Stage 1 — Half Resolution Denoising            │
-│  LTX-2.3 Transformer (48 blocks, 22B params)    │
-│  + Distilled LoRA (rank 384, fused at load)     │
-│  8 Euler steps, predefined sigmas               │
-│  No CFG (guidance scale = 1.0)                  │
-│  Input: noise at W/2 × H/2                      │
-│  Output: latents [1, 128, T_lat, H/2, W/2]     │
-└───────────────┬─────────────────────────────────┘
-                │
-                ▼
-┌─────────────────────────────────────────────────┐
-│  Spatial Upscaler (2x)                          │
-│  Denormalize → Upscale → Renormalize → AdaIN    │
-│  Output: latents [1, 128, T_lat, H, W]          │
-└───────────────┬─────────────────────────────────┘
-                │
-                ▼
-┌─────────────────────────────────────────────────┐
-│  Stage 2 — Full Resolution Refinement           │
-│  Same transformer + LoRA                        │
-│  3 Euler steps, sigmas [0.909, 0.725, 0.422]    │
-│  Re-noise upscaled latent with σ=0.909          │
-│  Output: refined latents at full resolution     │
-└───────────────┬─────────────────────────────────┘
-                │  ◄── Transformer unloaded from memory
-                ▼
-┌─────────────────────────────────────────────────┐
-│  VAE Decoder                                    │
-│  128ch latent → 9 up_blocks (ResBlocks +        │
-│  DepthToSpace upsampling) → 48ch → unpatchify   │
-│  → 3ch RGB frames                               │
-│  Temporal tiling for long videos (>64 frames)   │
-│  Output: [B, 3, T_frames, H, W]                │
-└───────────────┬─────────────────────────────────┘
-                │
-                ▼
-┌─────────────────────────────────────────────────┐
-│  MP4 Export (AVFoundation, 24fps)               │
-└─────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["Text Prompt"] --> B
+
+    subgraph enhance ["Prompt Enhancement (optional)"]
+        B["Gemma 3 12B VLM\n4-bit QAT, ~7.5 GB"]
+    end
+
+    B --> C
+
+    subgraph encoding ["Text Encoding"]
+        C["Gemma 3 12B → 49 hidden states\n(layers 1-47 + norm)"] --> D["Feature Extractor V2\nRMS norm + rescale"] --> E["Connector\nattention + MLP, 3840 → 4096"]
+    end
+
+    E -->|"⚡ Gemma unloaded"| F
+
+    subgraph stage1 ["Stage 1 — Half Resolution"]
+        F["LTX-2.3 Transformer (48 blocks, 22B)\n+ Distilled LoRA (rank 384)\n8 Euler steps · no CFG\nnoise at W/2 × H/2"]
+    end
+
+    F --> G
+
+    subgraph upscale ["Spatial Upscaler"]
+        G["Denormalize → 2x Upscale → Renormalize → AdaIN"]
+    end
+
+    G --> H
+
+    subgraph stage2 ["Stage 2 — Full Resolution Refinement"]
+        H["Same Transformer + LoRA\n3 Euler steps\nσ = 0.909 → 0.725 → 0.422"]
+    end
+
+    H -->|"⚡ Transformer unloaded"| I
+
+    subgraph decode ["VAE Decoder"]
+        I["128ch → 9 up_blocks\n(ResBlocks + DepthToSpace)\n→ 48ch → unpatchify → 3ch RGB\ntemporal tiling for long videos"]
+    end
+
+    I --> J["MP4 Export\nAVFoundation · 24fps"]
+
+    style enhance fill:#f3e8ff,stroke:#7c3aed
+    style encoding fill:#e0f2fe,stroke:#0284c7
+    style stage1 fill:#fef3c7,stroke:#d97706
+    style upscale fill:#d1fae5,stroke:#059669
+    style stage2 fill:#fef3c7,stroke:#d97706
+    style decode fill:#fee2e2,stroke:#dc2626
 ```
 
 ### Key Model Components
@@ -103,7 +88,9 @@ ltx-video generate \
 | Prompt enhancement | Yes (Gemma 3 12B) |
 | Inference time | *work in progress — full benchmark pending LTX 2.3 adaptation* |
 
-<video src="https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/text-to-video/t2v-768x512-9f.mp4" controls width="512"></video>
+[![T2V 768x512 preview](t2v-768x512-9f-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/text-to-video/t2v-768x512-9f.mp4)
+
+*Click the image to download and play the video.*
 
 ---
 
@@ -128,12 +115,14 @@ ltx-video generate \
 | Prompt enhancement | Yes (Gemma 3 12B) |
 | Inference time | *work in progress — full benchmark pending LTX 2.3 adaptation* |
 
-<video src="https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/text-to-video/t2v-1024x576-10s.mp4" controls width="640"></video>
+[![T2V 1024x576 10s preview](t2v-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/text-to-video/t2v-1024x576-10s.mp4)
+
+*Click the image to download and play the video.*
 
 ---
 
 ## Hardware
 
 - Apple Silicon M3 Max 96GB
-- macOS 15 (Sequoia)
+- macOS 26.3 (Tahoe)
 - Inference times will be benchmarked after full LTX 2.3 adaptation is complete
