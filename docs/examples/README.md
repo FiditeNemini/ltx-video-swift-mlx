@@ -7,12 +7,12 @@
 | Use Case | Description | Status |
 |----------|-------------|--------|
 | [Text-to-Video](text-to-video/) | Two-stage distilled T2V pipeline | Done |
+| [Image-to-Video](image-to-video/) | Condition on first frame + animate | Done |
 
 ## Pending Validation
 
 | Use Case | Description | Status |
 |----------|-------------|--------|
-| Image-to-Video | Condition on first frame | Pending |
 | Video-to-Video (Retake) | Temporal mask + regenerate | Pending |
 | Audio | Dual video/audio denoising | Pending |
 

@@ -11,7 +11,7 @@ Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video gen
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Text-to-Video (two-stage distilled) | **Done** | Matches HuggingFace Space quality |
-| Image-to-Video | Pending | |
+| Image-to-Video (two-stage distilled) | **Done** | Condition on first frame |
 | Video-to-Video (Retake) | Pending | |
 | Audio generation | Pending | |
 | Quantization (qint8/int4) | Pending validation | |
@@ -125,6 +125,12 @@ See [docs/examples/](docs/examples/) for generation examples with parameters and
 [![T2V 1024x576 10s preview](docs/examples/text-to-video/t2v-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/text-to-video/t2v-1024x576-10s.mp4)
 
 *"A beaver building a dam in a peaceful forest stream, golden hour lighting" — 241 frames, two-stage distilled, prompt enhanced. [Full details →](docs/examples/text-to-video/)*
+
+### Image-to-Video (10 seconds, 1024x576)
+
+[![I2V 1024x576 10s preview](docs/examples/image-to-video/i2v-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/image-to-video/i2v-1024x576-10s.mp4)
+
+*Red 2CV taking off Back to the Future style — from input image, 241 frames, prompt enhanced. [Full details →](docs/examples/image-to-video/)*
 
 ## Performance
 
