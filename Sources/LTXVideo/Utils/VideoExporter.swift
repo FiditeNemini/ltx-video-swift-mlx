@@ -20,21 +20,27 @@ public struct VideoExportConfig: Sendable {
     /// Video codec
     public var codec: AVVideoCodecType
 
-    /// Video quality (0.0 to 1.0)
+    /// Video quality (0.0 to 1.0). Used when `averageBitRate` is nil.
     public var quality: Float
+
+    /// Target average bit rate in bits per second. When set, overrides `quality`.
+    /// For example, 1_000_000 = 1 Mbps (similar to HuggingFace Space output).
+    public var averageBitRate: Int?
 
     /// Output pixel format
     public var pixelFormat: OSType
 
     public init(
         fps: Double = 24.0,
-        codec: AVVideoCodecType = .h264,
-        quality: Float = 0.8,
+        codec: AVVideoCodecType = .hevc,
+        quality: Float = 0.9,
+        averageBitRate: Int? = nil,
         pixelFormat: OSType = kCVPixelFormatType_32ARGB
     ) {
         self.fps = fps
         self.codec = codec
         self.quality = quality
+        self.averageBitRate = averageBitRate
         self.pixelFormat = pixelFormat
     }
 
@@ -227,13 +233,18 @@ public actor VideoExporter {
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
+        var compressionProperties: [String: Any] = [:]
+        if let bitRate = config.averageBitRate {
+            compressionProperties[AVVideoAverageBitRateKey] = bitRate
+        } else {
+            compressionProperties[AVVideoQualityKey] = config.quality
+        }
+
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: config.codec,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoQualityKey: config.quality
-            ]
+            AVVideoCompressionPropertiesKey: compressionProperties
         ]
 
         let writerInput = AVAssetWriterInput(
@@ -653,6 +664,7 @@ extension VideoExporter {
         audioWaveform: MLXArray? = nil,
         audioSampleRate: Int = 24000,
         audioGain: Float = 1.0,
+        config: VideoExportConfig = .default,
         to outputURL: URL
     ) async throws -> URL {
         LTXDebug.log("exportVideo: converting tensor \(tensor.shape) to images...")
@@ -679,7 +691,7 @@ extension VideoExporter {
             audioChannels = 2
         }
 
-        let exporter = VideoExporter()
+        let exporter = VideoExporter(config: config)
         return try await exporter.export(
             frames: images,
             width: width,

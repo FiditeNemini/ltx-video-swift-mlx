@@ -366,9 +366,19 @@ class LTXTransformer: Module {
         }
 
         // Compute prompt timestep embeddings for cross-attention AdaLN (LTX-2.3)
+        // Prompt AdaLN modulates text context (1024 tokens), so use scalar timestep
+        // even when video uses per-token timesteps (I2V conditioning mask)
         var promptTs: MLXArray? = nil
         if let promptAdaln = promptAdalnSingle {
-            let scaledTs = timesteps * Float(config.timestepScaleMultiplier)
+            // Extract scalar timestep per batch element (first token's value or single value)
+            let scalarTs: MLXArray
+            if timesteps.ndim > 1 {
+                // Per-token: (B, T) — take max per batch (non-conditioned tokens have sigma)
+                scalarTs = timesteps.max(axis: 1)  // (B,)
+            } else {
+                scalarTs = timesteps  // Already scalar (B,)
+            }
+            let scaledTs = scalarTs * Float(config.timestepScaleMultiplier)
             let (pEmb, _) = promptAdaln(scaledTs.flattened())
             promptTs = pEmb.reshaped([batchSize, -1, 2, config.innerDim])
         }

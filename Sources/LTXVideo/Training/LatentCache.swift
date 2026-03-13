@@ -81,25 +81,14 @@ class LatentCache {
             eval(textResult.embeddings, textResult.mask)
 
             // Build save dictionary
-            var saveDict: [String: MLXArray] = [
+            let saveDict: [String: MLXArray] = [
                 "video_latent": videoLatent,
                 "prompt_embeddings": textResult.embeddings,
                 "prompt_mask": textResult.mask,
             ]
 
-            // Encode audio if needed
-            if includeAudio, let audioWaveform = sample.audioWaveform {
-                let audioLatent = try await pipeline.encodeAudioLatents(waveform: audioWaveform)
-                eval(audioLatent)
-
-                // Get audio text embeddings (uses same Gemma + audio connector)
-                let audioTextResult = try await pipeline.encodeAudioText(prompt: sample.caption)
-                eval(audioTextResult.embeddings, audioTextResult.mask)
-
-                saveDict["audio_latent"] = audioLatent
-                saveDict["audio_embeddings"] = audioTextResult.embeddings
-                saveDict["audio_mask"] = audioTextResult.mask
-            }
+            // Audio latent caching removed — AudioProcessor dependency was removed.
+            // Audio training support will need to be re-added when AudioProcessor is restored.
 
             // Save to disk
             let url = URL(fileURLWithPath: cachePath)

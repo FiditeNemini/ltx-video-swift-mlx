@@ -368,26 +368,217 @@ class AudioDecoderMidBlock: Module {
     }
 }
 
+// MARK: - Audio Downsample
+
+/// 2x downsampling with stride-2 causal convolution
+/// Matches Python LTX2AudioDownsample
+class AudioDownsample: Module {
+    @ModuleInfo(key: "conv") var conv: Conv2d
+
+    init(inChannels: Int) {
+        // Stride-2 conv for 2x downsampling (padding handled manually)
+        self._conv.wrappedValue = Conv2d(
+            inputChannels: inChannels, outputChannels: inChannels,
+            kernelSize: .init((3, 3)), stride: .init((2, 2)), padding: .init((0, 0)),
+            bias: true
+        )
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Input: (B, C, H, W) NCHW — convert to NHWC for MLX Conv2d
+        var input = x.transposed(0, 2, 3, 1)  // (B, H, W, C)
+
+        // Causal padding: all height padding to top, symmetric width padding
+        // pad_h = kernel-1 = 2 (top), pad_w = kernel-1 = 2 (split: 1 left, 1 right)
+        input = MLX.padded(input, widths: [
+            .init((0, 0)),  // batch
+            .init((2, 0)),  // height: causal (top only)
+            .init((1, 1)),  // width: symmetric
+            .init((0, 0))   // channels
+        ])
+
+        let out = conv(input)  // (B, H_out, W_out, C_out)
+        return out.transposed(0, 3, 1, 2)  // Back to NCHW
+    }
+}
+
+// MARK: - Audio Encoder Down Level
+
+/// One level of the encoder downsampling path
+/// Contains resblocks and an optional downsample layer
+class AudioEncoderDownLevel: Module {
+    @ModuleInfo(key: "block") var blocks: [AudioResnetBlock]
+    @ModuleInfo(key: "downsample") var downsample: AudioDownsample?
+
+    init(inChannels: Int, outChannels: Int, numBlocks: Int = 2, hasDownsample: Bool) {
+        var blockList: [AudioResnetBlock] = []
+        blockList.append(AudioResnetBlock(inChannels: inChannels, outChannels: outChannels))
+        for _ in 1..<numBlocks {
+            blockList.append(AudioResnetBlock(inChannels: outChannels))
+        }
+        self._blocks.wrappedValue = blockList
+
+        if hasDownsample {
+            self._downsample.wrappedValue = AudioDownsample(inChannels: outChannels)
+        } else {
+            self._downsample.wrappedValue = nil
+        }
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var h = x
+        for block in blocks {
+            h = block(h)
+        }
+        if let down = downsample {
+            h = down(h)
+        }
+        return h
+    }
+}
+
+// MARK: - Audio Encoder Mid Block
+
+/// Mid block with 2 resblocks (no attention), same as decoder
+class AudioEncoderMidBlock: Module {
+    @ModuleInfo(key: "block_1") var block1: AudioResnetBlock
+    @ModuleInfo(key: "block_2") var block2: AudioResnetBlock
+
+    init(channels: Int) {
+        self._block1.wrappedValue = AudioResnetBlock(inChannels: channels)
+        self._block2.wrappedValue = AudioResnetBlock(inChannels: channels)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var h = block1(x)
+        h = block2(h)
+        return h
+    }
+}
+
+// MARK: - Audio VAE Encoder
+
+/// Audio VAE encoder: stereo mel spectrogram -> latent
+/// Matches Python LTX2AudioEncoder
+///
+/// Architecture:
+/// - conv_in: 2 -> 128
+/// - down[0]: 128->128, 2 resblocks + downsample 2x
+/// - down[1]: 128->256, 2 resblocks + downsample 2x
+/// - down[2]: 256->512, 2 resblocks, no downsample
+/// - mid: 2 resblocks (512)
+/// - norm_out + SiLU + conv_out: 512 -> 16 (double_z: mean + logvar)
+class AudioEncoder: Module {
+    let baseChannels: Int
+
+    @ModuleInfo(key: "conv_in") var convIn: AudioCausalConv2d
+    @ModuleInfo(key: "conv_out") var convOut: AudioCausalConv2d
+    @ModuleInfo(key: "mid") var mid: AudioEncoderMidBlock
+    @ModuleInfo(key: "down") var downLevels: [AudioEncoderDownLevel]
+    @ModuleInfo(key: "norm_out") var normOut: AudioPixelNorm
+
+    init(
+        inChannels: Int = 2,
+        latentChannels: Int = 8,
+        baseChannels: Int = 128,
+        chMult: [Int] = [1, 2, 4],
+        numResBlocks: Int = 2,
+        doubleZ: Bool = true
+    ) {
+        self.baseChannels = baseChannels
+
+        // conv_in: in_channels -> base_channels
+        self._convIn.wrappedValue = AudioCausalConv2d(
+            inChannels: inChannels, outChannels: baseChannels, kernelSize: 3
+        )
+
+        // Down levels — stored in Python level order [0, 1, 2]:
+        //   down[0] = level 0: 128->128, downsample (processed FIRST)
+        //   down[1] = level 1: 128->256, downsample (processed second)
+        //   down[2] = level 2: 256->512, no downsample (processed LAST)
+        let numLevels = chMult.count
+        var levels: [AudioEncoderDownLevel] = []
+        var currentChannels = baseChannels
+
+        for iLevel in 0..<numLevels {
+            let outCh = baseChannels * chMult[iLevel]
+            // Last level has no downsample
+            let hasDownsample = (iLevel < numLevels - 1)
+            levels.append(AudioEncoderDownLevel(
+                inChannels: currentChannels,
+                outChannels: outCh,
+                numBlocks: numResBlocks,
+                hasDownsample: hasDownsample
+            ))
+            currentChannels = outCh
+        }
+        self._downLevels.wrappedValue = levels
+
+        // Mid block
+        self._mid.wrappedValue = AudioEncoderMidBlock(channels: currentChannels)
+
+        // Final norm + conv_out
+        self._normOut.wrappedValue = AudioPixelNorm()
+
+        let outChannels = doubleZ ? latentChannels * 2 : latentChannels
+        self._convOut.wrappedValue = AudioCausalConv2d(
+            inChannels: currentChannels, outChannels: outChannels, kernelSize: 3
+        )
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // x: (B, C=2, T_mel, F=64) NCHW format from mel spectrogram
+        // AudioCausalConv2d handles NCHW→NHWC internally and returns NCHW
+        var h = convIn(x)
+
+        // Down path
+        for (i, level) in downLevels.enumerated() {
+            h = level(h)
+            eval(h)
+            Memory.clearCache()
+            LTXDebug.log("Audio encoder down[\(i)]: \(h.shape)")
+        }
+
+        // Mid block
+        h = mid(h)
+        eval(h)
+
+        // Final — all in NCHW (AudioCausalConv2d handles format internally)
+        h = normOut(h)
+        h = MLXNN.silu(h)
+        h = convOut(h)
+
+        return h  // (B, 16, T_latent, 16) — mean + logvar concatenated on channel axis
+    }
+}
+
 // MARK: - Audio VAE (Top-level)
 
 /// Top-level Audio VAE model for LTX-2
-/// Matches Python AutoencoderKLLTX2Audio (decoder only for generation)
+/// Matches Python AutoencoderKLLTX2Audio
 ///
-/// Decodes audio latents to stereo mel spectrograms.
+/// Encodes stereo mel spectrograms to audio latents (for A2Vid)
+/// and decodes audio latents to stereo mel spectrograms (for generation).
 /// The mel spectrograms are then passed to the vocoder for waveform synthesis.
 class AudioVAE: Module {
     let latentDownsampleFactor: Int = 4
+    let latentChannels: Int
 
     @ModuleInfo(key: "decoder") var decoder: AudioDecoder
+    @ModuleInfo(key: "encoder") var encoder: AudioEncoder?
     @ParameterInfo(key: "latents_mean") var latentsMean: MLXArray
     @ParameterInfo(key: "latents_std") var latentsStd: MLXArray
 
     init(
         latentChannels: Int = 8,
+        inChannels: Int = 2,
         outputChannels: Int = 2,
         baseChannels: Int = 128,
-        chMult: [Int] = [1, 2, 4]
+        chMult: [Int] = [1, 2, 4],
+        includeEncoder: Bool = false
     ) {
+        self.latentChannels = latentChannels
+
         self._decoder.wrappedValue = AudioDecoder(
             latentChannels: latentChannels,
             outputChannels: outputChannels,
@@ -395,7 +586,19 @@ class AudioVAE: Module {
             chMult: chMult
         )
 
-        // Per-channel statistics for denormalization (128 channels = latent_ch * mel_bins/4)
+        if includeEncoder {
+            self._encoder.wrappedValue = AudioEncoder(
+                inChannels: inChannels,
+                latentChannels: latentChannels,
+                baseChannels: baseChannels,
+                chMult: chMult,
+                doubleZ: true
+            )
+        } else {
+            self._encoder.wrappedValue = nil
+        }
+
+        // Per-channel statistics for normalization/denormalization (128 channels = latent_ch * mel_bins/4)
         self._latentsMean.wrappedValue = MLXArray.zeros([128])
         self._latentsStd.wrappedValue = MLXArray.ones([128])
     }
@@ -453,6 +656,48 @@ class AudioVAE: Module {
 
         LTXDebug.log("Audio VAE output: \(output.shape)")
         return output
+    }
+
+    /// Encode stereo mel spectrogram to normalized audio latents
+    ///
+    /// Uses mode (mean only, no reparameterization) matching Lightricks reference.
+    /// Applies per-channel normalization using stored statistics.
+    ///
+    /// - Parameter melSpectrogram: Stereo mel spectrogram (B, 2, T_mel, 64)
+    /// - Returns: Normalized audio latents (B, 8, T_latent, 16)
+    func encode(_ melSpectrogram: MLXArray) -> MLXArray {
+        guard let encoder = encoder else {
+            fatalError("AudioVAE encoder not initialized. Use includeEncoder: true in init.")
+        }
+
+        // Run encoder: (B, 2, T_mel, 64) → (B, 16, T_latent, mel_bins/4)
+        let encoderOutput = encoder(melSpectrogram)
+        let b = encoderOutput.dim(0)
+        let tLatent = encoderOutput.dim(2)
+        let mLatent = encoderOutput.dim(3)
+
+        // Split into mean and logvar along channel axis (double_z=true → 16 channels = 8 mean + 8 logvar)
+        // Use mode: only the mean (matching Lightricks reference — no sampling)
+        let mean = encoderOutput[0..., 0..<latentChannels, 0..., 0...]  // (B, 8, T_latent, M)
+
+        LTXDebug.log("Audio encode: encoder output \(encoderOutput.shape), mean \(mean.shape)")
+
+        // Patchify: (B, 8, T, M) → (B, T, 8*M) = (B, T, 128)
+        var sample = mean.transposed(0, 2, 1, 3)  // (B, T, 8, M)
+        sample = sample.reshaped([b, tLatent, -1])  // (B, T, 128)
+
+        // Normalize per-channel using stored statistics
+        let meanStats = latentsMean.reshaped([1, 1, 128])
+        let stdStats = latentsStd.reshaped([1, 1, 128])
+        sample = (sample - meanStats) / stdStats
+
+        // Unpatchify: (B, T, 128) → (B, 8, T, M)
+        sample = sample.reshaped([b, tLatent, latentChannels, mLatent])
+        sample = sample.transposed(0, 2, 1, 3)  // (B, 8, T_latent, M)
+
+        LTXDebug.log("Audio encode: normalized latent \(sample.shape), mean=\(MLX.mean(sample).item(Float.self)), std=\(MLX.std(sample).item(Float.self))")
+
+        return sample
     }
 
     /// Sanitize weights from Diffusers safetensors format

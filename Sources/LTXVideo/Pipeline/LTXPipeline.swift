@@ -12,11 +12,14 @@ import MLXVLM
 import Tokenizers
 import Hub
 
-// MARK: - Default Negative Prompt (matches Python DEFAULT_NEGATIVE_PROMPT)
+// MARK: - Negative Prompt Constants
 
-/// Default negative prompt used for CFG unconditional conditioning in the dev pipeline.
-/// This matches the Python mlx-video `DEFAULT_NEGATIVE_PROMPT` exactly.
-public let DEFAULT_NEGATIVE_PROMPT = """
+/// Detailed negative prompt available for use with CFG.
+/// Matches the Python Lightricks `DEFAULT_NEGATIVE_PROMPT` for compatibility.
+/// NOTE: Using this prompt with MLX attention produces visible grid/crosshatch artifacts
+/// on smooth surfaces because the diverse text tokens create spatially-varying patterns in
+/// the unconditional prediction that CFG amplifies. An empty string "" is recommended instead.
+public let DETAILED_NEGATIVE_PROMPT = """
 blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, \
 grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, \
 deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, \
@@ -34,14 +37,14 @@ inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.
 
 /// Progress information emitted during the denoising phase of generation.
 ///
-/// Passed to the `onProgress` callback of ``LTXPipeline/generateVideo(prompt:negativePrompt:config:onProgress:profile:)``
-/// and ``LTXPipeline/generateVideoTwoStage(prompt:config:upscalerWeightsPath:onProgress:profile:)``.
+/// Passed to the `onProgress` callback of ``LTXPipeline/generateVideo(prompt:config:upscalerWeightsPath:onProgress:profile:)``.
 ///
 /// ## Example
 /// ```swift
 /// let result = try await pipeline.generateVideo(
 ///     prompt: "A sunset",
 ///     config: config,
+///     upscalerWeightsPath: upscalerPath,
 ///     onProgress: { progress in
 ///         print("[\(Int(progress.progress * 100))%] \(progress.status)")
 ///     }
@@ -98,25 +101,23 @@ public final class TransformerRef: @unchecked Sendable {
 /// ```swift
 /// let pipeline = LTXPipeline(model: .distilled)
 /// try await pipeline.loadModels()
+/// let upscalerPath = try await pipeline.downloadUpscalerWeights()
 /// let result = try await pipeline.generateVideo(
 ///     prompt: "A cat walking in a garden",
-///     config: LTXVideoGenerationConfig(width: 512, height: 512, numFrames: 25)
+///     config: LTXVideoGenerationConfig(width: 768, height: 512, numFrames: 121),
+///     upscalerWeightsPath: upscalerPath
 /// )
 /// ```
 ///
-/// ## Two-Stage Pipeline
-/// For higher quality, use the dev model with distilled LoRA and 2x upscaling:
+/// ## Audio Generation
 /// ```swift
-/// let pipeline = LTXPipeline(model: .dev)
-/// try await pipeline.loadModels()
-/// let loraPath = try await pipeline.downloadDistilledLoRA()
-/// try await pipeline.fuseLoRA(from: loraPath)
-/// let upscalerPath = try await pipeline.downloadUpscalerWeights()
-/// let result = try await pipeline.generateVideoTwoStage(
-///     prompt: "Ocean sunset",
+/// try await pipeline.loadAudioModels()
+/// let result = try await pipeline.generateVideo(
+///     prompt: "Birds singing in a forest",
 ///     config: config,
 ///     upscalerWeightsPath: upscalerPath
 /// )
+/// // result.audioWaveform and result.audioSampleRate are populated
 /// ```
 ///
 /// ## Memory Management
@@ -175,12 +176,26 @@ public actor LTXPipeline {
         ltx2Transformer != nil && audioVAE != nil && vocoder != nil
     }
 
+    // MARK: - LoRA State
+
+    /// Original (pre-fusion) transformer weights, stored for unfusing
+    private var loraOriginalWeights: [String: MLXArray]? = nil
+
+    /// Path to the currently fused LoRA file
+    private var loraFusedPath: String? = nil
+
+    /// Scale used for the currently fused LoRA
+    private var loraFusedScale: Float = 1.0
+
+    /// Whether a LoRA is currently fused into the transformer
+    public var isLoRAFused: Bool { loraOriginalWeights != nil }
+
     /// Cached null embeddings (encoding of empty string "")
     private var cachedNullEmbeddings: (encoding: MLXArray, mask: MLXArray)?
 
     /// Whether models are loaded (Gemma may be nil after unloading post-encoding)
     public var isLoaded: Bool {
-        textEncoder != nil && transformer != nil && vaeDecoder != nil
+        textEncoder != nil && (transformer != nil || ltx2Transformer != nil) && vaeDecoder != nil
     }
 
     /// Whether Gemma model is available for text encoding
@@ -241,8 +256,6 @@ public actor LTXPipeline {
         var stepStart = Date()
 
         // Step 1: Load Gemma model and tokenizer
-        // For dev model: uses the bundled text_encoder from LTX-2-dev-bf16 (float32, ~48.7GB)
-        // This matches the Python baseline exactly.
         progressCallback?(DownloadProgress(progress: 0.1, message: "Loading Gemma model..."))
 
         let gemmaURL: URL
@@ -551,944 +564,43 @@ public actor LTXPipeline {
 
     // MARK: - Video Generation
 
-    /// Generate video from text prompt
+    /// Generate video using two-stage pipeline (half-res → upscale → refine).
+    ///
+    /// Supports both video-only and dual video/audio modes:
+    /// - **Video-only** (default): Uses `LTXTransformer` for denoising
+    /// - **With audio** (after `loadAudioModels()`): Uses `LTX2Transformer` for dual video/audio denoising
+    ///
+    /// Always two-stage distilled: 8 steps at half resolution → 2x spatial upscale → 3 refinement steps.
+    /// I2V supported via `config.imagePath`.
     ///
     /// - Parameters:
     ///   - prompt: Text description of the video
-    ///   - negativePrompt: Optional negative prompt for CFG
-    ///   - config: Video generation configuration
-    ///   - onProgress: Optional progress callback
-    ///   - onFrame: Optional callback for intermediate frame preview
-    /// - Returns: Video generation result with frames
-    /// Pre-computed text embeddings for diagnostic/cross-validation
-    public struct PrecomputedEmbeddings {
-        public let promptEmbeddings: MLXArray  // [1, T, 3840]
-        public let promptMask: MLXArray        // [1, T]
-        public let nullEmbeddings: MLXArray?   // [1, T, 3840] for CFG
-        public let nullMask: MLXArray?         // [1, T]
-
-        public init(promptEmbeddings: MLXArray, promptMask: MLXArray,
-                     nullEmbeddings: MLXArray? = nil, nullMask: MLXArray? = nil) {
-            self.promptEmbeddings = promptEmbeddings
-            self.promptMask = promptMask
-            self.nullEmbeddings = nullEmbeddings
-            self.nullMask = nullMask
-        }
-    }
-
-    public func generateVideo(
-        prompt: String,
-        negativePrompt: String? = nil,
-        config: LTXVideoGenerationConfig,
-        precomputedEmbeddings: PrecomputedEmbeddings? = nil,
-        onProgress: GenerationProgressCallback? = nil,
-        onFrame: FramePreviewCallback? = nil,
-        profile: Bool = false
-    ) async throws -> VideoGenerationResult {
-        // Validate configuration
-        try config.validate()
-        var timings = GenerationTimings()
-
-        guard isLoaded else {
-            throw LTXError.modelNotLoaded("Models not loaded. Call loadModels() first.")
-        }
-
-        guard let textEncoder = textEncoder,
-            let transformer = transformer,
-            let vaeDecoder = vaeDecoder
-        else {
-            throw LTXError.modelNotLoaded("One or more models failed to load")
-        }
-
-        let generationStart = Date()
-        LTXMemoryManager.logMemoryState("generation start")
-
-        LTXDebug.log("Generating video: \(config.width)x\(config.height), \(config.numFrames) frames")
-        LTXDebug.log("Prompt: \(prompt)")
-
-        let textEmbeddings: MLXArray
-        let contextMask: MLXArray
-        let useCFG = config.cfgScale > 1.0
-        let textEncStart = Date()
-        LTXMemoryManager.setPhase(.textEncoding)
-
-        if let precomputed = precomputedEmbeddings {
-            // Use pre-computed embeddings (for diagnostic/cross-validation)
-            // Cast to bfloat16 to match what the text encoder normally produces
-            LTXDebug.log("Using pre-computed embeddings (bypassing text encoder)")
-            let pe = precomputed.promptEmbeddings.asType(.bfloat16)
-            let pm = precomputed.promptMask.asType(.int32)
-
-            // Log injected embedding stats for verification
-            do {
-                let pMean = pe.mean().item(Float.self)
-                let pStd = MLX.sqrt(MLX.variance(pe)).item(Float.self)
-                LTXDebug.log("[DIAG] injected pos emb: mean=\(String(format: "%.8f", pMean)), std=\(String(format: "%.8f", pStd))")
-                let first5 = (0..<5).map { i in
-                    String(format: "%.6f", pe[0, 0, i].item(Float.self))
-                }
-                LTXDebug.log("[DIAG] injected pos emb[0,0,:5] = [\(first5.joined(separator: ", "))]")
-            }
-
-            if useCFG {
-                let ne = (precomputed.nullEmbeddings ?? MLXArray.zeros(like: pe)).asType(.bfloat16)
-                let nm = (precomputed.nullMask ?? MLXArray.zeros(like: pm)).asType(.int32)
-
-                // Log injected neg embedding stats
-                do {
-                    let nMean = ne.mean().item(Float.self)
-                    let nStd = MLX.sqrt(MLX.variance(ne)).item(Float.self)
-                    LTXDebug.log("[DIAG] injected neg emb: mean=\(String(format: "%.8f", nMean)), std=\(String(format: "%.8f", nStd))")
-                }
-
-                textEmbeddings = MLX.concatenated([ne, pe], axis: 0)
-                contextMask = MLX.concatenated([nm, pm], axis: 0)
-            } else {
-                textEmbeddings = pe
-                contextMask = pm
-            }
-            MLX.eval(textEmbeddings, contextMask)
-            LTXDebug.log("textEmbeddings shape: \(textEmbeddings.shape)")
-        } else {
-            // 0a. Reload Gemma if it was unloaded from a previous generation
-            if !isGemmaLoaded {
-                LTXDebug.log("Reloading Gemma model (was unloaded after previous generation)...")
-                let paths = try await downloader.downloadGemma(model: model, progress: nil)
-                gemmaModel = try Gemma3WeightLoader.loadModel(from: paths.modelDir)
-                tokenizer = try await AutoTokenizer.from(modelFolder: paths.tokenizerDir)
-                LTXDebug.log("Gemma model reloaded")
-            }
-
-            // 0b. Optionally enhance prompt using Gemma generation
-            let effectivePrompt: String
-            if config.enhancePrompt {
-                LTXDebug.log("Enhancing prompt with VLM (\(config.imagePath != nil ? "I2V" : "T2V"))...")
-                effectivePrompt = try await enhancePromptWithVLM(prompt, imagePath: config.imagePath)
-                LTXDebug.log("Using enhanced prompt for generation")
-            } else {
-                effectivePrompt = prompt
-            }
-
-            // 1. Encode text prompt
-            LTXDebug.log("Encoding text prompt... (CFG=\(config.cfgScale), enabled=\(useCFG))")
-            let (promptEmbeddings, promptMask) = encodePrompt(effectivePrompt, encoder: textEncoder)
-            MLX.eval(promptEmbeddings, promptMask)
-            LTXDebug.log("promptEmbeddings shape: \(promptEmbeddings.shape)")
-
-            // Log positive embedding stats + first values for element-wise comparison with Python
-            do {
-                let pMean = promptEmbeddings.mean().item(Float.self)
-                let pStd = MLX.sqrt(MLX.variance(promptEmbeddings)).item(Float.self)
-                LTXDebug.log("[DIAG] pos emb: mean=\(String(format: "%.8f", pMean)), std=\(String(format: "%.8f", pStd))")
-                // Print first 5 values for element-wise comparison
-                let first5 = (0..<5).map { i in
-                    String(format: "%.6f", promptEmbeddings[0, 0, i].item(Float.self))
-                }
-                LTXDebug.log("[DIAG] pos emb[0,0,:5] = [\(first5.joined(separator: ", "))]")
-                let mid5 = (0..<5).map { i in
-                    String(format: "%.6f", promptEmbeddings[0, 512, i].item(Float.self))
-                }
-                LTXDebug.log("[DIAG] pos emb[0,512,:5] = [\(mid5.joined(separator: ", "))]")
-            }
-
-            if useCFG {
-                // CFG mode: stack [negative, positive] embeddings for doubled batch
-                let negPromptText = negativePrompt ?? DEFAULT_NEGATIVE_PROMPT
-                LTXDebug.log("Encoding negative prompt for CFG (\(negPromptText.prefix(60))...)")
-                let (negEmbeddings, negMask) = encodePrompt(negPromptText, encoder: textEncoder)
-                MLX.eval(negEmbeddings, negMask)
-
-                // Log negative embedding stats
-                do {
-                    let nMean = negEmbeddings.mean().item(Float.self)
-                    let nStd = MLX.sqrt(MLX.variance(negEmbeddings)).item(Float.self)
-                    LTXDebug.log("[DIAG] neg emb: mean=\(String(format: "%.8f", nMean)), std=\(String(format: "%.8f", nStd))")
-                }
-
-                textEmbeddings = MLX.concatenated([negEmbeddings, promptEmbeddings], axis: 0)
-                contextMask = MLX.concatenated([negMask, promptMask], axis: 0)
-                MLX.eval(textEmbeddings, contextMask)
-                LTXDebug.log("textEmbeddings shape (CFG): \(textEmbeddings.shape)")
-            } else {
-                // No CFG: single batch, just the prompt embeddings
-                textEmbeddings = promptEmbeddings
-                contextMask = promptMask
-                LTXDebug.log("textEmbeddings shape (no CFG): \(textEmbeddings.shape)")
-            }
-
-            // 1b. Unload Gemma model to free memory for transformer denoising
-            LTXDebug.log("Unloading Gemma model to free memory...")
-            self.gemmaModel = nil
-            self.tokenizer = nil
-            Memory.clearCache()
-            LTXDebug.log("Gemma model unloaded")
-        }
-        timings.textEncoding = Date().timeIntervalSince(textEncStart)
-        LTXDebug.log("Text encoding: \(String(format: "%.1f", timings.textEncoding))s")
-        LTXMemoryManager.logMemoryState("after text encoding")
-
-        // 2. Create latent shape
-        let latentShape = VideoLatentShape.fromPixelDimensions(
-            batch: 1,
-            channels: 128,
-            frames: config.numFrames,
-            height: config.height,
-            width: config.width
-        )
-
-        LTXDebug.log(
-            "Latent shape: \(latentShape.frames)x\(latentShape.height)x\(latentShape.width)")
-
-        // 3. Generate initial noise
-        if let seed = config.seed {
-            MLXRandom.seed(seed)
-            LTXDebug.log("Using seed: \(seed)")
-        }
-
-        var latent = generateNoise(shape: latentShape, seed: config.seed)
-        LTXDebug.log("Initial latent shape: \(latent.shape)")
-        MLX.eval(latent)
-
-        // Log initial noise stats for Python comparison
-        do {
-            let nMean = latent.mean().item(Float.self)
-            let nStd = MLX.sqrt(MLX.variance(latent)).item(Float.self)
-            LTXDebug.log("[DIAG] Initial noise: mean=\(String(format: "%.8f", nMean)), std=\(String(format: "%.8f", nStd))")
-        }
-
-        // 3b. Apply cross-attention scaling if configured
-        if config.crossAttentionScale != 1.0 {
-            transformer.setCrossAttentionScale(config.crossAttentionScale)
-            LTXDebug.log("Cross-attention scale set to \(config.crossAttentionScale)")
-        }
-
-        // 4. Get sigma schedule (with dynamic time shifting matching Diffusers)
-        let useDistilled = shouldUseDistilledSchedule(config)
-        scheduler.setTimesteps(
-            numSteps: config.numSteps,
-            distilled: useDistilled,
-            latentTokenCount: latentShape.tokenCount
-        )
-        let sigmas = scheduler.sigmas
-        LTXDebug.log("Sigma schedule (\(useDistilled ? "distilled" : "dev")): \(sigmas.map { String(format: "%.4f", $0) })")
-
-        // 5. Scale initial noise by first sigma
-        latent = latent * sigmas[0]
-
-        // 6. Denoising loop
-        LTXMemoryManager.setPhase(.denoising)
-        LTXDebug.log("Starting denoising loop (\(config.numSteps) steps)...")
-        var previousVelocity: MLXArray? = nil  // For GE velocity correction
-
-        for step in 0..<config.numSteps {
-            let stepStart = Date()
-            let sigma = sigmas[step]
-            let sigmaNext = sigmas[step + 1]
-
-            onProgress?(
-                GenerationProgress(
-                    currentStep: step,
-                    totalSteps: config.numSteps,
-                    sigma: sigma
-                ))
-
-            let timestep = MLXArray([sigma])
-
-            // Patchify for transformer — cast to bfloat16 matching Diffusers latent_model_input.to(dtype)
-            let patchified = patchify(latent).asType(.bfloat16)
-            LTXDebug.log("Step \(step): patchified \(patchified.shape), σ=\(String(format: "%.4f", sigma))")
-
-            // Unpatchify velocity back to (B, C, F, H, W)
-            var velocity: MLXArray
-            var condVelocity: MLXArray  // conditional velocity for guidance rescale
-            if useCFG {
-                // Separate forward passes matching Diffusers (cfg_batch=False)
-                // Extract positive and negative embeddings + masks
-                let posEmbeddings = textEmbeddings[1..<2]  // [neg, pos] → pos
-                let negEmbeddings = textEmbeddings[0..<1]  // [neg, pos] → neg
-                let posMask = contextMask[1..<2]
-                let negMask = contextMask[0..<1]
-
-                // Positive pass (conditional)
-                let velPosPred = transformer(
-                    latent: patchified,
-                    context: posEmbeddings,
-                    timesteps: timestep,
-                    contextMask: posMask,
-                    latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
-                )
-                let velPos = unpatchify(velPosPred, shape: latentShape)
-                MLX.eval(velPos)  // Eval to free transformer graph — prevents memory thrashing
-
-                // Negative pass (unconditional)
-                let velNegPred = transformer(
-                    latent: patchified,
-                    context: negEmbeddings,
-                    timesteps: timestep,
-                    contextMask: negMask,
-                    latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
-                )
-                let velNeg = unpatchify(velNegPred, shape: latentShape)
-                MLX.eval(velNeg)
-
-                // Detailed step-0 CFG diagnostics
-                if step == 0 && profile {
-                    let condMean = velPos.mean().item(Float.self)
-                    let condStd = MLX.sqrt(MLX.variance(velPos)).item(Float.self)
-                    let uncondMean = velNeg.mean().item(Float.self)
-                    let uncondStd = MLX.sqrt(MLX.variance(velNeg)).item(Float.self)
-                    LTXDebug.log("[DIAG] Step 0 vel_cond (pos): mean=\(String(format: "%.8f", condMean)), std=\(String(format: "%.8f", condStd))")
-                    LTXDebug.log("[DIAG] Step 0 vel_uncond (neg): mean=\(String(format: "%.8f", uncondMean)), std=\(String(format: "%.8f", uncondStd))")
-                }
-
-                // Cast to float32 before CFG (matching Diffusers noise_pred_video.float())
-                let velPosF32 = velPos.asType(.float32)
-                let velNegF32 = velNeg.asType(.float32)
-
-                // Apply CFG in float32: vel_pos + (cfg_scale - 1) * (vel_pos - vel_neg)
-                velocity = applyCFG(uncond: velNegF32, cond: velPosF32, guidanceScale: config.cfgScale)
-
-                // Log CFG velocity stats at step 0
-                if step == 0 && profile {
-                    let cfgMean = velocity.mean().item(Float.self)
-                    let cfgStd = MLX.sqrt(MLX.variance(velocity)).item(Float.self)
-                    LTXDebug.log("[DIAG] Step 0 CFG velocity: mean=\(String(format: "%.8f", cfgMean)), std=\(String(format: "%.8f", cfgStd))")
-                }
-
-                // velocity stays float32 — scheduler operates in float32
-                // Save conditional velocity for rescale (applied after STG, matching Python)
-                condVelocity = velPosF32
-            } else {
-                // No CFG: single pass
-                let velocityPred = transformer(
-                    latent: patchified,
-                    context: textEmbeddings,
-                    timesteps: timestep,
-                    contextMask: contextMask,
-                    latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
-                )
-                // Cast to float32 matching Diffusers noise_pred.float()
-                velocity = unpatchify(velocityPred, shape: latentShape).asType(.float32)
-                condVelocity = velocity
-            }
-
-            // STG (Spatio-Temporal Guidance): perturbed forward pass with skipped self-attention
-            if config.stgScale > 0 {
-                // Enable skip flags on specified blocks
-                transformer.setSTGSkipFlags(skipSelfAttention: true, blockIndices: config.stgBlocks)
-
-                // Perturbed forward pass (single-batch, conditional only)
-                let perturbedPatchified = patchify(latent).asType(.bfloat16)
-                let perturbedTimestep = MLXArray([sigma])
-                // Extract prompt-only embeddings (second half of CFG-doubled batch)
-                let perturbedContext = useCFG ? textEmbeddings[1..<2] : textEmbeddings
-                let perturbedMask = useCFG ? contextMask[1..<2] : contextMask
-                let perturbedVelocityPred = transformer(
-                    latent: perturbedPatchified,
-                    context: perturbedContext,
-                    timesteps: perturbedTimestep,
-                    contextMask: perturbedMask,
-                    latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
-                )
-                let perturbedVelocity = unpatchify(perturbedVelocityPred, shape: latentShape).asType(.float32)
-
-                // Clear skip flags
-                transformer.clearSTGSkipFlags()
-
-                // Apply STG: velocity += stgScale * (cond - perturbed) matching Python guiders.py
-                velocity = velocity + MLXArray(config.stgScale) * (condVelocity - perturbedVelocity)
-            }
-
-            // Apply guidance rescale AFTER CFG+STG (matching Python guiders.py order)
-            if config.guidanceRescale > 0 {
-                velocity = applyGuidanceRescale(
-                    guidedVelocity: velocity,
-                    condVelocity: condVelocity,
-                    phi: config.guidanceRescale
-                )
-            }
-
-            // GE velocity correction: apply momentum on velocity prediction
-            if config.geGamma > 0, let prevVel = previousVelocity {
-                velocity = MLXArray(config.geGamma) * (velocity - prevVel) + prevVel
-            }
-            previousVelocity = velocity
-
-            // Euler step: x_{t-1} = x_t + (sigma_next - sigma) * velocity
-            latent = scheduler.step(
-                latent: latent,
-                velocity: velocity,
-                sigma: sigma,
-                sigmaNext: sigmaNext
-            )
-
-            // Evaluate to free computation graph memory
-            MLX.eval(latent)
-
-            // Periodic cache clearing to reduce GPU memory fragmentation
-            if (step + 1) % 5 == 0 {
-                Memory.clearCache()
-            }
-
-            // Per-step diagnostics matching Python format
-            if profile {
-                let vMean = velocity.mean().item(Float.self)
-                let vStd = MLX.sqrt(MLX.variance(velocity)).item(Float.self)
-                let lMean = latent.mean().item(Float.self)
-                let lStd = MLX.sqrt(MLX.variance(latent)).item(Float.self)
-                LTXDebug.log("  Step \(step): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), vel mean=\(String(format: "%.4f", vMean)), std=\(String(format: "%.4f", vStd)), latent mean=\(String(format: "%.4f", lMean)), std=\(String(format: "%.4f", lStd))")
-            }
-
-            timings.denoiseSteps.append(Date().timeIntervalSince(stepStart))
-            timings.sampleMemory()
-        }
-
-        // Diagnostic: check final latent stats
-        do {
-            let lMean = latent.mean().item(Float.self)
-            let lStd = MLX.sqrt(MLX.variance(latent)).item(Float.self)
-            let lMin = latent.min().item(Float.self)
-            let lMax = latent.max().item(Float.self)
-            LTXDebug.log("[DIAG] Final latent: mean=\(lMean), std=\(lStd), min=\(lMin), max=\(lMax)")
-            // Check spatial variance: variance across spatial dims (H, W) for first channel, first frame
-            let firstSlice = latent[0, 0, 0]  // (H, W) for batch=0, channel=0, frame=0
-            let spatialVar = MLX.variance(firstSlice).item(Float.self)
-            LTXDebug.log("[DIAG] Spatial variance (ch0, f0): \(spatialVar)")
-        }
-
-        // Diagnostic: check scale_shift_table
-        do {
-            let sst = transformer.scaleShiftTable
-            let sstMean = sst.mean().item(Float.self)
-            let sstStd = MLX.sqrt(MLX.variance(sst)).item(Float.self)
-            LTXDebug.log("[DIAG] scale_shift_table: mean=\(sstMean), std=\(sstStd)")
-            let block0sst = transformer.transformerBlocks[0].scaleShiftTable
-            let b0Mean = block0sst.mean().item(Float.self)
-            let b0Std = MLX.sqrt(MLX.variance(block0sst)).item(Float.self)
-            LTXDebug.log("[DIAG] block0.scale_shift_table: mean=\(b0Mean), std=\(b0Std)")
-            // Check q_norm weights (should be non-trivial if loaded from safetensors)
-            let qw = transformer.transformerBlocks[0].attn1.qNorm.weight
-            let qwMean = qw.mean().item(Float.self)
-            let qwStd = MLX.sqrt(MLX.variance(qw)).item(Float.self)
-            LTXDebug.log("[DIAG] block0.attn1.q_norm.weight: mean=\(qwMean), std=\(qwStd) (1.0/0.0 = NOT loaded)")
-        }
-
-        // 7. Unload transformer to free memory for VAE decode
-        if memoryOptimization.unloadAfterUse {
-            self.transformer = nil
-            eval([MLXArray]())
-            Memory.clearCache()
-            if memoryOptimization.unloadSleepSeconds > 0 {
-                try await Task.sleep(for: .seconds(memoryOptimization.unloadSleepSeconds))
-                Memory.clearCache()
-            }
-            LTXDebug.log("Transformer unloaded for VAE decode phase")
-            LTXMemoryManager.logMemoryState("after transformer unload")
-        }
-
-        // 8. Decode latents to video
-        LTXMemoryManager.setPhase(.vaeDecode)
-        // Use timestep_conditioning from VAE config.json (Diffusers default: false)
-        let vaeTimestep: Float? = nil
-        LTXDebug.log("Decoding latents to video... (timestep=\(vaeTimestep.map { String($0) } ?? "nil"))")
-        let vaeStart = Date()
-        let videoTensor = decodeVideo(
-            latent: latent, decoder: vaeDecoder, timestep: vaeTimestep,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
-        )
-        MLX.eval(videoTensor)
-        timings.vaeDecode = Date().timeIntervalSince(vaeStart)
-        LTXDebug.log("Decoded video shape: \(videoTensor.shape)")
-
-        // 8. Trim to requested frame count
-        // The VAE upsamples temporally by 2x at each stage (2→4→8→16),
-        // but LTX-2 uses the formula: pixelFrames = (latentFrames - 1) * 8 + 1
-        // So we trim to the exact requested number of frames.
-        let trimmedVideo: MLXArray
-        if videoTensor.dim(0) > config.numFrames {
-            trimmedVideo = videoTensor[0..<config.numFrames]
-            LTXDebug.log("Trimmed from \(videoTensor.dim(0)) to \(config.numFrames) frames")
-        } else {
-            trimmedVideo = videoTensor
-        }
-
-        let frames = VideoExporter.tensorToImages(trimmedVideo)
-        LTXDebug.log("Generated \(frames.count) frames")
-
-        LTXMemoryManager.logMemoryState("after VAE decode")
-        LTXMemoryManager.resetCacheLimit()
-
-        // Capture final peak memory
-        timings.capturePeakMemory()
-
-        let generationTime = Date().timeIntervalSince(generationStart)
-        let usedSeed = config.seed ?? 0
-
-        return VideoGenerationResult(
-            frames: trimmedVideo,
-            seed: usedSeed,
-            generationTime: generationTime,
-            timings: profile ? timings : nil
-        )
-    }
-
-    /// Generate video with simpler API
-    public func generate(
-        prompt: String,
-        width: Int = 704,
-        height: Int = 480,
-        numFrames: Int = 121,
-        numSteps: Int? = nil,
-        guidance: Float? = nil,
-        seed: UInt64? = nil,
-        negativePrompt: String? = nil,
-        onProgress: GenerationProgressCallback? = nil
-    ) async throws -> VideoGenerationResult {
-        let config = LTXVideoGenerationConfig(
-            width: width,
-            height: height,
-            numFrames: numFrames,
-            numSteps: numSteps ?? model.defaultSteps,
-            cfgScale: guidance ?? model.defaultGuidance,
-            seed: seed,
-            negativePrompt: negativePrompt
-        )
-
-        return try await generateVideo(
-            prompt: prompt,
-            negativePrompt: negativePrompt,
-            config: config,
-            onProgress: onProgress
-        )
-    }
-
-    // MARK: - Video + Audio Generation
-
-    /// Result of video+audio generation
-    public struct AudioVideoGenerationResult: Sendable {
-        /// Video frames tensor (F, H, W, 3)
-        public let frames: MLXArray
-
-        /// Audio waveform (B, 2, samples) at 24kHz
-        public let audioWaveform: MLXArray
-
-        /// Audio sample rate (24000 Hz)
-        public let audioSampleRate: Int
-
-        /// Seed used for generation
-        public let seed: UInt64
-
-        /// Total generation time in seconds
-        public let generationTime: Double
-    }
-
-    /// Generate video with synchronized audio
-    ///
-    /// Uses the LTX2 dual transformer for joint video/audio denoising.
-    /// Requires `loadModels()` + `loadAudioModels()` to have been called.
-    ///
-    /// - Parameters:
-    ///   - prompt: Text description of the video and audio
-    ///   - config: Video generation configuration
-    ///   - onProgress: Optional progress callback
-    /// - Returns: AudioVideoGenerationResult with video frames and audio waveform
-    public func generateVideoWithAudio(
-        prompt: String,
-        config: LTXVideoGenerationConfig,
-        onProgress: GenerationProgressCallback? = nil
-    ) async throws -> AudioVideoGenerationResult {
-        try config.validate()
-
-        guard let textEncoder = textEncoder,
-              let ltx2 = ltx2Transformer,
-              let vaeDecoder = vaeDecoder,
-              let audioVAE = audioVAE,
-              let vocoder = vocoder
-        else {
-            throw LTXError.modelNotLoaded("Audio models not loaded. Call loadModels() + loadAudioModels() first.")
-        }
-
-        let generationStart = Date()
-        let isI2V = config.imagePath != nil
-        LTXDebug.log("Generating video+audio\(isI2V ? " (I2V)" : ""): \(config.width)x\(config.height), \(config.numFrames) frames")
-
-        // 0. Encode image if I2V
-        var imageLatent: MLXArray? = nil
-        if let imagePath = config.imagePath {
-            LTXDebug.log("Encoding input image for I2V...")
-            imageLatent = try await encodeImage(path: imagePath, width: config.width, height: config.height)
-            unloadVAEEncoder()
-        }
-
-        // 1. Text encoding (with audio connector)
-        LTXMemoryManager.setPhase(.textEncoding)
-
-        if !isGemmaLoaded {
-            LTXDebug.log("Reloading Gemma model...")
-            let paths = try await downloader.downloadGemma(model: model)
-            gemmaModel = try Gemma3WeightLoader.loadModel(from: paths.modelDir)
-            tokenizer = try await AutoTokenizer.from(modelFolder: paths.tokenizerDir)
-        }
-
-        let effectivePrompt: String
-        if config.enhancePrompt {
-            LTXDebug.log("Enhancing prompt with VLM (\(config.imagePath != nil ? "I2V" : "T2V"))...")
-            effectivePrompt = try await enhancePromptWithVLM(prompt, imagePath: config.imagePath)
-        } else {
-            effectivePrompt = prompt
-        }
-
-        // Encode text with both video and audio connectors
-        let (inputIds, attentionMask) = tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
-
-        guard let gemma = gemmaModel else {
-            throw LTXError.modelNotLoaded("Gemma model not loaded")
-        }
-
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            throw LTXError.generationFailed("Failed to extract Gemma hidden states")
-        }
-
-        // Text encoder produces both video and audio embeddings
-        let encoderOutput = textEncoder.encodeFromHiddenStates(
-            hiddenStates: states,
-            attentionMask: attentionMask,
-            paddingSide: "left"
-        )
-        let videoTextEmbeddings = encoderOutput.videoEncoding
-        let audioTextEmbeddings = encoderOutput.audioEncoding ?? videoTextEmbeddings
-        let textMask = encoderOutput.attentionMask
-        MLX.eval(videoTextEmbeddings, audioTextEmbeddings, textMask)
-
-        LTXDebug.log("Video text: \(videoTextEmbeddings.shape), Audio text: \(audioTextEmbeddings.shape)")
-        LTXDebug.log("[DIAG] Video text embed: mean=\(MLX.mean(videoTextEmbeddings).item(Float.self)), std=\(MLX.std(videoTextEmbeddings).item(Float.self))")
-        LTXDebug.log("[DIAG] Audio text embed: mean=\(MLX.mean(audioTextEmbeddings).item(Float.self)), std=\(MLX.std(audioTextEmbeddings).item(Float.self))")
-        LTXDebug.log("[DIAG] Audio == Video embeddings: \(MLX.allClose(videoTextEmbeddings, audioTextEmbeddings, atol: 1e-5).item(Bool.self))")
-
-        // Encode negative prompt for CFG (dev model)
-        let useCFG = config.cfgScale > 1.0
-        var negVideoEmbeddings: MLXArray? = nil
-        var negAudioEmbeddings: MLXArray? = nil
-        var negTextMask: MLXArray? = nil
-
-        if useCFG {
-            let negPrompt = config.negativePrompt ?? DEFAULT_NEGATIVE_PROMPT
-            LTXDebug.log("Encoding negative prompt for audio CFG (\(negPrompt.prefix(60))...)")
-            let (negIds, negAttnMask) = tokenizePrompt(negPrompt, maxLength: textMaxLength)
-            let (_, negAllHiddenStates) = gemma(negIds, attentionMask: negAttnMask, outputHiddenStates: true)
-            guard let negStates = negAllHiddenStates else {
-                throw LTXError.generationFailed("Failed to extract negative Gemma hidden states")
-            }
-            let negOutput = textEncoder.encodeFromHiddenStates(
-                hiddenStates: negStates,
-                attentionMask: negAttnMask,
-                paddingSide: "left"
-            )
-            negVideoEmbeddings = negOutput.videoEncoding
-            negAudioEmbeddings = negOutput.audioEncoding ?? negOutput.videoEncoding
-            negTextMask = negOutput.attentionMask
-            MLX.eval(negVideoEmbeddings!, negAudioEmbeddings!, negTextMask!)
-            LTXDebug.log("[DIAG] Neg video embed: mean=\(MLX.mean(negVideoEmbeddings!).item(Float.self)), std=\(MLX.std(negVideoEmbeddings!).item(Float.self))")
-            LTXDebug.log("[DIAG] Neg audio embed: mean=\(MLX.mean(negAudioEmbeddings!).item(Float.self)), std=\(MLX.std(negAudioEmbeddings!).item(Float.self))")
-        }
-
-        // Unload Gemma
-        self.gemmaModel = nil
-        self.tokenizer = nil
-        Memory.clearCache()
-
-        // 2. Create latent shapes
-        let latentShape = VideoLatentShape.fromPixelDimensions(
-            batch: 1, channels: 128,
-            frames: config.numFrames, height: config.height, width: config.width
-        )
-
-        let audioNumFrames = computeAudioLatentFrames(videoFrames: config.numFrames)
-        LTXDebug.log("Audio latent frames: \(audioNumFrames)")
-
-        // 3. Generate noise
-        if let seed = config.seed {
-            MLXRandom.seed(seed)
-        }
-
-        // Video noise (float32)
-        var videoLatent = generateNoise(shape: latentShape, seed: config.seed)
-        MLX.eval(videoLatent)
-
-        // Audio noise (float32, drawn after video noise from same RNG)
-        let audioLatent = MLXRandom.normal(
-            [1, Self.audioLatentChannels, audioNumFrames, Self.audioLatentMelBins]
-        ).asType(.float32)
-        MLX.eval(audioLatent)
-
-        // Pack audio for transformer
-        var audioLatentPacked = packAudioLatents(audioLatent)
-
-        // 4. Sigma schedule
-        let useDistilled = shouldUseDistilledSchedule(config)
-        scheduler.setTimesteps(
-            numSteps: config.numSteps,
-            distilled: useDistilled,
-            latentTokenCount: latentShape.tokenCount
-        )
-        let sigmas = scheduler.sigmas
-
-        // Create separate audio scheduler (same sigmas)
-        let audioScheduler = LTXScheduler(isDistilled: useDistilled)
-        audioScheduler.setTimesteps(
-            numSteps: config.numSteps,
-            distilled: useDistilled,
-            latentTokenCount: latentShape.tokenCount
-        )
-
-        // Scale initial noise
-        videoLatent = videoLatent * sigmas[0]
-        audioLatentPacked = audioLatentPacked * sigmas[0]
-
-        // I2V: condition frame 0 with image latent
-        var conditioningMask: MLXArray? = nil
-        if let imgLatent = imageLatent {
-            videoLatent[0..., 0..., 0..<1, 0..., 0...] = imgLatent
-            MLX.eval(videoLatent)
-
-            // Per-token mask: 1 for frame 0, 0 for others
-            let tokensPerFrame = latentShape.height * latentShape.width
-            let frame0Mask = MLXArray.ones([1, tokensPerFrame])
-            let otherMask = MLXArray.zeros([1, latentShape.tokenCount - tokensPerFrame])
-            conditioningMask = MLX.concatenated([frame0Mask, otherMask], axis: 1)
-            MLX.eval(conditioningMask!)
-            LTXDebug.log("I2V: frame 0 conditioned with image latent, per-token timestep mask created")
-        }
-
-        // 5. Denoising loop
-        LTXMemoryManager.setPhase(.denoising)
-        LTXDebug.log("Starting dual video+audio denoising (\(config.numSteps) steps)...")
-
-        for step in 0..<config.numSteps {
-            let stepStart = Date()
-            let sigma = sigmas[step]
-            let sigmaNext = sigmas[step + 1]
-
-            onProgress?(GenerationProgress(
-                currentStep: step, totalSteps: config.numSteps, sigma: sigma
-            ))
-
-            // I2V: inject noise to conditioned frame (Diffusers pattern)
-            if let condLatent = imageLatent, config.imageCondNoiseScale > 0, sigma > 0 {
-                let injectionNoise = MLXRandom.normal(condLatent.shape)
-                let noisedFrame0 = condLatent + MLXArray(config.imageCondNoiseScale) * injectionNoise * MLXArray(sigma * sigma)
-                videoLatent[0..., 0..., 0..<1, 0..., 0...] = noisedFrame0
-            }
-
-            // Per-token timestep for I2V: frame 0 gets σ=0 (already clean), others get σ
-            let videoTimestep: MLXArray
-            if let mask = conditioningMask {
-                videoTimestep = MLXArray(sigma) * (1 - mask)  // (1, T): frame0=0, others=sigma
-            } else {
-                videoTimestep = MLXArray([sigma])
-            }
-            let audioTimestep = MLXArray([sigma])
-
-            // Patchify video for transformer
-            let videoPatchified = patchify(videoLatent).asType(.bfloat16)
-            let audioPatchified = audioLatentPacked.asType(.bfloat16)
-
-            // Forward pass through dual transformer
-            var videoVelocity: MLXArray
-            var audioVelocity: MLXArray
-            var posVideoVel = MLXArray(0)  // conditional velocity for guidance rescale
-
-            if useCFG {
-                // Positive (conditional) pass
-                let (posVideoPred, posAudioPred) = ltx2(
-                    videoLatent: videoPatchified,
-                    audioLatent: audioPatchified,
-                    videoContext: videoTextEmbeddings.asType(.bfloat16),
-                    audioContext: audioTextEmbeddings.asType(.bfloat16),
-                    videoTimesteps: videoTimestep,
-                    audioTimesteps: audioTimestep,
-                    videoContextMask: textMask,
-                    audioContextMask: textMask,
-                    videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
-                    audioNumFrames: audioNumFrames
-                )
-                posVideoVel = unpatchify(posVideoPred, shape: latentShape).asType(.float32)
-                let posAudioVel = posAudioPred.asType(.float32)
-                MLX.eval(posVideoVel, posAudioVel)
-
-                // Negative (unconditional) pass
-                let (negVideoPred, negAudioPred) = ltx2(
-                    videoLatent: videoPatchified,
-                    audioLatent: audioPatchified,
-                    videoContext: negVideoEmbeddings!.asType(.bfloat16),
-                    audioContext: negAudioEmbeddings!.asType(.bfloat16),
-                    videoTimesteps: videoTimestep,
-                    audioTimesteps: audioTimestep,
-                    videoContextMask: negTextMask!,
-                    audioContextMask: negTextMask!,
-                    videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
-                    audioNumFrames: audioNumFrames
-                )
-                let negVideoVel = unpatchify(negVideoPred, shape: latentShape).asType(.float32)
-                let negAudioVel = negAudioPred.asType(.float32)
-                MLX.eval(negVideoVel, negAudioVel)
-
-                // Apply CFG to both video and audio
-                videoVelocity = applyCFG(uncond: negVideoVel, cond: posVideoVel, guidanceScale: config.cfgScale)
-                audioVelocity = applyCFG(uncond: negAudioVel, cond: posAudioVel, guidanceScale: config.cfgScale)
-
-                // Guidance rescale applied after STG (below), matching Python guiders.py order
-
-                if step == 0 {
-                    LTXDebug.log("[DIAG] CFG step 0: posVideo mean=\(MLX.mean(posVideoVel).item(Float.self)), negVideo mean=\(MLX.mean(negVideoVel).item(Float.self))")
-                    LTXDebug.log("[DIAG] CFG step 0: posAudio mean=\(MLX.mean(posAudioVel).item(Float.self)), negAudio mean=\(MLX.mean(negAudioVel).item(Float.self))")
-                }
-            } else {
-                // No CFG (distilled): single pass
-                let (videoVelPred, audioVelPred) = ltx2(
-                    videoLatent: videoPatchified,
-                    audioLatent: audioPatchified,
-                    videoContext: videoTextEmbeddings.asType(.bfloat16),
-                    audioContext: audioTextEmbeddings.asType(.bfloat16),
-                    videoTimesteps: videoTimestep,
-                    audioTimesteps: audioTimestep,
-                    videoContextMask: textMask,
-                    audioContextMask: textMask,
-                    videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
-                    audioNumFrames: audioNumFrames
-                )
-                videoVelocity = unpatchify(videoVelPred, shape: latentShape).asType(.float32)
-                audioVelocity = audioVelPred.asType(.float32)
-            }
-
-            // Apply guidance rescale AFTER CFG (matching Python guiders.py order)
-            if config.guidanceRescale > 0, useCFG {
-                videoVelocity = applyGuidanceRescale(
-                    guidedVelocity: videoVelocity,
-                    condVelocity: posVideoVel,
-                    phi: config.guidanceRescale
-                )
-            }
-
-            // Euler step for video
-            if imageLatent != nil {
-                // I2V: only step frames 1+ (frame 0 stays clean)
-                let velocitySlice = videoVelocity[0..., 0..., 1..., 0..., 0...]
-                let latentSlice = videoLatent[0..., 0..., 1..., 0..., 0...]
-                let steppedSlice = scheduler.step(
-                    latent: latentSlice, velocity: velocitySlice,
-                    sigma: sigma, sigmaNext: sigmaNext
-                )
-                let frame0 = videoLatent[0..., 0..., 0..<1, 0..., 0...]
-                videoLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
-            } else {
-                videoLatent = scheduler.step(
-                    latent: videoLatent, velocity: videoVelocity,
-                    sigma: sigma, sigmaNext: sigmaNext
-                )
-            }
-
-            // Euler step for audio (same formula as scheduler.step)
-            audioLatentPacked = audioLatentPacked + (sigmaNext - sigma) * audioVelocity
-
-            MLX.eval(videoLatent, audioLatentPacked)
-            if (step + 1) % 5 == 0 { Memory.clearCache() }
-
-            // Diagnostics
-            let vvMean = MLX.mean(videoVelocity).item(Float.self)
-            let vvStd = MLX.std(videoVelocity).item(Float.self)
-            let avMean = MLX.mean(audioVelocity).item(Float.self)
-            let avStd = MLX.std(audioVelocity).item(Float.self)
-            let alMean = MLX.mean(audioLatentPacked).item(Float.self)
-            let alStd = MLX.std(audioLatentPacked).item(Float.self)
-            LTXDebug.log("[DIAG] Step \(step): videoVel mean=\(String(format: "%.6f", vvMean)) std=\(String(format: "%.6f", vvStd)) | audioVel mean=\(String(format: "%.6f", avMean)) std=\(String(format: "%.6f", avStd)) | audioLatent mean=\(String(format: "%.6f", alMean)) std=\(String(format: "%.6f", alStd))")
-
-            LTXDebug.log("Step \(step)/\(config.numSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
-        }
-
-        // 6. Unload transformer
-        if memoryOptimization.unloadAfterUse {
-            self.ltx2Transformer = nil
-            Memory.clearCache()
-            LTXDebug.log("LTX2 Transformer unloaded")
-        }
-
-        // 7. Decode video
-        LTXMemoryManager.setPhase(.vaeDecode)
-        let vaeTimestep: Float? = nil
-        let videoTensor = decodeVideo(
-            latent: videoLatent, decoder: vaeDecoder, timestep: vaeTimestep,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
-        )
-        MLX.eval(videoTensor)
-
-        // Trim video frames
-        let trimmedVideo: MLXArray
-        if videoTensor.dim(0) > config.numFrames {
-            trimmedVideo = videoTensor[0..<config.numFrames]
-        } else {
-            trimmedVideo = videoTensor
-        }
-
-        // 8. Decode audio: unpack → denormalize → AudioVAE → Vocoder
-        LTXDebug.log("Decoding audio latents...")
-        LTXDebug.log("Audio latent final: mean=\(String(format: "%.6f", MLX.mean(audioLatentPacked).item(Float.self))), std=\(String(format: "%.6f", MLX.std(audioLatentPacked).item(Float.self)))")
-
-        let audioLatentUnpacked = unpackAudioLatents(audioLatentPacked, numFrames: audioNumFrames)
-        let audioWaveform = decodeAudio(
-            latents: audioLatentUnpacked,
-            audioVAE: audioVAE,
-            vocoder: vocoder
-        )
-        MLX.eval(audioWaveform)
-        LTXDebug.log("Audio waveform: \(audioWaveform.shape)")
-
-        let generationTime = Date().timeIntervalSince(generationStart)
-        let usedSeed = config.seed ?? 0
-
-        return AudioVideoGenerationResult(
-            frames: trimmedVideo,
-            audioWaveform: audioWaveform,
-            audioSampleRate: vocoder.outputSampleRate,
-            seed: usedSeed,
-            generationTime: generationTime
-        )
-    }
-
-    // MARK: - Two-Stage Audio+Video Generation
-
-    /// Generate video with audio using two-stage pipeline (half-res → upscale → refine)
-    ///
-    /// Combines two-stage spatial upscaling with dual video/audio transformer.
-    /// Audio is denoised alongside video in both stages — no spatial upscaling for audio.
-    /// Stage 1: half-res video + audio denoised together
-    /// Upscale: video latent 2x (audio unchanged)
-    /// Stage 2: full-res video + audio re-noised and refined together
-    ///
-    /// - Parameters:
-    ///   - prompt: Text description of the video and audio
     ///   - config: Video generation configuration (width/height = FINAL resolution)
     ///   - upscalerWeightsPath: Path to spatial upscaler safetensors
     ///   - onProgress: Optional progress callback
-    /// - Returns: AudioVideoGenerationResult with video frames and audio waveform
-    public func generateVideoWithAudioTwoStage(
+    ///   - profile: Enable performance profiling
+    /// - Returns: VideoGenerationResult with video frames and optional audio
+    public func generateVideo(
         prompt: String,
         config: LTXVideoGenerationConfig,
         upscalerWeightsPath: String,
-        onProgress: GenerationProgressCallback? = nil
-    ) async throws -> AudioVideoGenerationResult {
+        onProgress: GenerationProgressCallback? = nil,
+        profile: Bool = false
+    ) async throws -> VideoGenerationResult {
         try config.validate()
+        var timings = GenerationTimings()
+
+        let hasAudio = isAudioLoaded
 
         guard let textEncoder = textEncoder,
-              let ltx2 = ltx2Transformer,
-              let vaeDecoder = vaeDecoder,
-              let audioVAE = audioVAE,
-              let vocoder = vocoder
+              let vaeDecoder = vaeDecoder
         else {
-            throw LTXError.modelNotLoaded("Audio+two-stage models not loaded. Call loadModels() + loadAudioModels() first.")
+            throw LTXError.modelNotLoaded("Models not loaded. Call loadModels() first.")
+        }
+
+        // Need either video-only OR dual transformer
+        guard transformer != nil || ltx2Transformer != nil else {
+            throw LTXError.modelNotLoaded("No transformer loaded. Call loadModels() first.")
         }
 
         let generationStart = Date()
@@ -1502,9 +614,9 @@ public actor LTXPipeline {
         let halfHeight = config.height / 2
         let isI2V = config.imagePath != nil
 
-        LTXDebug.log("Two-stage audio+video: \(halfWidth)x\(halfHeight) → \(config.width)x\(config.height)")
+        LTXDebug.log("Two-stage generation: \(halfWidth)x\(halfHeight) → \(config.width)x\(config.height), audio=\(hasAudio)")
 
-        // 0. Encode image at half-res if i2v
+        // 0. Encode image at half-res if I2V
         var halfResImageLatent: MLXArray? = nil
         if let imagePath = config.imagePath {
             LTXDebug.log("Two-stage I2V: encoding image at \(halfWidth)x\(halfHeight)")
@@ -1521,7 +633,8 @@ public actor LTXPipeline {
             effectivePrompt = prompt
         }
 
-        // 1. Text encoding (with audio connector)
+        // 1. Text encoding
+        let textEncodingStart = Date()
         let (inputIds, attentionMask) = tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
 
         guard let gemma = gemmaModel else {
@@ -1544,6 +657,7 @@ public actor LTXPipeline {
         MLX.eval(videoTextEmbeddings, audioTextEmbeddings, textMask)
 
         LTXDebug.log("Video text: \(videoTextEmbeddings.shape), Audio text: \(audioTextEmbeddings.shape)")
+        timings.textEncoding = Date().timeIntervalSince(textEncodingStart)
 
         // Unload Gemma
         self.gemmaModel = nil
@@ -1556,8 +670,8 @@ public actor LTXPipeline {
             frames: config.numFrames, height: halfHeight, width: halfWidth
         )
 
-        let audioNumFrames = computeAudioLatentFrames(videoFrames: config.numFrames)
-        LTXDebug.log("Stage 1 latent: \(stage1Shape.frames)x\(stage1Shape.height)x\(stage1Shape.width), audio frames: \(audioNumFrames)")
+        let audioNumFrames = hasAudio ? computeAudioLatentFrames(videoFrames: config.numFrames) : 0
+        LTXDebug.log("Stage 1 latent: \(stage1Shape.frames)x\(stage1Shape.height)x\(stage1Shape.width)\(hasAudio ? ", audio frames: \(audioNumFrames)" : "")")
 
         // 3. Generate noise
         if let seed = config.seed {
@@ -1569,25 +683,31 @@ public actor LTXPipeline {
         MLX.eval(videoLatent)
 
         // Audio noise (float32, drawn after video noise from same RNG)
-        let audioLatent = MLXRandom.normal(
-            [1, Self.audioLatentChannels, audioNumFrames, Self.audioLatentMelBins]
-        ).asType(.float32)
-        MLX.eval(audioLatent)
-        var audioLatentPacked = packAudioLatents(audioLatent)
+        var audioLatentPacked: MLXArray? = nil
+        if hasAudio {
+            let audioLatent = MLXRandom.normal(
+                [1, Self.audioLatentChannels, audioNumFrames, Self.audioLatentMelBins]
+            ).asType(.float32)
+            MLX.eval(audioLatent)
+            audioLatentPacked = packAudioLatents(audioLatent)
+        }
 
-        // 4. Stage 1 sigma schedule (distilled)
+        // 4. Stage 1 sigma schedule (always distilled: 8 steps, no CFG/STG)
+        let stage1Steps = 8
         let stage1Scheduler = LTXScheduler(isDistilled: true)
         stage1Scheduler.setTimesteps(
-            numSteps: config.numSteps,
+            numSteps: stage1Steps,
             distilled: true,
             latentTokenCount: stage1Shape.tokenCount
         )
         let stage1Sigmas = stage1Scheduler.sigmas
-        LTXDebug.log("Stage 1: \(stage1Sigmas.count - 1) steps, sigmas: \(stage1Sigmas)")
+        LTXDebug.log("Stage 1: \(stage1Sigmas.count - 1) distilled steps, sigmas: \(stage1Sigmas)")
 
         // Scale initial noise
         videoLatent = videoLatent * stage1Sigmas[0]
-        audioLatentPacked = audioLatentPacked * stage1Sigmas[0]
+        if hasAudio {
+            audioLatentPacked = audioLatentPacked! * stage1Sigmas[0]
+        }
 
         // I2V: condition frame 0 with per-token timestep masking
         var stage1CondMask: MLXArray? = nil
@@ -1604,7 +724,7 @@ public actor LTXPipeline {
 
         // === STAGE 1: Denoise at half resolution ===
         let stage1NumSteps = stage1Sigmas.count - 1
-        LTXDebug.log("=== Stage 1: Half-resolution dual denoising (\(stage1NumSteps) steps) ===")
+        LTXDebug.log("=== Stage 1: Half-resolution \(hasAudio ? "dual" : "video-only") denoising (\(stage1NumSteps) steps) ===")
         let stage1Start = Date()
 
         for step in 0..<stage1NumSteps {
@@ -1630,51 +750,94 @@ public actor LTXPipeline {
             } else {
                 videoTimestep = MLXArray([sigma])
             }
-            let audioTimestep = MLXArray([sigma])
 
             let videoPatchified = patchify(videoLatent).asType(.bfloat16)
-            let audioPatchified = audioLatentPacked.asType(.bfloat16)
 
-            let (videoVelPred, audioVelPred) = ltx2(
-                videoLatent: videoPatchified,
-                audioLatent: audioPatchified,
-                videoContext: videoTextEmbeddings.asType(.bfloat16),
-                audioContext: audioTextEmbeddings.asType(.bfloat16),
-                videoTimesteps: videoTimestep,
-                audioTimesteps: audioTimestep,
-                videoContextMask: textMask,
-                audioContextMask: textMask,
-                videoLatentShape: (frames: stage1Shape.frames, height: stage1Shape.height, width: stage1Shape.width),
-                audioNumFrames: audioNumFrames
-            )
+            if hasAudio, let ltx2 = ltx2Transformer {
+                // Dual video/audio denoising
+                let audioTimestep = MLXArray([sigma])
+                let audioPatchified = audioLatentPacked!.asType(.bfloat16)
 
-            let videoVelocity = unpatchify(videoVelPred, shape: stage1Shape).asType(.float32)
-            let audioVelocity = audioVelPred.asType(.float32)
-
-            if halfResImageLatent != nil {
-                // I2V: only step frames 1+ (frame 0 stays clean)
-                let velocitySlice = videoVelocity[0..., 0..., 1..., 0..., 0...]
-                let latentSlice = videoLatent[0..., 0..., 1..., 0..., 0...]
-                let steppedSlice = stage1Scheduler.step(
-                    latent: latentSlice, velocity: velocitySlice,
-                    sigma: sigma, sigmaNext: sigmaNext
+                let (videoVelPred, audioVelPred) = ltx2(
+                    videoLatent: videoPatchified,
+                    audioLatent: audioPatchified,
+                    videoContext: videoTextEmbeddings.asType(.bfloat16),
+                    audioContext: videoTextEmbeddings.asType(.bfloat16),
+                    videoTimesteps: videoTimestep,
+                    audioTimesteps: audioTimestep,
+                    videoContextMask: textMask,
+                    audioContextMask: textMask,
+                    videoLatentShape: (frames: stage1Shape.frames, height: stage1Shape.height, width: stage1Shape.width),
+                    audioNumFrames: audioNumFrames
                 )
-                let frame0 = videoLatent[0..., 0..., 0..<1, 0..., 0...]
-                videoLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
-            } else {
-                videoLatent = stage1Scheduler.step(
-                    latent: videoLatent, velocity: videoVelocity,
-                    sigma: sigma, sigmaNext: sigmaNext
+
+                let videoVelocity = unpatchify(videoVelPred, shape: stage1Shape).asType(.float32)
+                let audioVelocity = audioVelPred.asType(.float32)
+
+                if halfResImageLatent != nil {
+                    let velocitySlice = videoVelocity[0..., 0..., 1..., 0..., 0...]
+                    let latentSlice = videoLatent[0..., 0..., 1..., 0..., 0...]
+                    let steppedSlice = stage1Scheduler.step(
+                        latent: latentSlice, velocity: velocitySlice,
+                        sigma: sigma, sigmaNext: sigmaNext
+                    )
+                    let frame0 = videoLatent[0..., 0..., 0..<1, 0..., 0...]
+                    videoLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
+                } else {
+                    videoLatent = stage1Scheduler.step(
+                        latent: videoLatent, velocity: videoVelocity,
+                        sigma: sigma, sigmaNext: sigmaNext
+                    )
+                }
+                audioLatentPacked = audioLatentPacked! + (sigmaNext - sigma) * audioVelocity
+                MLX.eval(videoLatent, audioLatentPacked!)
+            } else if let videoTransformer = transformer {
+                // Video-only denoising
+                let velocityPred = videoTransformer(
+                    latent: videoPatchified,
+                    context: videoTextEmbeddings.asType(.bfloat16),
+                    timesteps: videoTimestep,
+                    contextMask: nil,
+                    latentShape: (frames: stage1Shape.frames, height: stage1Shape.height, width: stage1Shape.width)
                 )
+
+                let videoVelocity = unpatchify(velocityPred, shape: stage1Shape).asType(.float32)
+
+                if halfResImageLatent != nil {
+                    let velocitySlice = videoVelocity[0..., 0..., 1..., 0..., 0...]
+                    let latentSlice = videoLatent[0..., 0..., 1..., 0..., 0...]
+                    let steppedSlice = stage1Scheduler.step(
+                        latent: latentSlice, velocity: velocitySlice,
+                        sigma: sigma, sigmaNext: sigmaNext
+                    )
+                    let frame0 = videoLatent[0..., 0..., 0..<1, 0..., 0...]
+                    videoLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
+                } else {
+                    videoLatent = stage1Scheduler.step(
+                        latent: videoLatent, velocity: videoVelocity,
+                        sigma: sigma, sigmaNext: sigmaNext
+                    )
+                }
+                MLX.eval(videoLatent)
             }
-            audioLatentPacked = audioLatentPacked + (sigmaNext - sigma) * audioVelocity
 
-            MLX.eval(videoLatent, audioLatentPacked)
             if (step + 1) % 5 == 0 { Memory.clearCache() }
+            timings.denoiseSteps.append(Date().timeIntervalSince(stepStart))
+            timings.sampleMemory()
 
             LTXDebug.log("Stage 1 step \(step)/\(stage1NumSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
         }
         LTXDebug.log("Stage 1 complete: \(String(format: "%.1f", Date().timeIntervalSince(stage1Start)))s")
+
+        // Dump stage 1 output for comparison
+        if LTXDebug.isEnabled {
+            let dumpDir = "/tmp/debug_dumps/swift"
+            try? FileManager.default.createDirectory(atPath: dumpDir, withIntermediateDirectories: true)
+            let s1 = videoLatent.asType(.float32)
+            MLX.eval(s1)
+            try? MLX.save(arrays: ["data": s1], url: URL(fileURLWithPath: "\(dumpDir)/stage1_output.safetensors"))
+            LTXDebug.log("Dumped stage1_output: \(s1.shape)")
+        }
 
         // === UPSCALE VIDEO 2x (audio unchanged) ===
         LTXDebug.log("=== Upscaling video latent 2x ===")
@@ -1700,8 +863,17 @@ public actor LTXPipeline {
 
         LTXDebug.log("Upscale time: \(String(format: "%.1f", Date().timeIntervalSince(upscaleStart)))s, shape: \(videoLatent.shape)")
 
+        // Dump upscaled latent
+        if LTXDebug.isEnabled {
+            let dumpDir = "/tmp/debug_dumps/swift"
+            let up = videoLatent.asType(.float32)
+            MLX.eval(up)
+            try? MLX.save(arrays: ["data": up], url: URL(fileURLWithPath: "\(dumpDir)/after_upscale.safetensors"))
+            LTXDebug.log("Dumped after_upscale: \(up.shape)")
+        }
+
         // === STAGE 2: Refine at full resolution ===
-        LTXDebug.log("=== Stage 2: Full-resolution dual refinement (3 steps) ===")
+        LTXDebug.log("=== Stage 2: Full-resolution \(hasAudio ? "dual" : "video-only") refinement (3 steps) ===")
         let stage2Start = Date()
 
         let stage2Shape = VideoLatentShape.fromPixelDimensions(
@@ -1716,9 +888,10 @@ public actor LTXPipeline {
         let videoNoise = generateNoise(shape: stage2Shape)
         videoLatent = MLXArray(noiseScale) * videoNoise + MLXArray(1.0 - noiseScale) * videoLatent
 
-        // Re-noise audio similarly
-        let audioReNoise = MLXRandom.normal(audioLatentPacked.shape).asType(.float32)
-        audioLatentPacked = MLXArray(noiseScale) * audioReNoise + MLXArray(1.0 - noiseScale) * audioLatentPacked
+        if hasAudio {
+            let audioReNoise = MLXRandom.normal(audioLatentPacked!.shape).asType(.float32)
+            audioLatentPacked = MLXArray(noiseScale) * audioReNoise + MLXArray(1.0 - noiseScale) * audioLatentPacked!
+        }
 
         // I2V stage 2: encode image at full resolution and condition frame 0
         var fullResImageLatent: MLXArray? = nil
@@ -1735,7 +908,17 @@ public actor LTXPipeline {
             stage2CondMask = MLX.concatenated([frame0Mask, otherMask], axis: 1)
             MLX.eval(stage2CondMask!)
         }
-        MLX.eval(videoLatent, audioLatentPacked)
+        MLX.eval(videoLatent)
+        if hasAudio { MLX.eval(audioLatentPacked!) }
+
+        // Dump re-noised latent
+        if LTXDebug.isEnabled {
+            let dumpDir = "/tmp/debug_dumps/swift"
+            let rn = videoLatent.asType(.float32)
+            MLX.eval(rn)
+            try? MLX.save(arrays: ["data": rn], url: URL(fileURLWithPath: "\(dumpDir)/after_renoise.safetensors"))
+            LTXDebug.log("Dumped after_renoise: \(rn.shape)")
+        }
 
         let stage2NumSteps = stage2Sigmas.count - 1
         for step in 0..<stage2NumSteps {
@@ -1761,42 +944,68 @@ public actor LTXPipeline {
             } else {
                 videoTimestep = MLXArray([sigma])
             }
-            let audioTimestep = MLXArray([sigma])
 
             let videoPatchified = patchify(videoLatent).asType(.bfloat16)
-            let audioPatchified = audioLatentPacked.asType(.bfloat16)
 
-            let (videoVelPred, audioVelPred) = ltx2(
-                videoLatent: videoPatchified,
-                audioLatent: audioPatchified,
-                videoContext: videoTextEmbeddings.asType(.bfloat16),
-                audioContext: audioTextEmbeddings.asType(.bfloat16),
-                videoTimesteps: videoTimestep,
-                audioTimesteps: audioTimestep,
-                videoContextMask: textMask,
-                audioContextMask: textMask,
-                videoLatentShape: (frames: stage2Shape.frames, height: stage2Shape.height, width: stage2Shape.width),
-                audioNumFrames: audioNumFrames
-            )
+            if hasAudio, let ltx2 = ltx2Transformer {
+                let audioTimestep = MLXArray([sigma])
+                let audioPatchified = audioLatentPacked!.asType(.bfloat16)
 
-            let videoVelocity = unpatchify(videoVelPred, shape: stage2Shape).asType(.float32)
-            let audioVelocity = audioVelPred.asType(.float32)
+                let (videoVelPred, audioVelPred) = ltx2(
+                    videoLatent: videoPatchified,
+                    audioLatent: audioPatchified,
+                    videoContext: videoTextEmbeddings.asType(.bfloat16),
+                    audioContext: videoTextEmbeddings.asType(.bfloat16),
+                    videoTimesteps: videoTimestep,
+                    audioTimesteps: audioTimestep,
+                    videoContextMask: textMask,
+                    audioContextMask: textMask,
+                    videoLatentShape: (frames: stage2Shape.frames, height: stage2Shape.height, width: stage2Shape.width),
+                    audioNumFrames: audioNumFrames
+                )
 
-            // Euler step
-            let dt = sigmaNext - sigma
-            if fullResImageLatent != nil {
-                // I2V: only step frames 1+ (frame 0 stays clean)
-                let velocitySlice = videoVelocity[0..., 0..., 1..., 0..., 0...]
-                let latentSlice = videoLatent[0..., 0..., 1..., 0..., 0...]
-                let steppedSlice = latentSlice + MLXArray(dt) * velocitySlice
-                let frame0 = videoLatent[0..., 0..., 0..<1, 0..., 0...]
-                videoLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
-            } else {
-                videoLatent = videoLatent + MLXArray(dt) * videoVelocity
+                let videoVelocity = unpatchify(videoVelPred, shape: stage2Shape).asType(.float32)
+                let audioVelocity = audioVelPred.asType(.float32)
+
+                // Euler step
+                let dt = sigmaNext - sigma
+                if fullResImageLatent != nil {
+                    let velocitySlice = videoVelocity[0..., 0..., 1..., 0..., 0...]
+                    let latentSlice = videoLatent[0..., 0..., 1..., 0..., 0...]
+                    let steppedSlice = latentSlice + MLXArray(dt) * velocitySlice
+                    let frame0 = videoLatent[0..., 0..., 0..<1, 0..., 0...]
+                    videoLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
+                } else {
+                    videoLatent = videoLatent + MLXArray(dt) * videoVelocity
+                }
+                audioLatentPacked = audioLatentPacked! + MLXArray(dt) * audioVelocity
+                MLX.eval(videoLatent, audioLatentPacked!)
+            } else if let videoTransformer = transformer {
+                let velocityPred = videoTransformer(
+                    latent: videoPatchified,
+                    context: videoTextEmbeddings.asType(.bfloat16),
+                    timesteps: videoTimestep,
+                    contextMask: nil,
+                    latentShape: (frames: stage2Shape.frames, height: stage2Shape.height, width: stage2Shape.width)
+                )
+
+                let videoVelocity = unpatchify(velocityPred, shape: stage2Shape).asType(.float32)
+
+                let dt = sigmaNext - sigma
+                if fullResImageLatent != nil {
+                    let velocitySlice = videoVelocity[0..., 0..., 1..., 0..., 0...]
+                    let latentSlice = videoLatent[0..., 0..., 1..., 0..., 0...]
+                    let steppedSlice = latentSlice + MLXArray(dt) * velocitySlice
+                    let frame0 = videoLatent[0..., 0..., 0..<1, 0..., 0...]
+                    videoLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
+                } else {
+                    videoLatent = videoLatent + MLXArray(dt) * videoVelocity
+                }
+                MLX.eval(videoLatent)
             }
-            audioLatentPacked = audioLatentPacked + MLXArray(dt) * audioVelocity
 
-            MLX.eval(videoLatent, audioLatentPacked)
+            timings.denoiseSteps.append(Date().timeIntervalSince(stepStart))
+            timings.sampleMemory()
 
             LTXDebug.log("Stage 2 step \(step)/\(stage2NumSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
         }
@@ -1805,324 +1014,32 @@ public actor LTXPipeline {
         // Unload transformer
         if memoryOptimization.unloadAfterUse {
             self.ltx2Transformer = nil
+            self.transformer = nil
             Memory.clearCache()
-            LTXDebug.log("LTX2 Transformer unloaded")
+            LTXDebug.log("Transformer unloaded")
+        }
+
+        // Dump latent for Python comparison (debug)
+        if LTXDebug.isEnabled {
+            let dumpDir = "/tmp/debug_dumps/swift"
+            try? FileManager.default.createDirectory(atPath: dumpDir, withIntermediateDirectories: true)
+            let latentToSave = videoLatent.asType(.float32)
+            MLX.eval(latentToSave)
+            try? MLX.save(arrays: ["data": latentToSave], url: URL(fileURLWithPath: "\(dumpDir)/final_latent.safetensors"))
+            LTXDebug.log("Saved final latent to \(dumpDir)/final_latent.safetensors: \(latentToSave.shape)")
         }
 
         // Decode video
-        let vaeTimestep: Float? = nil
-        let videoTensor = decodeVideo(
-            latent: videoLatent, decoder: vaeDecoder, timestep: vaeTimestep,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
-        )
-        MLX.eval(videoTensor)
-
-        let trimmedVideo: MLXArray
-        if videoTensor.dim(0) > config.numFrames {
-            trimmedVideo = videoTensor[0..<config.numFrames]
-        } else {
-            trimmedVideo = videoTensor
-        }
-
-        // Decode audio
-        LTXDebug.log("Decoding audio latents...")
-        let audioLatentUnpacked = unpackAudioLatents(audioLatentPacked, numFrames: audioNumFrames)
-        let audioWaveform = decodeAudio(
-            latents: audioLatentUnpacked,
-            audioVAE: audioVAE,
-            vocoder: vocoder
-        )
-        MLX.eval(audioWaveform)
-        LTXDebug.log("Audio waveform: \(audioWaveform.shape)")
-
-        let generationTime = Date().timeIntervalSince(generationStart)
-        LTXDebug.log("Total two-stage audio+video time: \(String(format: "%.1f", generationTime))s")
-
-        return AudioVideoGenerationResult(
-            frames: trimmedVideo,
-            audioWaveform: audioWaveform,
-            audioSampleRate: vocoder.outputSampleRate,
-            seed: config.seed ?? 0,
-            generationTime: generationTime
-        )
-    }
-
-    // MARK: - Image-to-Video Generation
-
-    /// Load VAE encoder weights from the unified safetensors file
-    ///
-    /// Extracts encoder weights from the unified file (vae.encoder.* prefix).
-    private func loadVAEEncoder() async throws {
-        if vaeEncoder != nil { return }  // Already loaded
-
-        LTXDebug.log("Loading VAE encoder...")
-        let unifiedPath = try await downloader.downloadUnifiedWeights(model: model, progress: nil)
-        let encoderWeights = try LTXWeightLoader.loadVAEEncoderWeightsFromUnified(from: unifiedPath.path)
-
-        let encoder = VideoEncoder()
-        try LTXWeightLoader.applyVAEEncoderWeights(encoderWeights, to: encoder)
-        eval(encoder.parameters())
-        Memory.clearCache()
-
-        self.vaeEncoder = encoder
-        LTXDebug.log("VAE encoder loaded (\(encoderWeights.count) weights)")
-    }
-
-    /// Unload VAE encoder to free memory
-    private func unloadVAEEncoder() {
-        self.vaeEncoder = nil
-        eval([MLXArray]())
-        Memory.clearCache()
-        LTXDebug.log("VAE encoder unloaded")
-    }
-
-    /// Encode an image into latent space using the VAE encoder
-    ///
-    /// - Parameters:
-    ///   - imagePath: Path to input image
-    ///   - width: Target video width
-    ///   - height: Target video height
-    /// - Returns: Image latent tensor (1, 128, 1, H/32, W/32)
-    private func encodeImage(path imagePath: String, width: Int, height: Int) async throws -> MLXArray {
-        // Load and resize image
-        let imageTensor = try loadImage(from: imagePath, width: width, height: height)
-        MLX.eval(imageTensor)
-        LTXDebug.log("Image loaded: \(imageTensor.shape)")
-
-        // Load encoder if needed
-        try await loadVAEEncoder()
-
-        guard let encoder = vaeEncoder else {
-            throw LTXError.modelNotLoaded("VAE encoder failed to load")
-        }
-
-        // Encode: (1, 3, 1, H, W) -> (1, 128, 1, H/32, W/32)
-        let latent = encoder(imageTensor)
-        MLX.eval(latent)
-        LTXDebug.log("Image encoded to latent: \(latent.shape)")
-
-        // Normalize using VAE per-channel statistics (same as decoder uses to denormalize)
-        guard let vaeDecoder = vaeDecoder else {
-            throw LTXError.modelNotLoaded("VAE decoder not loaded (needed for latent statistics)")
-        }
-        let mean5d = vaeDecoder.meanOfMeans.asType(.float32).reshaped([1, -1, 1, 1, 1])
-        let std5d = vaeDecoder.stdOfMeans.asType(.float32).reshaped([1, -1, 1, 1, 1])
-        let normalizedLatent = (latent.asType(.float32) - mean5d) / std5d
-        MLX.eval(normalizedLatent)
-
-        LTXDebug.log("Normalized image latent: mean=\(normalizedLatent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(normalizedLatent)).item(Float.self))")
-
-        return normalizedLatent
-    }
-
-    /// Generate video conditioned on an input image (image-to-video)
-    ///
-    /// The first frame of the generated video matches the input image.
-    /// The remaining frames are generated from noise and denoised using
-    /// the same transformer and scheduler as text-to-video.
-    ///
-    /// Memory management:
-    /// - Phase 1: Load VAE encoder, encode image, unload encoder
-    /// - Phase 2: Encode text (Gemma), unload Gemma
-    /// - Phase 3: Denoise with transformer
-    /// - Phase 4: Unload transformer, decode with VAE decoder
-    ///
-    /// - Parameters:
-    ///   - prompt: Text description of the desired video motion
-    ///   - negativePrompt: Optional negative prompt for CFG
-    ///   - config: Video generation configuration (must have imagePath set)
-    ///   - onProgress: Optional progress callback
-    ///   - profile: Enable performance profiling
-    /// - Returns: Video generation result with frames
-    public func generateVideoFromImage(
-        prompt: String,
-        negativePrompt: String? = nil,
-        config: LTXVideoGenerationConfig,
-        onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false
-    ) async throws -> VideoGenerationResult {
-        try config.validate()
-        var timings = GenerationTimings()
-
-        guard let imagePath = config.imagePath else {
-            throw LTXError.invalidConfiguration("imagePath must be set for image-to-video generation")
-        }
-
-        guard isLoaded else {
-            throw LTXError.modelNotLoaded("Models not loaded. Call loadModels() first.")
-        }
-        guard let textEncoder = textEncoder,
-              let transformer = transformer,
-              let vaeDecoder = vaeDecoder
-        else {
-            throw LTXError.modelNotLoaded("One or more models failed to load")
-        }
-
-        let generationStart = Date()
-        LTXMemoryManager.logMemoryState("i2v generation start")
-
-        // === Phase 1: Encode image ===
-        LTXDebug.log("=== Phase 1: Image Encoding ===")
-        let imgEncStart = Date()
-        let imageLatent = try await encodeImage(path: imagePath, width: config.width, height: config.height)
-        LTXDebug.log("Image encoding: \(String(format: "%.1f", Date().timeIntervalSince(imgEncStart)))s")
-
-        // Unload encoder to free memory
-        unloadVAEEncoder()
-        LTXMemoryManager.logMemoryState("after image encoding")
-
-        // === Phase 2: Text Encoding ===
-        LTXDebug.log("=== Phase 2: Text Encoding ===")
-        let textEncStart = Date()
-        let useCFG = config.cfgScale > 1.0
-        LTXMemoryManager.setPhase(.textEncoding)
-
-        // Reload Gemma if needed
-        if !isGemmaLoaded {
-            LTXDebug.log("Reloading Gemma model...")
-            let paths = try await downloader.downloadGemma(model: model, progress: nil)
-            gemmaModel = try Gemma3WeightLoader.loadModel(from: paths.modelDir)
-            tokenizer = try await AutoTokenizer.from(modelFolder: paths.tokenizerDir)
-        }
-
-        // Optionally enhance prompt (I2V always has imagePath here)
-        let effectivePrompt: String
-        if config.enhancePrompt {
-            LTXDebug.log("Enhancing prompt with VLM (\(config.imagePath != nil ? "I2V" : "T2V"))...")
-            effectivePrompt = try await enhancePromptWithVLM(prompt, imagePath: config.imagePath)
-        } else {
-            effectivePrompt = prompt
-        }
-
-        // Encode prompt
-        let (promptEmbeddings, promptMask) = encodePrompt(effectivePrompt, encoder: textEncoder)
-        MLX.eval(promptEmbeddings, promptMask)
-
-        let textEmbeddings: MLXArray
-        let contextMask: MLXArray
-        if useCFG {
-            let negPromptText = negativePrompt ?? DEFAULT_NEGATIVE_PROMPT
-            let (negEmbeddings, negMask) = encodePrompt(negPromptText, encoder: textEncoder)
-            MLX.eval(negEmbeddings, negMask)
-            textEmbeddings = MLX.concatenated([negEmbeddings, promptEmbeddings], axis: 0)
-            contextMask = MLX.concatenated([negMask, promptMask], axis: 0)
-            MLX.eval(textEmbeddings, contextMask)
-        } else {
-            textEmbeddings = promptEmbeddings
-            contextMask = promptMask
-        }
-
-        // Unload Gemma
-        self.gemmaModel = nil
-        self.tokenizer = nil
-        Memory.clearCache()
-
-        timings.textEncoding = Date().timeIntervalSince(textEncStart)
-        LTXDebug.log("Text encoding: \(String(format: "%.1f", timings.textEncoding))s")
-
-        // === Phase 3: Denoising ===
-        LTXDebug.log("=== Phase 3: Denoising ===")
-        LTXMemoryManager.setPhase(.denoising)
-
-        // Create latent shape
-        let latentShape = VideoLatentShape.fromPixelDimensions(
-            batch: 1, channels: 128,
-            frames: config.numFrames,
-            height: config.height,
-            width: config.width
-        )
-        LTXDebug.log("Latent shape: \(latentShape.frames)x\(latentShape.height)x\(latentShape.width)")
-
-        // Seed
-        if let seed = config.seed {
-            MLXRandom.seed(seed)
-        }
-
-        // Cross-attention scaling
-        if config.crossAttentionScale != 1.0 {
-            transformer.setCrossAttentionScale(config.crossAttentionScale)
-        }
-
-        // Get sigma schedule
-        // Use distilled sigmas when running distilled-style (8 steps, no CFG) —
-        // matches the two-stage pipeline logic. The distilled LoRA was trained
-        // with this specific schedule.
-        let sigmas: [Float]
-        let useDistilled = shouldUseDistilledSchedule(config)
-        scheduler.setTimesteps(
-            numSteps: config.numSteps,
-            distilled: useDistilled,
-            latentTokenCount: latentShape.tokenCount
-        )
-        sigmas = scheduler.sigmas
-        LTXDebug.log("Sigma schedule (\(useDistilled ? "distilled" : "dev")): \(sigmas.map { String(format: "%.4f", $0) })")
-
-        // Generate noise for full video
-        var latent = generateNoise(shape: latentShape, seed: config.seed)
-
-        // Scale noise by first sigma
-        latent = latent * sigmas[0]
-
-        // Replace first frame with image latent (conditioned frame, no noise)
-        latent[0..., 0..., 0..<1, 0..., 0...] = imageLatent
-        MLX.eval(latent)
-
-        // Create per-token conditioning mask: 1.0 for frame 0 tokens, 0.0 for rest
-        // In patchified space, tokens are ordered (F, H, W), so frame 0 = first H'*W' tokens
-        let tokensPerFrame = latentShape.height * latentShape.width
-        let frame0Mask = MLXArray.ones([1, tokensPerFrame])
-        let otherMask = MLXArray.zeros([1, latentShape.tokenCount - tokensPerFrame])
-        let conditioningMask = MLX.concatenated([frame0Mask, otherMask], axis: 1)
-        MLX.eval(conditioningMask)
-
-        LTXDebug.log("I2V conditioning: per-token timestep (frame 0=0, rest=sigma) + SLICE Euler step")
-        LTXDebug.log("Conditioning mask: \(tokensPerFrame) conditioned tokens / \(latentShape.tokenCount) total")
-        LTXDebug.log("Image cond noise scale: \(config.imageCondNoiseScale)")
-
-        // Denoise with per-token timestep conditioning + slice frame freezing
-        latent = denoise(
-            latent: latent,
-            sigmas: sigmas,
-            textEmbeddings: textEmbeddings,
-            promptEmbeddings: promptEmbeddings,
-            contextMask: contextMask,
-            latentShape: latentShape,
-            config: config,
-            transformer: transformer,
-            useCFG: useCFG,
-            conditioningMask: conditioningMask,
-            conditionedLatent: imageLatent,
-            onProgress: onProgress,
-            profile: profile,
-            timings: &timings
-        )
-
-        // === Phase 4: VAE Decode ===
-        LTXDebug.log("=== Phase 4: VAE Decode ===")
-        if memoryOptimization.unloadAfterUse {
-            self.transformer = nil
-            eval([MLXArray]())
-            Memory.clearCache()
-            if memoryOptimization.unloadSleepSeconds > 0 {
-                try await Task.sleep(for: .seconds(memoryOptimization.unloadSleepSeconds))
-                Memory.clearCache()
-            }
-            LTXDebug.log("Transformer unloaded for VAE decode")
-        }
-
         LTXMemoryManager.setPhase(.vaeDecode)
-        let vaeTimestep: Float? = nil
         let vaeStart = Date()
         let videoTensor = decodeVideo(
-            latent: latent, decoder: vaeDecoder, timestep: vaeTimestep,
+            latent: videoLatent, decoder: vaeDecoder, timestep: nil,
             temporalTileSize: memoryOptimization.vaeTemporalTileSize,
             temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
         )
         MLX.eval(videoTensor)
         timings.vaeDecode = Date().timeIntervalSince(vaeStart)
 
-        // Trim to requested frame count
         let trimmedVideo: MLXArray
         if videoTensor.dim(0) > config.numFrames {
             trimmedVideo = videoTensor[0..<config.numFrames]
@@ -2130,16 +1047,35 @@ public actor LTXPipeline {
             trimmedVideo = videoTensor
         }
 
-        LTXMemoryManager.logMemoryState("after i2v VAE decode")
+        // Decode audio if present
+        var audioWaveform: MLXArray? = nil
+        var audioSampleRate: Int? = nil
+        if hasAudio, let audioVAE = audioVAE, let vocoder = vocoder {
+            LTXDebug.log("Decoding audio latents...")
+            let audioLatentUnpacked = unpackAudioLatents(audioLatentPacked!, numFrames: audioNumFrames)
+            audioWaveform = decodeAudio(
+                latents: audioLatentUnpacked,
+                audioVAE: audioVAE,
+                vocoder: vocoder
+            )
+            MLX.eval(audioWaveform!)
+            audioSampleRate = vocoder.outputSampleRate
+            LTXDebug.log("Audio waveform: \(audioWaveform!.shape)")
+        }
+
         LTXMemoryManager.resetCacheLimit()
         timings.capturePeakMemory()
 
         let generationTime = Date().timeIntervalSince(generationStart)
+        LTXDebug.log("Total two-stage generation time: \(String(format: "%.1f", generationTime))s")
+
         return VideoGenerationResult(
             frames: trimmedVideo,
             seed: config.seed ?? 0,
             generationTime: generationTime,
-            timings: profile ? timings : nil
+            timings: profile ? timings : nil,
+            audioWaveform: audioWaveform,
+            audioSampleRate: audioSampleRate
         )
     }
 
@@ -2194,8 +1130,6 @@ public actor LTXPipeline {
             ))
 
             // Inject noise to conditioned frame BEFORE transformer (Diffusers pattern)
-            // noised = init_latents + noise_scale * noise * sigma^2
-            // Quadratic decay: more noise at early steps (high sigma), less at late steps
             if let condLatent = conditionedLatent, config.imageCondNoiseScale > 0, sigma > 0 {
                 let injectionNoise = MLXRandom.normal(condLatent.shape)
                 let noisedFrame0 = condLatent + MLXArray(config.imageCondNoiseScale) * injectionNoise * MLXArray(sigma * sigma)
@@ -2204,13 +1138,12 @@ public actor LTXPipeline {
 
             let latentInput: MLXArray
             let timestep: MLXArray
-            let isI2V = conditioningMask != nil
+            let hasPerTokenTimestep = conditioningMask != nil
+            let hasConditionedFrame0 = conditionedLatent != nil
 
             if useCFG {
                 latentInput = prepareForCFG(currentLatent)
-                if isI2V, let mask = conditioningMask {
-                    // Per-token timestep: frame 0 tokens = 0 (clean), others = sigma
-                    // Double the mask for CFG (uncond + cond both get same mask)
+                if hasPerTokenTimestep, let mask = conditioningMask {
                     let perToken = MLXArray(sigma) * (1 - mask)  // (1, T)
                     timestep = MLX.concatenated([perToken, perToken], axis: 0)  // (2, T)
                 } else {
@@ -2218,8 +1151,7 @@ public actor LTXPipeline {
                 }
             } else {
                 latentInput = currentLatent
-                if isI2V, let mask = conditioningMask {
-                    // Per-token timestep: frame 0 tokens = 0 (clean), others = sigma
+                if hasPerTokenTimestep, let mask = conditioningMask {
                     timestep = MLXArray(sigma) * (1 - mask)  // (1, T)
                 } else {
                     timestep = MLXArray([sigma])
@@ -2233,17 +1165,16 @@ public actor LTXPipeline {
                 latent: patchified,
                 context: textEmbeddings,
                 timesteps: timestep,
-                contextMask: contextMask,
+                contextMask: nil,
                 latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
             )
 
             var velocity: MLXArray
-            var condVelocity: MLXArray  // conditional velocity for guidance rescale
+            var condVelocity: MLXArray
             if useCFG {
                 let fullVelocity = unpatchify(velocityPred, shape: latentShape.doubled())
                 let (uncond, cond) = splitCFGOutput(fullVelocity)
                 let condF32 = cond.asType(.float32)
-                // Cast to float32 for CFG computation
                 velocity = applyCFG(
                     uncond: uncond.asType(.float32),
                     cond: condF32,
@@ -2251,33 +1182,8 @@ public actor LTXPipeline {
                 )
                 condVelocity = condF32
             } else {
-                // Cast to float32 matching Diffusers noise_pred.float()
                 velocity = unpatchify(velocityPred, shape: latentShape).asType(.float32)
                 condVelocity = velocity
-            }
-
-            // I2V diagnostics: print velocity and latent stats per frame for every step
-            if isI2V {
-                let vf32 = velocity.asType(.float32)
-                let lf32 = currentLatent.asType(.float32)
-                for f in 0..<min(latentShape.frames, 4) {
-                    let fv = vf32[0..., 0..., f..<(f+1), 0..., 0...]
-                    let fl = lf32[0..., 0..., f..<(f+1), 0..., 0...]
-                    let fvAbsMean = MLX.abs(fv).mean().item(Float.self)
-                    let flMean = fl.mean().item(Float.self)
-                    let flStd = MLX.sqrt(MLX.variance(fl)).item(Float.self)
-                    print("  [I2V] Step \(step) Frame \(f): vel_abs=\(String(format: "%.4f", fvAbsMean)), lat mean=\(String(format: "%.4f", flMean)) std=\(String(format: "%.4f", flStd))")
-                }
-                // Timestep info on first step
-                if step == 0 {
-                    let tsEval = timestep.asType(.float32)
-                    if timestep.ndim >= 2 {
-                        let tokensPerFrame = latentShape.height * latentShape.width
-                        let ts0 = tsEval[0, 0].item(Float.self)
-                        let ts1 = tsEval[0, tokensPerFrame].item(Float.self)
-                        print("  [I2V] timestep shape=\(timestep.shape), frame0_ts=\(String(format: "%.4f", ts0)), frame1_ts=\(String(format: "%.4f", ts1))")
-                    }
-                }
             }
 
             // STG
@@ -2285,24 +1191,21 @@ public actor LTXPipeline {
                 transformer.setSTGSkipFlags(skipSelfAttention: true, blockIndices: config.stgBlocks)
                 let perturbedPatchified = patchify(currentLatent).asType(.bfloat16)
                 let perturbedTimestep: MLXArray
-                if isI2V, let mask = conditioningMask {
-                    perturbedTimestep = MLXArray(sigma) * (1 - mask)  // (1, T) per-token
+                if hasPerTokenTimestep, let mask = conditioningMask {
+                    perturbedTimestep = MLXArray(sigma) * (1 - mask)
                 } else {
                     perturbedTimestep = MLXArray([sigma])
                 }
-                // Extract prompt-only embeddings (second half of CFG-doubled batch)
                 let perturbedContext = useCFG ? textEmbeddings[1..<2] : textEmbeddings
-                let perturbedMask = useCFG ? contextMask[1..<2] : contextMask
                 let perturbedVelocityPred = transformer(
                     latent: perturbedPatchified,
                     context: perturbedContext,
                     timesteps: perturbedTimestep,
-                    contextMask: perturbedMask,
+                    contextMask: nil,
                     latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
                 )
                 let perturbedVelocity = unpatchify(perturbedVelocityPred, shape: latentShape).asType(.float32)
                 transformer.clearSTGSkipFlags()
-                // STG: stg_scale * (cond - perturbed) matching Python guiders.py
                 velocity = velocity + MLXArray(config.stgScale) * (condVelocity - perturbedVelocity)
             }
 
@@ -2311,6 +1214,8 @@ public actor LTXPipeline {
                 velocity = applyGuidanceRescale(
                     guidedVelocity: velocity,
                     condVelocity: condVelocity,
+                    latent: currentLatent,
+                    sigma: sigma,
                     phi: config.guidanceRescale
                 )
             }
@@ -2321,10 +1226,7 @@ public actor LTXPipeline {
             }
             previousVelocity = velocity
 
-            if isI2V {
-                // SLICE approach (matches Diffusers LTX2ImageToVideoPipeline exactly):
-                // 1. Euler step only on frames 1+ (frame 0 stays clean)
-                // 2. Re-attach unchanged frame 0
+            if hasConditionedFrame0 {
                 let velocitySlice = velocity[0..., 0..., 1..., 0..., 0...]
                 let latentSlice = currentLatent[0..., 0..., 1..., 0..., 0...]
                 let steppedSlice = scheduler.step(
@@ -2336,7 +1238,6 @@ public actor LTXPipeline {
                 let frame0 = currentLatent[0..., 0..., 0..<1, 0..., 0...]
                 currentLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
             } else {
-                // Standard Euler step for T2V — step all frames
                 currentLatent = scheduler.step(
                     latent: currentLatent,
                     velocity: velocity,
@@ -2344,6 +1245,7 @@ public actor LTXPipeline {
                     sigmaNext: sigmaNext
                 )
             }
+
             MLX.eval(currentLatent)
 
             // Periodic cache clearing to reduce GPU memory fragmentation
@@ -2362,350 +1264,76 @@ public actor LTXPipeline {
                 let lStd = MLX.sqrt(MLX.variance(currentLatent)).item(Float.self)
                 LTXDebug.log("  Step \(step): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), vel mean=\(String(format: "%.4f", vMean)), std=\(String(format: "%.4f", vStd)), latent mean=\(String(format: "%.4f", lMean)), std=\(String(format: "%.4f", lStd))")
                 LTXDebug.log("  Step \(step) time: \(String(format: "%.2f", stepDuration))s")
-                // Per-frame velocity diagnostics for I2V
-                if conditionedLatent != nil && step % 2 == 0 {
-                    for f in 0..<min(latentShape.frames, 4) {
-                        let frameVel = velocity[0..., 0..., f..<(f+1), 0..., 0...]
-                        let fvMean = frameVel.mean().item(Float.self)
-                        let fvStd = MLX.sqrt(MLX.variance(frameVel)).item(Float.self)
-                        let frameLat = currentLatent[0..., 0..., f..<(f+1), 0..., 0...]
-                        let flMean = frameLat.mean().item(Float.self)
-                        let flStd = MLX.sqrt(MLX.variance(frameLat)).item(Float.self)
-                        LTXDebug.log("    Frame \(f): vel(mean=\(String(format: "%.4f", fvMean)), std=\(String(format: "%.4f", fvStd))) lat(mean=\(String(format: "%.4f", flMean)), std=\(String(format: "%.4f", flStd)))")
-                    }
-                }
             }
         }
 
         return currentLatent
     }
 
-    // MARK: - Two-Stage Generation
+    // MARK: - Image-to-Video Helpers
 
-    /// Generate video using two-stage pipeline (half-res → upscale → refine)
-    ///
-    /// Matches Blaizzy/mlx-video approach:
-    /// - Stage 1: Denoise at half resolution (8 steps with STAGE_1_SIGMAS)
-    /// - Upscale: Denormalize → SpatialUpscaler 2x → Renormalize
-    /// - Stage 2: Add noise → Denoise at full resolution (3 steps with STAGE_2_SIGMAS)
-    /// - Same transformer for both stages — no LoRA needed
+    /// Load VAE encoder weights from the unified safetensors file
+    private func loadVAEEncoder() async throws {
+        if vaeEncoder != nil { return }  // Already loaded
+
+        LTXDebug.log("Loading VAE encoder...")
+        let unifiedPath = try await downloader.downloadUnifiedWeights(model: model, progress: nil)
+        let encoderWeights = try LTXWeightLoader.loadVAEEncoderWeightsFromUnified(from: unifiedPath.path)
+
+        let encoder = VideoEncoder()
+        try LTXWeightLoader.applyVAEEncoderWeights(encoderWeights, to: encoder)
+        eval(encoder.parameters())
+        Memory.clearCache()
+
+        self.vaeEncoder = encoder
+        LTXDebug.log("VAE encoder loaded (\(encoderWeights.count) weights)")
+    }
+
+    /// Unload VAE encoder to free memory
+    private func unloadVAEEncoder() {
+        self.vaeEncoder = nil
+        eval([MLXArray]())
+        Memory.clearCache()
+        LTXDebug.log("VAE encoder unloaded")
+    }
+
+    /// Encode an image into latent space using the VAE encoder
     ///
     /// - Parameters:
-    ///   - prompt: Text description of the video
-    ///   - config: Video generation configuration (width/height = FINAL resolution)
-    ///   - upscalerWeightsPath: Path to spatial upscaler safetensors
-    ///   - onProgress: Optional progress callback
-    ///   - profile: Enable performance profiling
-    /// - Returns: Video generation result at full resolution
-    public func generateVideoTwoStage(
-        prompt: String,
-        config: LTXVideoGenerationConfig,
-        upscalerWeightsPath: String,
-        onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false
-    ) async throws -> VideoGenerationResult {
-        try config.validate()
-        var timings = GenerationTimings()
+    ///   - imagePath: Path to input image
+    ///   - width: Target video width
+    ///   - height: Target video height
+    /// - Returns: Image latent tensor (1, 128, 1, H/32, W/32)
+    private func encodeImage(path imagePath: String, width: Int, height: Int) async throws -> MLXArray {
+        // Load and resize image
+        let imageTensor = try loadImage(from: imagePath, width: width, height: height)
+        MLX.eval(imageTensor)
+        LTXDebug.log("Image loaded: \(imageTensor.shape)")
 
-        guard isLoaded else {
-            throw LTXError.modelNotLoaded("Models not loaded. Call loadModels() first.")
-        }
-        guard let textEncoder = textEncoder,
-              let transformer = transformer,
-              let vaeDecoder = vaeDecoder
-        else {
-            throw LTXError.modelNotLoaded("One or more models failed to load")
+        // Load encoder if needed
+        try await loadVAEEncoder()
+
+        guard let encoder = vaeEncoder else {
+            throw LTXError.modelNotLoaded("VAE encoder failed to load")
         }
 
-        let generationStart = Date()
-
-        // Two-stage requires width/height divisible by 64
-        guard config.width % 64 == 0 && config.height % 64 == 0 else {
-            throw LTXError.invalidConfiguration("Two-stage requires width and height divisible by 64. Got \(config.width)x\(config.height)")
-        }
-
-        let halfWidth = config.width / 2
-        let halfHeight = config.height / 2
-
-        LTXDebug.log("Two-stage generation: \(halfWidth)x\(halfHeight) → \(config.width)x\(config.height)")
-        LTXMemoryManager.logMemoryState("two-stage start")
-
-        let isI2V = config.imagePath != nil
-
-        // 0. Encode image at half-res if i2v
-        var halfResImageLatent: MLXArray? = nil
-        if let imagePath = config.imagePath {
-            LTXDebug.log("Two-stage I2V: encoding image at \(halfWidth)x\(halfHeight)")
-            halfResImageLatent = try await encodeImage(path: imagePath, width: halfWidth, height: halfHeight)
-            unloadVAEEncoder()
-        }
-
-        // 0b. Optionally enhance prompt
-        let effectivePrompt: String
-        if config.enhancePrompt {
-            LTXDebug.log("Enhancing prompt with VLM (\(config.imagePath != nil ? "I2V" : "T2V"))...")
-            effectivePrompt = try await enhancePromptWithVLM(prompt, imagePath: config.imagePath)
-        } else {
-            effectivePrompt = prompt
-        }
-
-        // 1. Encode text (shared between both stages)
-        LTXMemoryManager.setPhase(.textEncoding)
-        let textEncStart = Date()
-        let useCFG = config.cfgScale > 1.0
-        let (promptEmbeddings, promptMask) = encodePrompt(effectivePrompt, encoder: textEncoder)
-        MLX.eval(promptEmbeddings, promptMask)
-
-        let textEmbeddings: MLXArray
-        let contextMask: MLXArray
-        if useCFG {
-            // Use DEFAULT_NEGATIVE_PROMPT for CFG (matching Python behavior)
-            let (negEmbeddings, negMask) = encodePrompt(DEFAULT_NEGATIVE_PROMPT, encoder: textEncoder)
-            MLX.eval(negEmbeddings, negMask)
-            textEmbeddings = MLX.concatenated([negEmbeddings, promptEmbeddings], axis: 0)
-            contextMask = MLX.concatenated([negMask, promptMask], axis: 0)
-            MLX.eval(textEmbeddings, contextMask)
-        } else {
-            textEmbeddings = promptEmbeddings
-            contextMask = promptMask
-        }
-        timings.textEncoding = Date().timeIntervalSince(textEncStart)
-        LTXDebug.log("Text encoding: \(String(format: "%.1f", timings.textEncoding))s")
-
-        // Unload Gemma to free memory for denoising
-        LTXDebug.log("Unloading Gemma model to free memory...")
-        self.gemmaModel = nil
-        self.tokenizer = nil
-        Memory.clearCache()
-        LTXDebug.log("Gemma model unloaded")
-
-        // 2. Seed
-        if let seed = config.seed {
-            MLXRandom.seed(seed)
-            LTXDebug.log("Using seed: \(seed)")
-        }
-
-        // Apply cross-attention scaling if configured
-        if config.crossAttentionScale != 1.0 {
-            transformer.setCrossAttentionScale(config.crossAttentionScale)
-        }
-
-        // === STAGE 1: Denoise at half resolution ===
-        LTXMemoryManager.setPhase(.denoising)
-        LTXDebug.log("=== Stage 1: Half-resolution denoising (\(config.numSteps) steps) ===")
-        let stage1Start = Date()
-
-        let stage1Shape = VideoLatentShape.fromPixelDimensions(
-            batch: 1, channels: 128,
-            frames: config.numFrames,
-            height: halfHeight,
-            width: halfWidth
-        )
-        LTXDebug.log("Stage 1 latent: \(stage1Shape.frames)x\(stage1Shape.height)x\(stage1Shape.width)")
-
-        // Determine stage 1 sigmas based on model configuration
-        let stage1Sigmas: [Float]
-        if config.numSteps <= 8 && config.cfgScale <= 1.0 {
-            // Distilled or LoRA mode: use distilled sigmas with dynamic shifting
-            let stage1Scheduler = LTXScheduler(isDistilled: true)
-            stage1Scheduler.setTimesteps(
-                numSteps: config.numSteps,
-                distilled: true,
-                latentTokenCount: stage1Shape.tokenCount
-            )
-            stage1Sigmas = stage1Scheduler.sigmas
-            LTXDebug.log("Stage 1 using distilled sigmas with dynamic shift (\(stage1Sigmas.count - 1) steps)")
-        } else {
-            // Dev model: compute sigmas via scheduler with token-dependent shift
-            let stage1Scheduler = LTXScheduler(isDistilled: false)
-            stage1Scheduler.setTimesteps(
-                numSteps: config.numSteps,
-                distilled: false,
-                latentTokenCount: stage1Shape.tokenCount
-            )
-            stage1Sigmas = stage1Scheduler.sigmas
-            LTXDebug.log("Stage 1 using dev sigmas (\(stage1Sigmas.count - 1) steps)")
-        }
-
-        // Generate noise and scale by initial sigma
-        var latent = generateNoise(shape: stage1Shape, seed: config.seed)
-        latent = latent * stage1Sigmas[0]
-
-        // I2V: replace first frame with image latent and create conditioning mask
-        var stage1CondMask: MLXArray? = nil
-        if let imgLatent = halfResImageLatent {
-            latent[0..., 0..., 0..<1, 0..., 0...] = imgLatent
-            let s1TokensPerFrame = stage1Shape.height * stage1Shape.width
-            let s1Frame0Mask = MLXArray.ones([1, s1TokensPerFrame])
-            let s1OtherMask = MLXArray.zeros([1, stage1Shape.tokenCount - s1TokensPerFrame])
-            stage1CondMask = MLX.concatenated([s1Frame0Mask, s1OtherMask], axis: 1)
-            MLX.eval(stage1CondMask!)
-            LTXDebug.log("Stage 1 I2V: frame 0 conditioned (\(s1TokensPerFrame)/\(stage1Shape.tokenCount) tokens)")
-        }
+        // Encode: (1, 3, 1, H, W) -> (1, 128, 1, H/32, W/32)
+        let latent = encoder(imageTensor)
         MLX.eval(latent)
+        LTXDebug.log("Image encoded to latent: \(latent.shape)")
 
-        // Denoise
-        latent = denoise(
-            latent: latent,
-            sigmas: stage1Sigmas,
-            textEmbeddings: textEmbeddings,
-            promptEmbeddings: promptEmbeddings,
-            contextMask: contextMask,
-            latentShape: stage1Shape,
-            config: config,
-            transformer: transformer,
-            useCFG: useCFG,
-            conditioningMask: stage1CondMask,
-            conditionedLatent: halfResImageLatent,
-            onProgress: onProgress,
-            profile: profile,
-            timings: &timings
-        )
-        LTXDebug.log("Stage 1 complete: \(String(format: "%.1f", Date().timeIntervalSince(stage1Start)))s")
-        LTXDebug.log("Stage 1 latent stats: mean=\(latent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(latent)).item(Float.self))")
-
-        // === UPSCALE 2x ===
-        LTXDebug.log("=== Upscaling latent 2x ===")
-        let upscaleStart = Date()
-
-        // Load upscaler
-        let upscaler = try loadSpatialUpscaler(from: upscalerWeightsPath)
-
-        // Get VAE per-channel statistics for denormalization
-        let latentMean = vaeDecoder.meanOfMeans
-        let latentStd = vaeDecoder.stdOfMeans
-        MLX.eval(latentMean, latentStd)
-        LTXDebug.log("VAE stats: mean shape=\(latentMean.shape), std shape=\(latentStd.shape)")
-
-        let mean5d = latentMean.reshaped([1, -1, 1, 1, 1])
-        let std5d = latentStd.reshaped([1, -1, 1, 1, 1])
-
-        // Denormalize → upscale → renormalize (matching Python upsample_video)
-        let denormedLatent = latent * std5d + mean5d
-        MLX.eval(denormedLatent)
-        LTXDebug.log("After denormalize: mean=\(denormedLatent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(denormedLatent)).item(Float.self))")
-
-        let upscaledLatent = upscaler(denormedLatent)
-        MLX.eval(upscaledLatent)
-        LTXDebug.log("After upscaler: shape=\(upscaledLatent.shape), mean=\(upscaledLatent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(upscaledLatent)).item(Float.self))")
-
-        latent = (upscaledLatent - mean5d) / std5d
-        MLX.eval(latent)
-        LTXDebug.log("After renormalize: mean=\(latent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(latent)).item(Float.self))")
-
-        LTXDebug.log("Upscaled latent shape: \(latent.shape)")
-        LTXDebug.log("Upscale time: \(String(format: "%.1f", Date().timeIntervalSince(upscaleStart)))s")
-
-        // === STAGE 2: Refine at full resolution ===
-        LTXDebug.log("=== Stage 2: Full-resolution refinement (3 steps) ===")
-        let stage2Start = Date()
-
-        let stage2Shape = VideoLatentShape.fromPixelDimensions(
-            batch: 1, channels: 128,
-            frames: config.numFrames,
-            height: config.height,
-            width: config.width
-        )
-        LTXDebug.log("Stage 2 latent: \(stage2Shape.frames)x\(stage2Shape.height)x\(stage2Shape.width)")
-
-        // Add noise for refinement: latent = noise * sigma + latent * (1 - sigma)
-        let stage2Sigmas = STAGE_2_DISTILLED_SIGMA_VALUES
-        let noiseScale = stage2Sigmas[0]  // 0.909375
-        let noise = generateNoise(shape: stage2Shape)
-        latent = MLXArray(noiseScale) * noise + MLXArray(1.0 - noiseScale) * latent
-
-        // I2V stage 2: encode image at full resolution and condition frame 0
-        var stage2CondMask: MLXArray? = nil
-        var stage2CondLatent: MLXArray? = nil
-        if isI2V, let imagePath = config.imagePath {
-            LTXDebug.log("Stage 2 I2V: encoding image at \(config.width)x\(config.height)")
-            let fullResImageLatent = try await encodeImage(path: imagePath, width: config.width, height: config.height)
-            unloadVAEEncoder()
-            latent[0..., 0..., 0..<1, 0..., 0...] = fullResImageLatent
-            stage2CondLatent = fullResImageLatent
-            let s2TokensPerFrame = stage2Shape.height * stage2Shape.width
-            let s2Frame0Mask = MLXArray.ones([1, s2TokensPerFrame])
-            let s2OtherMask = MLXArray.zeros([1, stage2Shape.tokenCount - s2TokensPerFrame])
-            stage2CondMask = MLX.concatenated([s2Frame0Mask, s2OtherMask], axis: 1)
-            MLX.eval(stage2CondMask!)
-            LTXDebug.log("Stage 2 I2V: frame 0 conditioned (\(s2TokensPerFrame)/\(stage2Shape.tokenCount) tokens)")
+        // Normalize using VAE per-channel statistics
+        guard let vaeDecoder = vaeDecoder else {
+            throw LTXError.modelNotLoaded("VAE decoder not loaded (needed for latent statistics)")
         }
-        MLX.eval(latent)
-        LTXDebug.log("Added stage 2 noise (σ=\(noiseScale))")
-        LTXDebug.log("Stage 2 input stats: mean=\(latent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(latent)).item(Float.self))")
+        let mean5d = vaeDecoder.meanOfMeans.asType(.float32).reshaped([1, -1, 1, 1, 1])
+        let std5d = vaeDecoder.stdOfMeans.asType(.float32).reshaped([1, -1, 1, 1, 1])
+        let normalizedLatent = (latent.asType(.float32) - mean5d) / std5d
+        MLX.eval(normalizedLatent)
 
-        // Denoise stage 2 — ALWAYS without CFG (distilled refinement sigmas)
-        // Use prompt-only embeddings, not CFG-concatenated [neg, pos]
-        latent = denoise(
-            latent: latent,
-            sigmas: stage2Sigmas,
-            textEmbeddings: promptEmbeddings,
-            promptEmbeddings: promptEmbeddings,
-            contextMask: promptMask,
-            latentShape: stage2Shape,
-            config: config,
-            transformer: transformer,
-            useCFG: false,
-            conditioningMask: stage2CondMask,
-            conditionedLatent: stage2CondLatent,
-            onProgress: onProgress,
-            profile: profile,
-            timings: &timings
-        )
-        LTXDebug.log("Stage 2 complete: \(String(format: "%.1f", Date().timeIntervalSince(stage2Start)))s")
-        LTXDebug.log("Stage 2 output stats: mean=\(latent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(latent)).item(Float.self)), min=\(latent.min().item(Float.self)), max=\(latent.max().item(Float.self))")
+        LTXDebug.log("Normalized image latent: mean=\(normalizedLatent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(normalizedLatent)).item(Float.self))")
 
-        // Unload transformer to free memory for VAE decode
-        if memoryOptimization.unloadAfterUse {
-            self.transformer = nil
-            eval([MLXArray]())
-            Memory.clearCache()
-            if memoryOptimization.unloadSleepSeconds > 0 {
-                try await Task.sleep(for: .seconds(memoryOptimization.unloadSleepSeconds))
-                Memory.clearCache()
-            }
-            LTXDebug.log("Transformer unloaded for VAE decode phase")
-            LTXMemoryManager.logMemoryState("after transformer unload")
-        }
-
-        // === VAE Decode ===
-        LTXMemoryManager.setPhase(.vaeDecode)
-        // Use timestep_conditioning from VAE config.json
-        let vaeTimestep2: Float? = nil
-        LTXDebug.log("Decoding latents to video... (timestep=\(vaeTimestep2.map { String($0) } ?? "nil"))")
-        let vaeStart = Date()
-        let videoTensor = decodeVideo(
-            latent: latent, decoder: vaeDecoder, timestep: vaeTimestep2,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
-        )
-        MLX.eval(videoTensor)
-        timings.vaeDecode = Date().timeIntervalSince(vaeStart)
-        LTXDebug.log("VAE decode: \(String(format: "%.1f", timings.vaeDecode))s")
-
-        // Trim to requested frame count
-        let trimmedVideo: MLXArray
-        if videoTensor.dim(0) > config.numFrames {
-            trimmedVideo = videoTensor[0..<config.numFrames]
-        } else {
-            trimmedVideo = videoTensor
-        }
-
-        LTXMemoryManager.logMemoryState("after two-stage VAE decode")
-        LTXMemoryManager.resetCacheLimit()
-
-        // Capture final peak memory
-        timings.capturePeakMemory()
-
-        let generationTime = Date().timeIntervalSince(generationStart)
-        LTXDebug.log("Total two-stage time: \(String(format: "%.1f", generationTime))s")
-
-        return VideoGenerationResult(
-            frames: trimmedVideo,
-            seed: config.seed ?? 0,
-            generationTime: generationTime,
-            timings: profile ? timings : nil
-        )
+        return normalizedLatent
     }
 
     // MARK: - LoRA Support
@@ -3103,21 +1731,34 @@ public actor LTXPipeline {
         from loraPath: String,
         scale: Float = 1.0
     ) throws -> Int {
-        // Use whichever transformer is loaded (video-only or dual audio/video)
-        let target: Module
-        if let t = transformer {
-            target = t
-        } else if let t = ltx2Transformer {
-            target = t
-        } else {
-            throw LTXError.modelNotLoaded("Transformer not loaded")
-        }
+        let target = try getTransformerModule()
         let (originals, _) = try target.fuseLoRA(from: loraPath, scale: scale)
-        // LoRA weights (LoRAWeights struct) go out of scope here — freed by ARC.
-        // GPU cache cleared inside fuseWeights() after all batches.
-        // Final cleanup to release any remaining intermediate tensors.
+        // Store state for unfusing
+        self.loraOriginalWeights = originals
+        self.loraFusedPath = loraPath
+        self.loraFusedScale = scale
         Memory.clearCache()
         return originals.count
+    }
+
+    /// Restore transformer weights to pre-LoRA state.
+    ///
+    /// No-op if no LoRA is currently fused.
+    public func unfuseLoRA() {
+        guard let originals = loraOriginalWeights else { return }
+        guard let target = transformer ?? ltx2Transformer else { return }
+        target.unfuseLoRA(originalWeights: originals)
+        self.loraOriginalWeights = nil
+        self.loraFusedPath = nil
+        self.loraFusedScale = 1.0
+        Memory.clearCache()
+    }
+
+    /// Returns whichever transformer Module is loaded.
+    private func getTransformerModule() throws -> Module {
+        if let t = transformer { return t }
+        if let t = ltx2Transformer { return t }
+        throw LTXError.modelNotLoaded("Transformer not loaded")
     }
 
     // MARK: - Training Support
@@ -3166,26 +1807,6 @@ public actor LTXPipeline {
         return normalized
     }
 
-    /// Encode audio waveform to latents using the Audio VAE encoder.
-    ///
-    /// Note: AudioVAE encoder is not yet implemented. This is a placeholder
-    /// that generates zero latents with the correct shape for training setup.
-    ///
-    /// - Parameter waveform: Audio waveform as 1D float32 array
-    /// - Returns: Audio latent tensor (placeholder zeros)
-    public func encodeAudioLatents(waveform: MLXArray) async throws -> MLXArray {
-        // AudioVAE only has decode(), no encode() yet.
-        // Generate placeholder latents with correct shape for the training pipeline.
-        // Audio latent shape: (B, 8, T_audio, 16) packed to (B, T, 128)
-        // T_audio = round(duration_s * 25) where audio_latents_per_second = 16000/160/4 = 25
-        let numSamples = waveform.size
-        let durationS = Float(numSamples) / 16000.0
-        let audioFrames = max(1, Int(round(durationS * 25.0)))
-        let packedDim = 128  // 8 * 16
-
-        return MLXArray.zeros([1, audioFrames, packedDim]).asType(.float32)
-    }
-
     /// Encode text for audio conditioning.
     ///
     /// Uses the same Gemma model but with the audio text connector.
@@ -3200,7 +1821,6 @@ public actor LTXPipeline {
             throw LTXError.modelNotLoaded("Gemma model not loaded")
         }
 
-        // Encode using same path as video text (audio connector handles the difference)
         let (embeddings, mask) = encodePrompt(prompt, encoder: textEncoder)
         eval(embeddings, mask)
 
@@ -3300,9 +1920,6 @@ public actor LTXPipeline {
             return (placeholder, mask)
         }
         LTXDebug.log("Got \(states.count) hidden states from Gemma")
-
-        // Debug: dump hidden state stats for comparison with Python (disabled for production)
-        // (HS comparison confirmed identical active tokens across all 49 layers)
 
         // Step 3: Pass through text encoder (feature extractor + connector)
         let encoderOutput = encoder.encodeFromHiddenStates(

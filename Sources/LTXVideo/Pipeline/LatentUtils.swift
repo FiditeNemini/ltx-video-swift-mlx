@@ -151,12 +151,10 @@ func applyCFG(
 
 /// Apply guidance rescale to reduce overexposure from CFG
 ///
-/// Rescales the CFG output so its per-channel standard deviation matches
-/// the conditional velocity's std, then blends with the original.
-///
-/// Matches Lightricks Python guiders.py exactly:
-///   factor = rescale_scale * (cond.std() / pred.std()) + (1 - rescale_scale)
-///   pred = pred * factor
+/// Operates in denoised (x₀) space matching the Lightricks Python pipeline:
+/// 1. Convert velocities to x₀ = x_t - σ·v (matching X0Model)
+/// 2. Rescale: factor = phi * (cond_x0.std() / pred_x0.std()) + (1 - phi)
+/// 3. Convert back to velocity: v = (x_t - x₀) / σ
 ///
 /// Uses global scalar std (over ALL dimensions), NOT per-sample keepDims.
 /// Must be called AFTER both CFG and STG are applied (matching Python order).
@@ -164,65 +162,34 @@ func applyCFG(
 /// - Parameters:
 ///   - guidedVelocity: Guided velocity after CFG+STG (B, C, F, H, W)
 ///   - condVelocity: Conditional-only velocity (B, C, F, H, W)
+///   - latent: Current noisy sample x_t
+///   - sigma: Current noise level
 ///   - phi: Rescale factor (0.0 = no rescale, 0.7 = recommended)
 /// - Returns: Rescaled velocity
 func applyGuidanceRescale(
     guidedVelocity: MLXArray,
     condVelocity: MLXArray,
+    latent: MLXArray,
+    sigma: Float,
     phi: Float
 ) -> MLXArray {
     guard phi > 0.0 else { return guidedVelocity }
 
-    // Global scalar std matching Python cond.std() / pred.std()
-    let condStd = MLX.sqrt(MLX.variance(condVelocity) + 1e-8)
-    let predStd = MLX.sqrt(MLX.variance(guidedVelocity) + 1e-8)
+    let s = MLXArray(sigma).asType(.float32)
+    let lat = latent.asType(.float32)
+
+    // Convert to x₀ space (matching X0Model: x₀ = x_t - σ·v)
+    let condX0 = lat - s * condVelocity.asType(.float32)
+    let guidedX0 = lat - s * guidedVelocity.asType(.float32)
+
+    // Rescale in x₀ space (matching Python guiders.py)
+    let condStd = MLX.sqrt(MLX.variance(condX0) + 1e-8)
+    let predStd = MLX.sqrt(MLX.variance(guidedX0) + 1e-8)
     let factor = MLXArray(phi) * (condStd / predStd) + MLXArray(1.0 - phi)
+    let rescaledX0 = guidedX0 * factor
 
-    return guidedVelocity * factor
-}
-
-// MARK: - AdaIN Filtering
-
-/// Apply Adaptive Instance Normalization (AdaIN) to a latent tensor
-///
-/// Normalizes each channel of the input latent to match the per-channel mean
-/// and standard deviation of the reference latent. This prevents distribution
-/// shift when upsampling latents between pipeline stages.
-///
-/// Matches Lightricks/LTX-Video `adain_filter_latent` exactly.
-///
-/// - Parameters:
-///   - latent: Input latent tensor (B, C, F, H, W) — to be normalized
-///   - reference: Reference latent tensor (B, C, F', H', W') — statistics target
-///     Spatial dimensions can differ; only per-channel stats are used.
-///   - factor: Blending factor (1.0 = full AdaIN, 0.0 = no change)
-/// - Returns: AdaIN-filtered latent with same shape as input
-func adainFilterLatent(
-    _ latent: MLXArray,
-    reference: MLXArray,
-    factor: Float = 1.0
-) -> MLXArray {
-    guard factor > 0 else { return latent }
-
-    // Compute per-channel mean and std for both tensors
-    // Axes [2, 3, 4] = F, H, W (spatial-temporal dims)
-    let latentMean = MLX.mean(latent, axes: [2, 3, 4], keepDims: true)
-    let latentVar = MLX.variance(latent, axes: [2, 3, 4], keepDims: true)
-    let latentStd = MLX.sqrt(latentVar)
-
-    let refMean = MLX.mean(reference, axes: [2, 3, 4], keepDims: true)
-    let refVar = MLX.variance(reference, axes: [2, 3, 4], keepDims: true)
-    let refStd = MLX.sqrt(refVar)
-
-    // AdaIN: normalize input to zero-mean/unit-var, then apply reference stats
-    let normalized = (latent - latentMean) / (latentStd + 1e-8)
-    let result = normalized * refStd + refMean
-
-    // Blend between original and AdaIN result
-    if factor >= 1.0 {
-        return result
-    }
-    return MLXArray(factor) * result + MLXArray(1.0 - factor) * latent
+    // Convert back to velocity: v = (x_t - x₀) / σ
+    return ((lat - rescaledX0) / s).asType(guidedVelocity.dtype)
 }
 
 // MARK: - Latent Normalization
@@ -389,3 +356,4 @@ func loadImage(from path: String, width: Int, height: Int) throws -> MLXArray {
 
     return result
 }
+

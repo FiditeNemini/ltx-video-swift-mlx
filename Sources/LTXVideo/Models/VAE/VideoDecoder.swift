@@ -86,7 +86,7 @@ class VAEDepthToSpaceUpsample3d: Module {
 
     @ModuleInfo(key: "conv") var conv: CausalConv3dFull
 
-    init(inChannels: Int, outChannels: Int, factor: (Int, Int, Int), residual: Bool = true) {
+    init(inChannels: Int, outChannels: Int, factor: (Int, Int, Int), residual: Bool = false) {
         self.factor = factor
         self.useResidual = residual
         let (ft, fh, fw) = factor
@@ -146,7 +146,7 @@ class VAEDepthToSpaceUpsample3d: Module {
             h = h[0..., 0..., 1..., 0..., 0...]
         }
 
-        // Add residual
+        // Add residual (only used by encoder's SpaceToDepthDownsample, not decoder)
         if let res = residualVal {
             h = h + res
         }
@@ -172,6 +172,7 @@ func unpatchify(
     let c = cPatched / (patchSizeHW * patchSizeHW * patchSizeT)
 
     var out = x.reshaped([b, c, patchSizeT, patchSizeHW, patchSizeHW, t, h, w])
+    // Lightricks convention: pW before pH (matching encoder patchify and conv_out weights)
     out = out.transposed(0, 1, 5, 2, 6, 4, 7, 3)
     out = out.reshaped([b, c, t * patchSizeT, h * patchSizeHW, w * patchSizeHW])
 
@@ -235,23 +236,36 @@ class VideoDecoder: Module {
         )
 
         // 5 resblock groups: channels [1024, 512, 512, 256, 128], blocks [2, 2, 4, 6, 4]
+        // D2S blocks: decoder uses compress_all/compress_space/compress_time (NO residual)
+        // NOT compress_all_res (only encoder uses _res variants)
         self._upBlocks0.wrappedValue = VAEResBlockGroup(channels: 1024, numBlocks: 2)
         self._upBlocks1.wrappedValue = VAEDepthToSpaceUpsample3d(
-            inChannels: 1024, outChannels: 512, factor: (2, 2, 2), residual: true
+            inChannels: 1024, outChannels: 512, factor: (2, 2, 2), residual: false
         )
         self._upBlocks2.wrappedValue = VAEResBlockGroup(channels: 512, numBlocks: 2)
         self._upBlocks3.wrappedValue = VAEDepthToSpaceUpsample3d(
-            inChannels: 512, outChannels: 512, factor: (2, 2, 2), residual: true
+            inChannels: 512, outChannels: 512, factor: (2, 2, 2), residual: false
         )
         self._upBlocks4.wrappedValue = VAEResBlockGroup(channels: 512, numBlocks: 4)
         self._upBlocks5.wrappedValue = VAEDepthToSpaceUpsample3d(
-            inChannels: 512, outChannels: 256, factor: (2, 1, 1), residual: true
+            inChannels: 512, outChannels: 256, factor: (2, 1, 1), residual: false
         )
         self._upBlocks6.wrappedValue = VAEResBlockGroup(channels: 256, numBlocks: 6)
         self._upBlocks7.wrappedValue = VAEDepthToSpaceUpsample3d(
-            inChannels: 256, outChannels: 128, factor: (1, 2, 2), residual: true
+            inChannels: 256, outChannels: 128, factor: (1, 2, 2), residual: false
         )
         self._upBlocks8.wrappedValue = VAEResBlockGroup(channels: 128, numBlocks: 4)
+    }
+
+    /// Save debug tensor dump if debug mode is enabled
+    private func dumpTensor(_ x: MLXArray, name: String) {
+        guard LTXDebug.isEnabled else { return }
+        let dumpDir = "/tmp/debug_dumps/swift"
+        try? FileManager.default.createDirectory(atPath: dumpDir, withIntermediateDirectories: true)
+        let toSave = x.asType(.float32)
+        MLX.eval(toSave)
+        try? MLX.save(arrays: ["data": toSave], url: URL(fileURLWithPath: "\(dumpDir)/vae_\(name).safetensors"))
+        LTXDebug.log("Dumped vae_\(name): \(toSave.shape)")
     }
 
     func callAsFunction(_ sample: MLXArray) -> MLXArray {
@@ -264,11 +278,13 @@ class VideoDecoder: Module {
         let stdExp = stdOfMeans.asType(.float32).reshaped([1, -1, 1, 1, 1])
         x = (x.asType(.float32) * stdExp + meanExp).asType(x.dtype)
         LTXDebug.log("After denormalize: mean=\(x.mean().item(Float.self))")
+        dumpTensor(x, name: "after_denorm")
 
         // Conv in
         x = convIn(x, causal: causal)
         eval(x)
         LTXDebug.log("After conv_in: \(x.shape), mean=\(x.mean().item(Float.self))")
+        dumpTensor(x, name: "after_conv_in")
 
         // Up blocks
         x = upBlocks0(x, causal: causal)
@@ -278,6 +294,7 @@ class VideoDecoder: Module {
         x = upBlocks1(x, causal: causal)
         eval(x)
         LTXDebug.log("After up_blocks_1 (d2s 2,2,2): \(x.shape)")
+        dumpTensor(x, name: "after_d2s_1")
 
         x = upBlocks2(x, causal: causal)
         eval(x)
@@ -286,6 +303,7 @@ class VideoDecoder: Module {
         x = upBlocks3(x, causal: causal)
         eval(x)
         LTXDebug.log("After up_blocks_3 (d2s 2,2,2): \(x.shape)")
+        dumpTensor(x, name: "after_d2s_3")
 
         x = upBlocks4(x, causal: causal)
         eval(x)
@@ -294,6 +312,7 @@ class VideoDecoder: Module {
         x = upBlocks5(x, causal: causal)
         eval(x)
         LTXDebug.log("After up_blocks_5 (d2s 2,1,1): \(x.shape)")
+        dumpTensor(x, name: "after_d2s_5")
 
         x = upBlocks6(x, causal: causal)
         eval(x)
@@ -302,6 +321,7 @@ class VideoDecoder: Module {
         x = upBlocks7(x, causal: causal)
         eval(x)
         LTXDebug.log("After up_blocks_7 (d2s 1,2,2): \(x.shape)")
+        dumpTensor(x, name: "after_d2s_7")
 
         x = upBlocks8(x, causal: causal)
         eval(x)
@@ -315,11 +335,13 @@ class VideoDecoder: Module {
         x = convOut(x, causal: causal)
         eval(x)
         LTXDebug.log("After conv_out: \(x.shape), mean=\(x.mean().item(Float.self))")
+        dumpTensor(x, name: "after_conv_out")
 
         // Unpatchify: (B, 48, T, H, W) -> (B, 3, T, H*4, W*4)
         x = unpatchify(x, patchSizeHW: patchSize, patchSizeT: 1)
         eval(x)
         LTXDebug.log("After unpatchify: \(x.shape)")
+        dumpTensor(x, name: "after_unpatchify")
 
         return x
     }

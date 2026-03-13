@@ -1,26 +1,34 @@
 # LTX-Video-Swift-MLX
 
-Swift implementation of [LTX-2](https://github.com/Lightricks/LTX-Video) (Lightricks Text-to-Video 2) optimized for Apple Silicon using [MLX](https://github.com/ml-explore/mlx-swift).
+> **MAJOR CHANGE — WORK IN PROGRESS: LTX 2.3 Support**
+>
+> This project is being upgraded from LTX-2.0 to **LTX-2.3** (Lightricks, March 2026). The codebase is under active development. Some features are validated, others are pending adaptation.
 
-Generates videos from text prompts, running entirely on-device on Apple Silicon Macs.
+Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video generation, optimized for Apple Silicon using [MLX](https://github.com/ml-explore/mlx-swift). Runs entirely on-device.
 
-## Features
+## LTX 2.3 Migration Status
 
-- **Text-to-video generation** with LTX-2 19B parameter model
-- **Two model variants**: Distilled (fast, 8 steps) and Dev (quality, 40 steps)
-- **Two-stage pipeline**: Half-resolution generation + 2x spatial upscaling + refinement
-- **LoRA support**: Distilled LoRA for fast dev-quality generation (8 steps instead of 40)
-- **Prompt enhancement**: Gemma 3 12B generates detailed video descriptions from short prompts
-- **On-the-fly quantization**: 8-bit (qint8) or 4-bit (int4) transformer quantization for reduced memory
-- **Memory optimization**: 3-phase pipeline with configurable presets (light/moderate/aggressive)
-- **VAE temporal tiling**: Generates long videos (200+ frames) within memory constraints
-- **Profiling**: Detailed per-step timing and memory usage reporting
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Text-to-Video (two-stage distilled) | **Done** | Matches HuggingFace Space quality |
+| Image-to-Video | Pending | |
+| Video-to-Video (Retake) | Pending | |
+| Audio generation | Pending | |
+| Quantization (qint8/int4) | Pending validation | |
+
+## What's New in LTX 2.3
+
+- **Unified Gemma VLM**: Single `gemma-3-12b-it-qat-4bit` (~7.5 GB) replaces per-variant bf16 text encoders (~24 GB each)
+- **22B Transformer**: 48 blocks with gated attention, cross-attention AdaLN, SST (9 values)
+- **Unified weights**: Single `.safetensors` file per variant, split at load time
+- **Feature Extractor V2**: Per-token RMS norm + rescale (replaces V1 per-segment normalization)
+- **Two-stage pipeline**: Built-in half-res generation + 2x spatial upscaling + refinement
 
 ## Requirements
 
 - macOS 15+ (Sequoia)
 - Apple Silicon Mac (M1/M2/M3/M4)
-- 32 GB+ unified memory recommended (16 GB minimum with distilled model)
+- 32 GB+ unified memory recommended
 - Xcode 16+
 
 ## Quick Start
@@ -33,51 +41,64 @@ cd ltx-video-swift-mlx
 swift build
 ```
 
-Or build with Xcode:
+Or build Release with Xcode:
 ```bash
 xcodebuild -scheme ltx-video -configuration Release -derivedDataPath .xcodebuild \
   -destination 'platform=macOS' build
 ```
 
-### Generate a video
+### Generate a Video
 
 ```bash
-# Distilled model (fast, ~16 GB RAM)
-ltx-video generate "A cat walking on the beach" \
-    -w 768 -h 512 -f 25 -o output.mp4
+# Standard quality (768x512, 5 seconds)
+ltx-video generate "A cat walking on the beach" -w 768 -h 512 -f 121
 
-# Dev model (best quality, ~25 GB RAM)
-ltx-video generate "A cat walking on the beach" \
-    -m dev -w 768 -h 512 -f 25 -o output.mp4
+# High resolution (1024x576, 10 seconds)
+ltx-video generate "Ocean waves at sunset" -w 1024 -h 576 -f 241
 
-# Dev + distilled LoRA (dev quality at distilled speed)
-ltx-video generate "A cat walking on the beach" \
-    --distilled-lora -w 768 -h 512 -f 25 -o output.mp4
+# With prompt enhancement (recommended)
+ltx-video generate "A beaver building a dam" -w 768 -h 512 -f 121 --enhance-prompt
 
-# Two-stage with upscaler (highest quality)
-ltx-video generate "A cat walking on the beach" \
-    --distilled-lora --two-stage -w 768 -h 512 -f 25 -o output.mp4
-
-# With prompt enhancement
-ltx-video generate "A cat on a beach" \
-    --enhance-prompt --seed 42 -w 768 -h 512 -f 25 -o output.mp4
-
-# With 8-bit quantization (reduced memory)
-ltx-video generate "A cat walking on the beach" \
-    --transformer-quant qint8 -w 768 -h 512 -f 25 -o output.mp4
+# With quantization (lower memory)
+ltx-video generate "A sunset over mountains" -w 768 -h 512 -f 121 --transformer-quant qint8
 ```
 
-Models are downloaded automatically on first run from [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) on HuggingFace.
+Models (~30 GB total) are downloaded automatically on first run from [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) and [mlx-community/gemma-3-12b-it-qat-4bit](https://huggingface.co/mlx-community/gemma-3-12b-it-qat-4bit).
 
-## Model Variants
+## Pipeline Architecture
 
-| Variant | Steps | CFG | RAM | Speed | Quality |
-|---------|-------|-----|-----|-------|---------|
-| Distilled | 8 | 1.0 (off) | ~16 GB | Fast | Good |
-| Dev | 40 | 4.0 | ~25 GB | Slow | Best |
-| Dev + Distilled LoRA | 8 | 1.0 (off) | ~25 GB | Fast | Near-dev |
+The `generate` command runs a **two-stage distilled pipeline** matching the [LTX-2 HuggingFace Space](https://huggingface.co/spaces/Lightricks/LTX-2):
 
-The two-stage pipeline (`--two-stage`) generates at half resolution, upscales 2x with a spatial upscaler, and refines with 3 additional steps. Two-stage requires either the distilled model or distilled LoRA — the dev model alone cannot do the 3-step refinement stage (see [examples](docs/examples/beaver-dam/README.md#why-two-stage-requires-distilled-lora)).
+```
+Text Prompt
+    │
+    ▼
+Gemma 3 12B (4-bit QAT) ──► 49 hidden states
+    │
+    ▼
+Feature Extractor V2 + Connector ──► text embeddings [1, 1024, 4096]
+    │  ◄── Gemma unloaded
+    ▼
+┌── Stage 1: Half resolution (W/2 × H/2)
+│   LTX-2.3 Transformer (22B) + Distilled LoRA
+│   8 Euler steps, no CFG
+└── Output: latents at half resolution
+    │
+    ▼
+Spatial Upscaler: 2x (denormalize → upscale → renormalize → AdaIN)
+    │
+    ▼
+┌── Stage 2: Full resolution (W × H)
+│   Same transformer, 3 refinement steps
+│   Sigmas: [0.909, 0.725, 0.422]
+└── Output: refined latents
+    │  ◄── Transformer unloaded
+    ▼
+VAE Decoder ──► video frames (temporal tiling for long videos)
+    │
+    ▼
+MP4 Export (AVFoundation, 24fps)
+```
 
 ## CLI Reference
 
@@ -85,137 +106,52 @@ The two-stage pipeline (`--two-stage`) generates at half resolution, upscales 2x
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `<prompt>` | required | Text prompt describing the video |
+| `<prompt>` | required | Text prompt |
 | `-o, --output` | `output.mp4` | Output file path |
-| `-w, --width` | `512` | Video width (divisible by 32, by 64 for two-stage) |
-| `-h, --height` | `512` | Video height (divisible by 32, by 64 for two-stage) |
-| `-f, --frames` | `25` | Frame count (must be 8n+1: 9, 17, 25, 33...) |
-| `-s, --steps` | model default | Denoising steps (8 distilled, 40 dev) |
-| `-g, --guidance` | model default | CFG scale (1.0=off, 4.0 for dev) |
-| `-m, --model` | `distilled` | Model variant: `distilled` or `dev` |
-| `--seed` | random | Random seed for reproducibility |
-| `--transformer-quant` | `bf16` | Transformer quantization: `bf16`, `qint8` (8-bit), `int4` (4-bit) |
-| `--distilled-lora` | off | Apply distilled LoRA (forces dev, 8 steps, no CFG) |
-| `--two-stage` | off | Two-stage generation with 2x spatial upscaling |
-| `--enhance-prompt` | off | Enhance prompt using Gemma 3 generation |
-| `--lora` | none | Path to custom LoRA weights (.safetensors) |
-| `--lora-scale` | `1.0` | LoRA scale factor |
-| `--negative-prompt` | built-in | Negative prompt for CFG |
-| `--guidance-rescale` | `0.0` | Guidance rescale phi (0.7 recommended with CFG) |
-| `--cross-attn-scale` | `1.0` | Cross-attention scale (>1 = stronger prompt adherence) |
-| `--stg-scale` | `0.0` | Spatio-Temporal Guidance scale (0.5 recommended) |
-| `--stg-blocks` | `"29"` | STG block indices (comma-separated) |
-| `--ge-gamma` | `0.0` | GE velocity correction gamma |
-| `--gemma-path` | auto-download | Path to local Gemma model directory |
-| `--ltx-weights` | auto-download | Path to unified LTX-2 weights file |
-| `--hf-token` | none | HuggingFace token for gated models |
-| `--profile` | off | Show detailed timing and memory breakdown |
-| `--debug` | off | Enable debug output |
-| `--dry-run` | off | Validate config without generating |
+| `-w, --width` | `768` | Video width (divisible by 64) |
+| `-h, --height` | `512` | Video height (divisible by 64) |
+| `-f, --frames` | `121` | Frame count (must be 8n+1) |
+| `--seed` | random | Random seed |
+| `--image` | none | Input image for I2V |
+| `--audio` | off | Enable audio generation |
+| `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
+| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+| `--debug` | off | Debug output |
+| `--profile` | off | Timing/memory breakdown |
 
 ### `ltx-video download`
 
-Pre-download model weights from HuggingFace.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-m, --model` | `distilled` | Model variant to download |
-| `--hf-token` | none | HuggingFace token |
-| `--force` | off | Force re-download |
+Pre-download model weights.
 
 ### `ltx-video info`
 
-Show version and usage information.
+Show version and pipeline information.
 
 ## Examples
 
-See [docs/examples/](docs/examples/) for detailed generation examples with visual comparisons.
+See [docs/examples/](docs/examples/) for generation examples with parameters and videos.
+
+### Text-to-Video (10 seconds, 1024x576)
+
+<video src="https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/text-to-video/t2v-1024x576-10s.mp4" controls width="640"></video>
+
+*"A beaver building a dam in a peaceful forest stream, golden hour lighting" — 241 frames, two-stage distilled, prompt enhanced. [Full details →](docs/examples/text-to-video/)*
 
 ## Performance
 
-Benchmarked on Apple Silicon M3 Max 96GB, generating 25 frames at 768x512 with prompt enhancement:
+*Work in progress — full benchmarks pending complete LTX 2.3 adaptation.*
 
-| Configuration | Steps | Time | Notes |
-|---------------|-------|------|-------|
-| Distilled | 8 | 113s | Fastest single-stage |
-| Dev + LoRA | 8 | 102s | Dev quality, distilled speed |
-| Distilled + Upscaler | 8+3 | 81s | Fast with 2x upscaling |
-| **Dev + LoRA + Upscaler** | **8+3** | **78s** | **Best quality/speed ratio** |
-| Dev | 40 | 799s | Best quality at 768x512 |
-| Dev 1024x576 | 40 | 1455s | Highest resolution |
-
-## Architecture
-
-```
-Text Prompt
-    │
-    ▼
-Gemma 3 12B (4-bit quantized) ──► 49 hidden states
-    │
-    ▼
-Feature Extractor + Connector ──► text embeddings [1, 1024, 3840]
-    │
-    │ ◄── Gemma unloaded to free memory
-    ▼
-LTX-2 Transformer (48 blocks, flow-matching)
-    │
-    │  ┌─ Distilled: 8 steps, predefined sigmas
-    ├──┤  Dev: 40 steps, token-shifted sigmas + CFG
-    │  └─ Dev+LoRA: 8 distilled steps on dev weights
-    │
-    │ ◄── Transformer unloaded to free memory
-    ▼
-VAE Decoder (SimpleVideoDecoder) ──► video frames (temporal tiling for long videos)
-    │
-    ▼
-MP4 Export (AVFoundation)
-```
-
-**Two-Stage Pipeline** (requires distilled model or distilled LoRA):
-```
-Stage 1: Generate at half resolution (W/2 x H/2)
-    │
-    ▼
-Spatial Upscaler: Denormalize → 2x upscale → Renormalize → AdaIN
-    │
-    ▼
-Stage 2: Add noise (σ=0.909) → Refine at full resolution (3 distilled steps)
-```
-
-## Swift Package Integration
-
-```swift
-import LTXVideo
-
-let pipeline = LTXPipeline(model: .distilled)
-try await pipeline.loadModels()
-
-let config = LTXVideoGenerationConfig(
-    width: 768, height: 512, numFrames: 25
-)
-let result = try await pipeline.generateVideo(
-    prompt: "A sunset over the ocean",
-    config: config
-)
-
-try await VideoExporter.exportVideo(
-    frames: result.frames,
-    width: result.width,
-    height: result.height,
-    to: URL(fileURLWithPath: "output.mp4")
-)
-```
+Hardware: Apple Silicon M3 Max 96GB.
 
 ## Constraints
 
-- **Frame count**: Must be `8n + 1` (valid: 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, ...)
-- **Resolution**: Width and height must be divisible by 32 (by 64 for two-stage)
-- **Recommended resolutions**: 512x512, 768x512, 512x768, 832x480, 1024x576
+- **Frame count**: Must be `8n + 1` (9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, ...)
+- **Resolution**: Width and height divisible by 64
+- **Recommended**: 768x512, 1024x576, 832x480
 
 ## Credits
 
-- [LTX-Video](https://github.com/Lightricks/LTX-Video) by Lightricks
-- [HuggingFace Diffusers](https://github.com/huggingface/diffusers) (reference implementation)
+- [LTX-2](https://github.com/Lightricks/LTX-2) by Lightricks
 - [MLX](https://github.com/ml-explore/mlx-swift) by Apple
 - [Gemma 3](https://ai.google.dev/gemma) by Google
 

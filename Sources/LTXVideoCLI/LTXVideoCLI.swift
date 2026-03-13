@@ -20,7 +20,7 @@ struct LTXVideoCLI: AsyncParsableCommand {
 
 struct Generate: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Generate a video from a text prompt"
+        abstract: "Generate a video from a text prompt (always two-stage distilled)"
     )
 
     @Argument(help: "The text prompt describing the video to generate")
@@ -29,80 +29,20 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Output file path (default: output.mp4)")
     var output: String = "output.mp4"
 
-    @Option(name: .shortAndLong, help: "Video width in pixels (must be divisible by 32)")
-    var width: Int = 512
+    @Option(name: .shortAndLong, help: "Video width in pixels (must be divisible by 64 for two-stage)")
+    var width: Int = 768
 
-    @Option(name: .shortAndLong, help: "Video height in pixels (must be divisible by 32)")
+    @Option(name: .shortAndLong, help: "Video height in pixels (must be divisible by 64 for two-stage)")
     var height: Int = 512
 
     @Option(name: .shortAndLong, help: "Number of frames (must be 8n+1, e.g., 9, 17, 25, 33...)")
-    var frames: Int = 25
-
-    @Option(name: .shortAndLong, help: "Number of inference steps (default: 8 for distilled)")
-    var steps: Int?
-
-    @Option(name: .shortAndLong, help: "CFG guidance scale (1.0 = no CFG, default for distilled)")
-    var guidance: Float?
+    var frames: Int = 121
 
     @Option(name: .long, help: "Random seed for reproducibility")
     var seed: UInt64?
 
-    @Option(name: .shortAndLong, help: "Model variant: distilled or dev")
-    var model: String = "distilled"
-
-    @Option(name: .long, help: "Path to LoRA weights (.safetensors)")
-    var lora: String?
-
-    @Option(name: .long, help: "LoRA scale factor")
-    var loraScale: Float = 1.0
-
-    @Option(name: .long, help: "HuggingFace token for gated models")
-    var hfToken: String?
-
-    @Option(name: .long, help: "Custom directory for model storage (default: ~/Library/Caches/ltx-video-mlx)")
-    var modelsDir: String?
-
-    @Option(name: .long, help: "Path to local Gemma3 model directory")
-    var gemmaPath: String?
-
-    @Option(name: .long, help: "Path to unified LTX-2.3 weights file (.safetensors)")
-    var ltxWeights: String?
-
-    @Option(name: .long, help: "Input image path for image-to-video generation")
+    @Option(name: .long, help: "Input image for image-to-video generation")
     var image: String?
-
-    @Option(name: .long, help: "Image conditioning noise scale (0.0=rigid freeze, 0.15=default, 0.3=more motion)")
-    var imageCondNoise: Float = 0.15
-
-    @Option(name: .long, help: "Negative prompt for CFG (default: detailed quality-negative prompt)")
-    var negativePrompt: String?
-
-    @Option(name: .long, help: "Guidance rescale (phi). 0.0=off, 0.7=recommended with CFG")
-    var guidanceRescale: Float = 0.7
-
-    @Option(name: .long, help: "Cross-attention scale. 1.0=default, >1=stronger prompt adherence")
-    var crossAttnScale: Float = 1.0
-
-    @Option(name: .long, help: "GE velocity correction gamma. 0.0=off")
-    var geGamma: Float = 0.0
-
-    @Option(name: .long, help: "STG (Spatio-Temporal Guidance) scale. 0.0=off, 1.0=default for dev. Omit to use model default")
-    var stgScale: Float?
-
-    @Option(name: .long, help: "STG block indices (comma-separated, e.g. \"29\" or \"28,29\")")
-    var stgBlocks: String = "28"
-
-    @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8 (8-bit), int4 (4-bit)")
-    var transformerQuant: String = "bf16"
-
-    @Flag(name: .long, help: "Use two-stage generation: half resolution then upscale 2x and refine")
-    var twoStage: Bool = false
-
-    @Flag(name: .long, help: "Apply distilled LoRA (auto-downloads, forces dev model, 8 steps, no CFG)")
-    var distilledLora: Bool = false
-
-    @Flag(name: .long, help: "Enhance prompt using Gemma before generation")
-    var enhancePrompt: Bool = false
 
     @Flag(name: .long, help: "Generate audio alongside video (dual video/audio denoising)")
     var audio: Bool = false
@@ -110,14 +50,32 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "Audio gain (linear). 1.0=unchanged, 0.5=-6dB, 0.25=-12dB (default: 1.0)")
     var audioGain: Float = 1.0
 
+    @Flag(name: .long, help: "Enhance prompt using Gemma before generation")
+    var enhancePrompt: Bool = false
+
+    @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
+    var transformerQuant: String = "bf16"
+
+    @Option(name: .long, help: "Video bitrate in kbps (e.g., 1000 for 1 Mbps). Default: quality-based encoding")
+    var bitrate: Int?
+
     @Flag(name: .long, help: "Enable debug output")
     var debug: Bool = false
 
     @Flag(name: .long, help: "Enable performance profiling")
     var profile: Bool = false
 
-    @Flag(name: .long, help: "Skip model loading (dry run)")
-    var dryRun: Bool = false
+    @Option(name: .long, help: "HuggingFace token for gated models")
+    var hfToken: String?
+
+    @Option(name: .long, help: "Custom directory for model storage")
+    var modelsDir: String?
+
+    @Option(name: .long, help: "Path to local Gemma model directory")
+    var gemmaPath: String?
+
+    @Option(name: .long, help: "Path to local LTX unified weights file")
+    var ltxWeights: String?
 
     mutating func run() async throws {
         // Configure custom models directory if specified
@@ -130,34 +88,24 @@ struct Generate: AsyncParsableCommand {
             LTXDebug.enableDebugMode()
         }
 
-        // Parse STG blocks
-        let parsedStgBlocks = stgBlocks.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-
         let isI2V = image != nil
 
-        print("LTX-2.3 Video Generation")
-        print("======================")
+        print("LTX-2.3 Video Generation (Two-Stage Distilled)")
+        print("================================================")
         print("Mode: \(isI2V ? "image-to-video" : "text-to-video")")
         if let imagePath = image {
             print("Input image: \(imagePath)")
         }
         print("Prompt: \(prompt)")
         print("Output: \(output)")
-        print("Resolution: \(width)x\(height)")
+        print("Resolution: \(width)x\(height) (stage 1: \(width/2)x\(height/2))")
         print("Frames: \(frames)")
-        print("Model: \(distilledLora ? "dev" : model)")
-        if distilledLora { print("Distilled LoRA: enabled") }
         if let seed = seed {
             print("Seed: \(seed)")
         }
-        if guidanceRescale > 0 { print("Guidance rescale: \(guidanceRescale)") }
-        if crossAttnScale != 1.0 { print("Cross-attention scale: \(crossAttnScale)") }
-        if geGamma > 0 { print("GE gamma: \(geGamma)") }
-        if let stg = stgScale { print("STG scale: \(stg) (explicit)") }
-        if twoStage { print("Two-stage: enabled") }
         if enhancePrompt {
             if image != nil {
-                print("Prompt enhancement: enabled (multimodal I2V — VLM sees input image)")
+                print("Prompt enhancement: enabled (multimodal I2V)")
             } else {
                 print("Prompt enhancement: enabled (text-only T2V)")
             }
@@ -171,9 +119,9 @@ struct Generate: AsyncParsableCommand {
             throw ValidationError("Frame count must be 8n+1 (e.g., 9, 17, 25, 33, ...). Got \(frames)")
         }
 
-        // Validate dimensions (must be divisible by 32)
-        guard width % 32 == 0 && height % 32 == 0 else {
-            throw ValidationError("Width and height must be divisible by 32. Got \(width)x\(height)")
+        // Validate dimensions (must be divisible by 64 for two-stage)
+        guard width % 64 == 0 && height % 64 == 0 else {
+            throw ValidationError("Width and height must be divisible by 64. Got \(width)x\(height)")
         }
 
         // Parse transformer quantization
@@ -182,37 +130,11 @@ struct Generate: AsyncParsableCommand {
         }
         let quantConfig = LTXQuantizationConfig(transformer: quantOption)
 
-        // Parse model variant
-        // --distilled-lora forces dev model
-        let effectiveModel = distilledLora ? "dev" : model
-        guard let modelVariant = LTXModel(rawValue: effectiveModel) else {
-            throw ValidationError("Invalid model: \(model). Use: distilled or dev")
-        }
-
-        if twoStage {
-            // Two-stage validation: width/height must be divisible by 64
-            guard width % 64 == 0 && height % 64 == 0 else {
-                throw ValidationError("Two-stage requires width and height divisible by 64. Got \(width)x\(height)")
-            }
-            let stageDesc = distilledLora || (effectiveModel == "dev" && lora == nil) ? "dev + distilled LoRA" : effectiveModel
-            print("Two-stage pipeline: \(width/2)x\(height/2) -> upscale 2x -> \(width)x\(height)")
-            print("  Base model: \(stageDesc)")
-        }
-
-        if distilledLora {
-            print("Distilled LoRA: will fuse into dev model (8 steps, no CFG)")
-        }
-
-        if dryRun {
-            print("Validation passed (dry run mode)")
-            return
-        }
-
-        // Create pipeline
+        // Create pipeline (always distilled)
         print("Creating pipeline...")
         fflush(stdout)
         let pipeline = LTXPipeline(
-            model: modelVariant,
+            model: .distilled,
             quantization: quantConfig,
             hfToken: hfToken
         )
@@ -243,201 +165,100 @@ struct Generate: AsyncParsableCommand {
             print("Audio models loaded")
         }
 
-        // Apply LoRA
-        // --distilled-lora: always download and fuse distilled LoRA
-        // --two-stage without --distilled-lora: no auto LoRA (user controls model/steps/CFG)
-        let needsDistilledLoRA = distilledLora
-        if needsDistilledLoRA {
-            // Download and fuse distilled LoRA
-            print("Downloading distilled LoRA (if needed)...")
-            fflush(stdout)
-            let loraPath = try await pipeline.downloadDistilledLoRA()
-            print("Fusing distilled LoRA into transformer...")
-            fflush(stdout)
-            let fusedCount = try await pipeline.fuseLoRA(from: loraPath, scale: loraScale)
-            print("  Fused \(fusedCount) layers (scale=\(loraScale))")
-        } else if let loraPath = lora {
-            // Custom LoRA specified
-            print("Applying LoRA from \(loraPath)...")
-            let result = try await pipeline.applyLoRA(from: loraPath, scale: loraScale)
-            print("  Modified \(result.modifiedLayerCount) layers")
-        }
+        // Download upscaler (always needed for two-stage)
+        print("Downloading upscaler weights (if needed)...")
+        fflush(stdout)
+        let upscalerPath = try await pipeline.downloadUpscalerWeights()
+        print("Upscaler weights ready")
 
-        // Generate video
-        print("\nGenerating video...")
-        let startGen = Date()
-
-        // Determine steps and CFG:
-        // --distilled-lora: default to 8 steps, no CFG (can be overridden with --steps/--guidance)
-        // Otherwise: use model defaults or explicit overrides
-        let effectiveSteps: Int
-        let effectiveCFG: Float
-        if distilledLora {
-            effectiveSteps = steps ?? 8
-            effectiveCFG = guidance ?? 1.0
-        } else {
-            effectiveSteps = steps ?? modelVariant.defaultSteps
-            effectiveCFG = guidance ?? modelVariant.defaultGuidance
-        }
-
-        // STG: use explicit value if provided, otherwise model default
-        // (distilled-lora forces distilled defaults → STG off)
-        let effectiveSTGScale: Float
-        if let explicitSTG = stgScale {
-            effectiveSTGScale = explicitSTG
-        } else if distilledLora {
-            effectiveSTGScale = 0.0
-        } else {
-            effectiveSTGScale = modelVariant.defaultSTGScale
-        }
-        if effectiveSTGScale > 0 { print("STG scale: \(effectiveSTGScale), blocks: \(parsedStgBlocks)") }
-
+        // Build config (distilled defaults: 8 steps, no CFG, no STG)
         let config = LTXVideoGenerationConfig(
             width: width,
             height: height,
             numFrames: frames,
-            numSteps: effectiveSteps,
-            cfgScale: effectiveCFG,
+            numSteps: 8,
+            cfgScale: 1.0,
             seed: seed,
-            guidanceRescale: guidanceRescale,
-            crossAttentionScale: crossAttnScale,
-            geGamma: geGamma,
-            stgScale: effectiveSTGScale,
-            stgBlocks: parsedStgBlocks,
-            twoStage: twoStage,
+            guidanceRescale: 0.0,
+            stgScale: 0.0,
             enhancePrompt: enhancePrompt,
-            imagePath: image,
-            imageCondNoiseScale: imageCondNoise
+            imagePath: image
         )
 
-        // Audio generation uses separate path
-        if audio {
-            let audioResult: LTXPipeline.AudioVideoGenerationResult
-            if twoStage {
-                // Two-stage + audio: half-res → upscale → refine, with dual video/audio
-                print("Downloading upscaler weights (if needed)...")
-                fflush(stdout)
-                let upscalerPath = try await pipeline.downloadUpscalerWeights()
-                print("Upscaler weights ready")
+        // Generate — ONE API call
+        print("\nGenerating video...")
+        fflush(stdout)
+        let startGen = Date()
 
-                audioResult = try await pipeline.generateVideoWithAudioTwoStage(
-                    prompt: prompt,
-                    config: config,
-                    upscalerWeightsPath: upscalerPath,
-                    onProgress: { progress in
-                        print("  \(progress.status)")
-                    }
-                )
-            } else {
-                audioResult = try await pipeline.generateVideoWithAudio(
-                    prompt: prompt,
-                    config: config,
-                    onProgress: { progress in
-                        print("  \(progress.status)")
-                    }
-                )
-            }
+        let result = try await pipeline.generateVideo(
+            prompt: prompt,
+            config: config,
+            upscalerWeightsPath: upscalerPath,
+            onProgress: { progress in
+                print("  \(progress.status)")
+            },
+            profile: profile
+        )
 
-            let genTime = Date().timeIntervalSince(startGen)
-            print("Generation completed in \(String(format: "%.1f", genTime))s")
-            fflush(stdout)
+        let genTime = Date().timeIntervalSince(startGen)
+        print("Generation completed in \(String(format: "%.1f", genTime))s")
+        fflush(stdout)
 
+        // Export video
+        print("\nExporting to \(output)...")
+        fflush(stdout)
+        let outputURL = URL(fileURLWithPath: output)
+
+        // Configure video export with optional bitrate
+        var exportConfig = VideoExportConfig.default
+        if let kbps = bitrate {
+            exportConfig.averageBitRate = kbps * 1000
+            print("Using target bitrate: \(kbps) kbps")
+        }
+
+        if let audioWaveform = result.audioWaveform, let audioSampleRate = result.audioSampleRate {
             // Export video with muxed audio
-            print("\nExporting video+audio to \(output)...")
-            fflush(stdout)
-            let outputURL = URL(fileURLWithPath: output)
             let videoURL = try await VideoExporter.exportVideo(
-                frames: audioResult.frames,
+                frames: result.frames,
                 width: width,
                 height: height,
                 fps: 24.0,
-                audioWaveform: audioResult.audioWaveform,
-                audioSampleRate: audioResult.audioSampleRate,
+                audioWaveform: audioWaveform,
+                audioSampleRate: audioSampleRate,
                 audioGain: audioGain,
+                config: exportConfig,
                 to: outputURL
             )
             print("Video+audio saved to: \(videoURL.path)")
 
-            // Also export standalone WAV for debugging comparison
+            // Also export standalone WAV
             let wavPath = output.replacingOccurrences(of: ".mp4", with: ".wav")
             try AudioExporter.exportToWAV(
-                waveform: audioResult.audioWaveform,
-                sampleRate: audioResult.audioSampleRate,
+                waveform: audioWaveform,
+                sampleRate: audioSampleRate,
                 audioGain: audioGain,
                 path: wavPath
             )
             print("Audio WAV saved to: \(wavPath)")
-
-            // Print summary
-            print("\n--- Summary ---")
-            print("Seed: \(audioResult.seed)")
-            print("Generation time: \(String(format: "%.1f", audioResult.generationTime))s")
-            print("Audio sample rate: \(audioResult.audioSampleRate) Hz")
-            return
-        }
-
-        let result: VideoGenerationResult
-        if twoStage {
-            // Two-stage: half-res -> upscale 2x -> refine at full-res
-            print("Downloading upscaler weights (if needed)...")
-            fflush(stdout)
-            let upscalerPath = try await pipeline.downloadUpscalerWeights()
-            print("Upscaler weights ready")
-
-            result = try await pipeline.generateVideoTwoStage(
-                prompt: prompt,
-                config: config,
-                upscalerWeightsPath: upscalerPath,
-                onProgress: { progress in
-                    print("  \(progress.status)")
-                },
-                profile: profile
-            )
-        } else if isI2V {
-            // Image-to-video: encode image + denoise + decode
-            result = try await pipeline.generateVideoFromImage(
-                prompt: prompt,
-                negativePrompt: negativePrompt,
-                config: config,
-                onProgress: { progress in
-                    print("  \(progress.status)")
-                },
-                profile: profile
-            )
         } else {
-            result = try await pipeline.generateVideo(
-                prompt: prompt,
-                negativePrompt: negativePrompt,
-                config: config,
-                onProgress: { progress in
-                    print("  \(progress.status)")
-                },
-                profile: profile
+            let videoURL = try await VideoExporter.exportVideo(
+                frames: result.frames,
+                width: width,
+                height: height,
+                fps: 24.0,
+                config: exportConfig,
+                to: outputURL
             )
+            print("Video saved to: \(videoURL.path)")
         }
-
-        let genTime = Date().timeIntervalSince(startGen)
-        print("Generation completed in \(String(format: "%.1f", genTime))s")
-
-        // Export video
-        print("\nExporting to \(output)...")
-        let outputURL = URL(fileURLWithPath: output)
-
-        let videoURL = try await VideoExporter.exportVideo(
-            frames: result.frames,
-            width: width,
-            height: height,
-            fps: 24.0,
-            to: outputURL
-        )
-        print("Video saved to: \(videoURL.path)")
 
         // Print summary
         print("\n--- Summary ---")
-        print("Frames: \(result.numFrames)")
-        print("Resolution: \(result.width)x\(result.height)")
         print("Seed: \(result.seed)")
         print("Generation time: \(String(format: "%.1f", result.generationTime))s")
+        if result.audioWaveform != nil {
+            print("Audio sample rate: \(result.audioSampleRate ?? 0) Hz")
+        }
 
         // Print detailed profiling if enabled
         if profile, let t = result.timings {
@@ -532,30 +353,41 @@ struct Info: ParsableCommand {
             Version: \(LTXVideo.version)
             Platform: macOS (Apple Silicon with MLX)
 
-            Model Variants:
-              distilled     - ~16GB RAM, 8 steps
-              dev           - ~25GB RAM, 30 steps (best quality)
+            Pipeline: Two-Stage Distilled (matching HF Space)
+              Stage 1: Half resolution, 8 distilled Euler steps
+              Upscale: 2x spatial upscaler
+              Stage 2: Full resolution, 3 distilled refinement steps
+              Audio: Optional dual video/audio denoising
 
             Constraints:
               Frame count: Must be 8n+1 (9, 17, 25, 33, 41, 49, ...)
-              Resolution: Width and height must be divisible by 32
-              Recommended: 512x512, 768x512, 832x480, 1024x576
+              Resolution: Width and height must be divisible by 64
+              Recommended: 768x512, 1024x576, 832x480
 
-            Usage:
-              ltx-video generate "A cat walking" --output cat.mp4
-              ltx-video generate "Ocean sunset" --two-stage -w 768 -h 512 -f 241
-              ltx-video download --model distilled
-              ltx-video info
+            Commands:
+              generate      - Generate video (T2V or I2V, optional audio)
+              download      - Download model weights
+              train         - Fine-tune models with LoRA
+              info          - Show this information
 
             Examples:
               # Quick test (small video)
               ltx-video generate "A red ball bouncing" -w 256 -h 256 -f 9
 
-              # Standard quality
-              ltx-video generate "Ocean waves at sunset" -w 512 -h 512 -f 25
+              # Standard quality (two-stage distilled)
+              ltx-video generate "Ocean waves at sunset" -w 768 -h 512 -f 121
 
-              # High quality with two-stage pipeline (10 seconds)
-              ltx-video generate "A forest with falling leaves" -w 768 -h 512 -f 241 --two-stage
+              # With audio
+              ltx-video generate "Birds singing in a forest" -w 768 -h 512 -f 121 --audio
+
+              # Image-to-video
+              ltx-video generate "Make this come alive" --image photo.jpg -w 768 -h 512 -f 25
+
+              # With prompt enhancement
+              ltx-video generate "A beaver" -w 768 -h 512 -f 121 --enhance-prompt
+
+              # With quantization (lower memory)
+              ltx-video generate "A sunset" -w 768 -h 512 -f 121 --transformer-quant qint8
             """)
     }
 }

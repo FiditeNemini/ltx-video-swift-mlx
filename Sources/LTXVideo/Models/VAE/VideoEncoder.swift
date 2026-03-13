@@ -23,7 +23,7 @@ func encoderPatchify(_ x: MLXArray) -> MLXArray {
     // (B, 3, T, H/4, 4, W/4, 4) -> rearrange to (B, 3*4*4, T, H/4, W/4)
     var out = x.reshaped([b, c, t, h / pH, pH, w / pW, pW])
     // Transpose: (B, C, T, H/4, pH, W/4, pW) -> (B, C, pW, pH, T, H/4, W/4)
-    // Must match Python permute(0,1,3,7,5,2,4,6) which puts pW before pH in channels
+    // Lightricks convention: pW before pH in channel packing (matching decoder unpatchify)
     out = out.transposed(0, 1, 6, 4, 2, 3, 5)
     // Reshape: (B, C*pH*pW, T, H/4, W/4) = (B, 48, T, H/4, W/4)
     out = out.reshaped([b, c * pH * pW, t, h / pH, w / pW])
@@ -203,11 +203,15 @@ class EncoderDownBlock: Module {
 /// Architecture mirrors the decoder in reverse:
 /// - Patchify: (B, 3, T, H, W) -> (B, 48, T, H/4, W/4)
 /// - conv_in: 48 -> 128
-/// - 4 down blocks with progressively increasing channels (128 -> 256 -> 512 -> 1024 -> 2048)
-/// - mid block: 2 resnets at 2048
+/// - 4 down blocks: 128->256->512->1024->1024
+/// - mid block: 2 resnets at 1024
 /// - PerChannelRMSNorm + SiLU
-/// - conv_out: 2048 -> 129
+/// - conv_out: 1024 -> 129
 /// - Take first 128 channels (mean of the distribution, ignoring logvar)
+///
+/// Safetensors flat block layout (0-8):
+///   0=res(128,4), 1=ds(1,2,2), 2=res(256,6), 3=ds(2,1,1),
+///   4=res(512,4), 5=ds(2,2,2), 6=res(1024,2), 7=ds(2,2,2), 8=mid_res(1024,2)
 public class VideoEncoder: Module {
     @ModuleInfo(key: "conv_in") var convIn: CausalConv3dFull
     @ModuleInfo(key: "conv_out") var convOut: CausalConv3dFull
@@ -232,7 +236,7 @@ public class VideoEncoder: Module {
             spatialPaddingMode: padMode
         )
         self._convOut.wrappedValue = CausalConv3dFull(
-            inChannels: 2048, outChannels: 129, kernelSize: 3,
+            inChannels: 1024, outChannels: 129, kernelSize: 3,
             spatialPaddingMode: padMode
         )
 
@@ -246,19 +250,19 @@ public class VideoEncoder: Module {
             inChannels: 256, outChannels: 512, numResnets: 6,
             downsampleFactor: (2, 1, 1), spatialPaddingMode: padMode
         )
-        // down_blocks.2: 6 resnets @ 512ch, downsample stride (2,2,2) -> 1024ch
+        // down_blocks.2: 4 resnets @ 512ch, downsample stride (2,2,2) -> 1024ch
         self._downBlocks2.wrappedValue = EncoderDownBlock(
-            inChannels: 512, outChannels: 1024, numResnets: 6,
+            inChannels: 512, outChannels: 1024, numResnets: 4,
             downsampleFactor: (2, 2, 2), spatialPaddingMode: padMode
         )
-        // down_blocks.3: 2 resnets @ 1024ch, downsample stride (2,2,2) -> 2048ch
+        // down_blocks.3: 2 resnets @ 1024ch, downsample stride (2,2,2) -> 1024ch
         self._downBlocks3.wrappedValue = EncoderDownBlock(
-            inChannels: 1024, outChannels: 2048, numResnets: 2,
+            inChannels: 1024, outChannels: 1024, numResnets: 2,
             downsampleFactor: (2, 2, 2), spatialPaddingMode: padMode
         )
 
-        // mid_block: 2 resnets @ 2048ch
-        self._midBlock.wrappedValue = EncoderResBlockGroup(channels: 2048, numBlocks: 2, spatialPaddingMode: padMode)
+        // mid_block: 2 resnets @ 1024ch
+        self._midBlock.wrappedValue = EncoderResBlockGroup(channels: 1024, numBlocks: 2, spatialPaddingMode: padMode)
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {

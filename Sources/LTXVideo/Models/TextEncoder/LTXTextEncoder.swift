@@ -744,10 +744,19 @@ class VideoGemmaTextEncoderModel: Module {
         // Apply mask to zero out padded positions
         let finalEncoded = processed * binaryMask.expandedDimensions(axis: -1).asType(processed.dtype)
 
-        // Process audio connector if available (shares same feature extractor output)
+        // Process audio connector if available (needs separate FE pass with audio projection → 2048)
         var audioEncoded: MLXArray? = nil
         if let audioConnector = audioEmbeddingsConnector {
-            let (audioProcessed, audioOutputMask) = audioConnector(encoded, attentionMask: connectorMask)
+            let audioFE = featureExtractor.extractFromHiddenStates(
+                hiddenStates: hiddenStates,
+                attentionMask: attentionMask,
+                paddingSide: paddingSide,
+                modality: "audio"
+            )
+            MLX.eval(audioFE)
+            LTXDebug.log("[TextEnc] Audio FE output: \(audioFE.shape)")
+            let audioConnectorMask = convertToAdditiveMask(attentionMask, dtype: audioFE.dtype)
+            let (audioProcessed, audioOutputMask) = audioConnector(audioFE, attentionMask: audioConnectorMask)
             MLX.eval(audioProcessed)
             let audioBinaryMask = (audioOutputMask.squeezed(axes: [1, 2]) .>= -0.5).asType(.int32)
             audioEncoded = audioProcessed * audioBinaryMask.expandedDimensions(axis: -1).asType(audioProcessed.dtype)

@@ -955,7 +955,22 @@ class LTXWeightLoader {
         }
 
         _ = model.update(parameters: ModuleParameters.unflattened(updates))
-        LTXDebug.log("Applied \(updates.count) weights to transformer (\(notFound) unmatched)")
+
+        // Check for model parameters NOT loaded (would keep random initialization!)
+        let loadedKeys = Set(updates.keys)
+        let missingFromModel = flatParameters.keys.filter { !loadedKeys.contains($0) }.sorted()
+
+        // Log weight stats (always for unmatched/missing, debug for success)
+        if !unmatchedKeys.isEmpty || !missingFromModel.isEmpty {
+            print("[Weights] Transformer: \(updates.count) loaded, \(notFound) unmatched, \(missingFromModel.count) missing")
+            if !unmatchedKeys.isEmpty {
+                print("[Weights]   Unmatched: \(unmatchedKeys.sorted().prefix(10).joined(separator: ", "))")
+            }
+            if !missingFromModel.isEmpty {
+                print("[Weights]   Missing: \(missingFromModel.prefix(10).joined(separator: ", "))")
+            }
+        }
+        LTXDebug.log("Applied \(updates.count) weights to transformer (\(notFound) unmatched, \(missingFromModel.count) missing)")
     }
 
     /// Apply weights to a VAE decoder model
@@ -1053,20 +1068,23 @@ class LTXWeightLoader {
     /// Load Audio VAE weights from safetensors file
     ///
     /// Extracts decoder and latent stat keys, applying Conv2d weight transposition.
-    static func loadAudioVAEWeights(from path: String) throws -> [String: MLXArray] {
+    /// When includeEncoder is true, also loads encoder weights for A2Vid.
+    static func loadAudioVAEWeights(from path: String, includeEncoder: Bool = false) throws -> [String: MLXArray] {
         LTXDebug.log("Loading Audio VAE weights from: \(path)")
         let raw = try loadArrays(url: URL(fileURLWithPath: path))
 
-        // Filter to decoder + latent stat keys only (skip encoder)
-        var decoderWeights: [String: MLXArray] = [:]
+        var filteredWeights: [String: MLXArray] = [:]
         for (key, value) in raw {
             if key.hasPrefix("decoder.") || key == "latents_mean" || key == "latents_std" {
-                decoderWeights[key] = value
+                filteredWeights[key] = value
+            } else if includeEncoder && key.hasPrefix("encoder.") {
+                filteredWeights[key] = value
             }
         }
 
-        LTXDebug.log("Audio VAE: \(decoderWeights.count) decoder weights")
-        return decoderWeights
+        let encoderCount = filteredWeights.keys.filter { $0.hasPrefix("encoder.") }.count
+        LTXDebug.log("Audio VAE: \(filteredWeights.count) weights (\(encoderCount) encoder)")
+        return filteredWeights
     }
 
     /// Apply weights to an AudioVAE model
@@ -1163,6 +1181,20 @@ class LTXWeightLoader {
         var source = weights
         var mapped: [String: MLXArray] = [:]
 
+        // Safetensors uses flat block indexing (0-8) for the encoder:
+        //   0=res(128,4), 1=downsample, 2=res(256,6), 3=downsample,
+        //   4=res(512,4), 5=downsample, 6=res(1024,2), 7=downsample, 8=mid_res(1024,2)
+        //
+        // Swift model uses grouped blocks:
+        //   down_blocks_0 (resnets + downsamplers), down_blocks_1, ..., down_blocks_3, mid_block
+        //
+        // Mapping: flat even indices → resnets, flat odd indices → downsamplers
+        //   flat 0 → down_blocks_0.resnets, flat 1 → down_blocks_0.downsamplers
+        //   flat 2 → down_blocks_1.resnets, flat 3 → down_blocks_1.downsamplers
+        //   flat 4 → down_blocks_2.resnets, flat 5 → down_blocks_2.downsamplers
+        //   flat 6 → down_blocks_3.resnets, flat 7 → down_blocks_3.downsamplers
+        //   flat 8 → mid_block
+
         let allKeys = Array(source.keys)
         for key in allKeys {
             guard let value = source.removeValue(forKey: key) else { continue }
@@ -1171,49 +1203,51 @@ class LTXWeightLoader {
             guard key.hasPrefix("encoder.") else { continue }
 
             var newKey = String(key.dropFirst("encoder.".count))
+            let newValue = value
+            // No weight transposition: Conv3dFull stores weights in PyTorch format (O,I,T,H,W)
+            // and handles the conversion internally during forward pass.
 
-            // Map down_blocks.{i}.* -> down_blocks_{i}.*
-            for i in 0...3 {
-                let prefix = "down_blocks.\(i)."
-                if newKey.hasPrefix(prefix) {
-                    newKey = "down_blocks_\(i)." + String(newKey.dropFirst(prefix.count))
-                    break
-                }
-            }
+            // Handle flat down_blocks indexing
+            var handled = false
+            for flatIdx in 0...8 {
+                let prefix = "down_blocks.\(flatIdx)."
+                guard newKey.hasPrefix(prefix) else { continue }
+                let suffix = String(newKey.dropFirst(prefix.count))
 
-            // Diffusers uses "resnets" — Swift EncoderResBlockGroup uses @ModuleInfo(key: "resnets")
-            // for down_blocks: resnets are inside EncoderResBlockGroup which exposes "resnets"
-            // Path: down_blocks_{i}.resnets.{j}.conv1.* -> down_blocks_{i}.resnets.resnets.{j}.conv1.*
-            // Because EncoderDownBlock has @ModuleInfo(key: "resnets") -> EncoderResBlockGroup
-            // and EncoderResBlockGroup has @ModuleInfo(key: "resnets") -> [EncoderResBlock3d]
-            // So the path nesting is: down_blocks_{i}.resnets.resnets.{j}.*
-            for i in 0...3 {
-                let resPrefix = "down_blocks_\(i).resnets."
-                if newKey.hasPrefix(resPrefix) {
-                    let suffix = String(newKey.dropFirst(resPrefix.count))
-                    // Check if it's already double-nested
-                    if !suffix.hasPrefix("resnets.") {
-                        newKey = "\(resPrefix)resnets.\(suffix)"
+                if flatIdx == 8 {
+                    // Block 8 = mid_block
+                    // res_blocks.{j}.* → mid_block.resnets.{j}.*
+                    if suffix.hasPrefix("res_blocks.") {
+                        let resSuffix = String(suffix.dropFirst("res_blocks.".count))
+                        newKey = "mid_block.resnets.\(resSuffix)"
+                    } else {
+                        newKey = "mid_block.\(suffix)"
                     }
-                    break
+                } else if flatIdx % 2 == 0 {
+                    // Even flat indices = resblock groups
+                    let groupIdx = flatIdx / 2
+                    // res_blocks.{j}.* → down_blocks_{group}.resnets.resnets.{j}.*
+                    if suffix.hasPrefix("res_blocks.") {
+                        let resSuffix = String(suffix.dropFirst("res_blocks.".count))
+                        newKey = "down_blocks_\(groupIdx).resnets.resnets.\(resSuffix)"
+                    } else {
+                        newKey = "down_blocks_\(groupIdx).resnets.\(suffix)"
+                    }
+                } else {
+                    // Odd flat indices = downsamplers
+                    let groupIdx = flatIdx / 2
+                    // conv.* → down_blocks_{group}.downsamplers.conv.*
+                    newKey = "down_blocks_\(groupIdx).downsamplers.\(suffix)"
                 }
+                handled = true
+                break
             }
 
-            // Downsamplers: down_blocks_{i}.downsamplers.0.* -> down_blocks_{i}.downsamplers.*
-            for i in 0...3 {
-                let dsPrefix = "down_blocks_\(i).downsamplers.0."
-                if newKey.hasPrefix(dsPrefix) {
-                    let suffix = String(newKey.dropFirst(dsPrefix.count))
-                    newKey = "down_blocks_\(i).downsamplers.\(suffix)"
-                    break
-                }
+            if !handled {
+                // conv_in.*, conv_out.*, mid_block.* pass through unchanged
             }
 
-            // Mid block resnets: mid_block.resnets.{j}.* -> mid_block.resnets.{j}.*
-            // EncoderResBlockGroup has @ModuleInfo(key: "resnets") -> [EncoderResBlock3d]
-            // So mid_block.resnets.{j} matches directly
-
-            mapped[newKey] = value
+            mapped[newKey] = newValue
         }
 
         LTXDebug.log("Mapped \(mapped.count) VAE encoder weights")
@@ -1357,7 +1391,7 @@ class LTXWeightLoader {
         let vae = mapVAEWeights(vaeRaw)
         let connector = mapTextEncoderWeights(connectorRaw)
 
-        LTXDebug.log("Split: transformer=\(transformer.count), vae=\(vae.count), connector=\(connector.count)")
+        LTXDebug.log("Split unified: \(allWeights.count) input → transformer=\(transformer.count), vae=\(vae.count), connector=\(connector.count)")
         return (transformer, vae, connector)
     }
 

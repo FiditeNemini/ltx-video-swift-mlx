@@ -39,6 +39,8 @@ DerivedData/
 
 # Generated videos
 *.mp4
+# Allow example videos in docs
+!docs/examples/**/*.mp4
 
 # Temporary files
 *.tmp

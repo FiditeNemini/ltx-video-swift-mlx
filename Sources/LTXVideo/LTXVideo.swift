@@ -37,7 +37,7 @@ import MLXNN
 ///     width: 768, height: 512, numFrames: 241,
 ///     numSteps: 8, cfgScale: 1.0, twoStage: true
 /// )
-/// let result = try await pipeline.generateVideoTwoStage(
+/// let result = try await pipeline.generateVideo(
 ///     prompt: "Ocean waves at sunset",
 ///     config: config,
 ///     upscalerWeightsPath: upscalerPath
@@ -339,11 +339,27 @@ public struct VideoGenerationResult: @unchecked Sendable {
     /// is passed to the generation method.
     public let timings: GenerationTimings?
 
-    public init(frames: MLXArray, seed: UInt64, generationTime: TimeInterval, timings: GenerationTimings? = nil) {
+    /// Audio waveform (optional). Present when audio generation is enabled.
+    /// Shape: `(samples,)` float32. Sample rate given by ``audioSampleRate``.
+    public let audioWaveform: MLXArray?
+
+    /// Audio sample rate in Hz (e.g. 24000). Only set when ``audioWaveform`` is present.
+    public let audioSampleRate: Int?
+
+    public init(
+        frames: MLXArray,
+        seed: UInt64,
+        generationTime: TimeInterval,
+        timings: GenerationTimings? = nil,
+        audioWaveform: MLXArray? = nil,
+        audioSampleRate: Int? = nil
+    ) {
         self.frames = frames
         self.seed = seed
         self.generationTime = generationTime
         self.timings = timings
+        self.audioWaveform = audioWaveform
+        self.audioSampleRate = audioSampleRate
     }
 }
 
