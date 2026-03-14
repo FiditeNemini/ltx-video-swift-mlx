@@ -35,7 +35,7 @@ public struct LoRATrainingConfig: Sendable {
     /// Model variant to train on
     public var model: String
 
-    /// Whether to include audio LoRA targets
+    /// Whether to include audio LoRA targets (not yet supported)
     public var includeAudio: Bool
 
     /// Audio loss weight relative to video loss
@@ -47,11 +47,17 @@ public struct LoRATrainingConfig: Sendable {
     /// Transformer quantization for QLoRA (bf16, qint8, int4)
     public var transformerQuant: String
 
-    /// Gradient accumulation steps
+    /// Gradient accumulation steps (effective batch size = gradientAccumulationSteps)
     public var gradientAccumulationSteps: Int
+
+    /// Maximum gradient norm for clipping (0 = disabled)
+    public var maxGradNorm: Float
 
     /// LR warmup steps
     public var warmupSteps: Int
+
+    /// Trigger word to prepend to all captions (e.g., "CAKEIFY")
+    public var triggerWord: String?
 
     /// Seed for reproducibility
     public var seed: UInt64?
@@ -68,40 +74,40 @@ public struct LoRATrainingConfig: Sendable {
     /// LTX weights path
     public var ltxWeightsPath: String?
 
-    // MARK: - Memory Presets
+    // MARK: - Memory Presets (for 22B model)
 
-    /// Preset for 32GB systems
+    /// Preset for 32GB systems (int4 quantization, minimal resolution)
     public static let compact = LoRATrainingConfig(
-        rank: 8, alpha: 8, learningRate: 1e-4,
+        rank: 16, alpha: 16, learningRate: 2e-4,
         width: 256, height: 256, numFrames: 9,
-        transformerQuant: "int4"
+        includeFFN: false, transformerQuant: "int4"
     )
 
-    /// Preset for 64GB systems
+    /// Preset for 64GB systems (int4, moderate resolution)
     public static let balanced = LoRATrainingConfig(
-        rank: 16, alpha: 16, learningRate: 1e-4,
-        width: 384, height: 384, numFrames: 17,
-        transformerQuant: "qint8"
+        rank: 32, alpha: 32, learningRate: 2e-4,
+        width: 384, height: 384, numFrames: 9,
+        includeFFN: false, transformerQuant: "int4"
     )
 
-    /// Preset for 96GB systems
+    /// Preset for 96GB systems (int4, higher resolution)
     public static let quality = LoRATrainingConfig(
-        rank: 32, alpha: 32, learningRate: 1e-4,
-        width: 512, height: 512, numFrames: 25,
-        transformerQuant: "bf16"
+        rank: 64, alpha: 64, learningRate: 2e-4,
+        width: 512, height: 512, numFrames: 9,
+        includeFFN: false, transformerQuant: "int4"
     )
 
-    /// Preset for 192GB systems
+    /// Preset for 192GB+ systems (bf16 full precision)
     public static let max = LoRATrainingConfig(
-        rank: 64, alpha: 64, learningRate: 1e-4,
-        width: 768, height: 512, numFrames: 41,
-        transformerQuant: "bf16"
+        rank: 128, alpha: 128, learningRate: 2e-4,
+        width: 512, height: 512, numFrames: 9,
+        includeFFN: false, transformerQuant: "bf16"
     )
 
     public init(
         rank: Int = 16,
         alpha: Float? = nil,
-        learningRate: Float = 1e-4,
+        learningRate: Float = 2e-4,
         weightDecay: Float = 0.01,
         maxSteps: Int = 2000,
         saveEvery: Int = 250,
@@ -111,10 +117,12 @@ public struct LoRATrainingConfig: Sendable {
         model: String = "dev",
         includeAudio: Bool = false,
         audioLossWeight: Float = 0.5,
-        includeFFN: Bool = true,
+        includeFFN: Bool = false,
         transformerQuant: String = "bf16",
         gradientAccumulationSteps: Int = 1,
+        maxGradNorm: Float = 1.0,
         warmupSteps: Int = 100,
+        triggerWord: String? = nil,
         seed: UInt64? = nil,
         hfToken: String? = nil,
         modelsDir: String? = nil,
@@ -136,7 +144,9 @@ public struct LoRATrainingConfig: Sendable {
         self.includeFFN = includeFFN
         self.transformerQuant = transformerQuant
         self.gradientAccumulationSteps = gradientAccumulationSteps
+        self.maxGradNorm = maxGradNorm
         self.warmupSteps = warmupSteps
+        self.triggerWord = triggerWord
         self.seed = seed
         self.hfToken = hfToken
         self.modelsDir = modelsDir
@@ -157,6 +167,9 @@ public struct LoRATrainingConfig: Sendable {
         }
         guard learningRate > 0 && learningRate < 1 else {
             throw TrainingError.invalidConfig("Learning rate must be between 0 and 1, got \(learningRate)")
+        }
+        guard gradientAccumulationSteps >= 1 else {
+            throw TrainingError.invalidConfig("Gradient accumulation steps must be >= 1, got \(gradientAccumulationSteps)")
         }
     }
 }

@@ -76,7 +76,7 @@ public class LoRATrainer {
             width: config.width,
             height: config.height,
             numFrames: config.numFrames,
-            extractAudio: config.includeAudio
+            extractAudio: false
         )
         print("Found \(dataset.count) training samples")
 
@@ -105,26 +105,27 @@ public class LoRATrainer {
         )
 
         if config.includeAudio {
-            print("Loading audio models...")
-            try await pipeline.loadAudioModels { progress in
-                print("  \(progress.message) (\(Int(progress.progress * 100))%)")
-            }
+            throw TrainingError.invalidConfig(
+                "Audio LoRA training is not yet supported. " +
+                "Audio latent caching requires AudioProcessor, which will be added in a future version."
+            )
         }
 
         // Step 3: Build latent cache
         let cacheDir = (outputDir as NSString).appendingPathComponent("latent_cache")
-        let cache = LatentCache(cacheDir: cacheDir, includeAudio: config.includeAudio)
+        let cache = LatentCache(cacheDir: cacheDir, triggerWord: config.triggerWord)
 
         print("Building latent cache...")
         try await cache.build(from: dataset, pipeline: pipeline) { idx, total, filename in
             print("  Encoding [\(idx + 1)/\(total)] \(filename)")
         }
 
-        // Load cached samples
+        // Load cached samples and validate shapes
         try cache.loadAll()
         guard !cache.isEmpty else {
             throw TrainingError.datasetError("No cached samples available after encoding")
         }
+        try cache.validate(config: config)
         print("Cached \(cache.count) samples")
 
         // Step 4: Unload Gemma and VAE encoder to free memory
@@ -136,12 +137,13 @@ public class LoRATrainer {
         // Step 5: Get transformer and inject LoRA
         let transformerRef = try await pipeline.getTransformerForTraining()
         let transformer = transformerRef.module
+
         print("Injecting LoRA (rank=\(config.rank), alpha=\(config.alpha))...")
         let injection = LoRAInjector.inject(
             into: transformer,
             rank: config.rank,
             alpha: config.alpha,
-            includeAudio: config.includeAudio,
+            includeAudio: false,
             includeFFN: config.includeFFN
         )
         print("Injected \(injection.injectedCount) LoRA layers")
@@ -151,75 +153,73 @@ public class LoRATrainer {
         let totalTrainableElements = trainableParams.reduce(0) { $0 + $1.size }
         print("Trainable parameters: \(totalTrainableElements) elements (\(trainableParams.count) tensors)")
 
+
+        guard !trainableParams.isEmpty else {
+            throw TrainingError.modelError(
+                "No trainable parameters found after LoRA injection. " +
+                "Injected \(injection.injectedCount) layers but none are trainable."
+            )
+        }
+
         // Step 6: Set up optimizer
         let optimizer = AdamW(learningRate: config.learningRate, weightDecay: config.weightDecay)
 
-        // Step 7: Compute latent shape from config
-        let latentShape = VideoLatentShape.fromPixelDimensions(
-            frames: config.numFrames,
-            height: config.height,
-            width: config.width
-        )
-
-        // Step 8: Training loop
+        // Step 7: Training loop
         print("\nStarting training...")
         print("Steps: \(config.maxSteps), LR: \(config.learningRate), Rank: \(config.rank)")
         print("Resolution: \(config.width)x\(config.height), Frames: \(config.numFrames)")
+        if config.gradientAccumulationSteps > 1 {
+            print("Gradient accumulation: \(config.gradientAccumulationSteps) steps")
+        }
+        if let trigger = config.triggerWord {
+            print("Trigger word: \(trigger)")
+        }
         print()
+        fflush(stdout)
 
-        let audioWeight = config.audioLossWeight
-        let lFrames = latentShape.frames
-        let lHeight = latentShape.height
-        let lWidth = latentShape.width
 
         // Create loss+grad function using valueAndGrad(model:_:) with [MLXArray] signature
         // Pack all inputs into an [MLXArray] and unpack inside the closure
+        // latentShape is passed via the arrays to allow per-sample shapes from cache
         let lossGradFn = valueAndGrad(model: transformer) {
             (model: Module, arrays: [MLXArray]) -> [MLXArray] in
-            let videoLatent = arrays[0]
+            // Latent from cache is 5D (B,C,T,H,W) — patchify to 3D (B, T*H*W, C)
+            // for transformer input. All noise/target ops happen in patchified space.
+            let videoLatent5D = arrays[0]
+            let videoLatent = patchify(videoLatent5D)
             let promptEmbeddings = arrays[1]
             let promptMask = arrays[2]
+            let lFrames = Int(arrays[3].item(Int32.self))
+            let lHeight = Int(arrays[4].item(Int32.self))
+            let lWidth = Int(arrays[5].item(Int32.self))
             let batchSize = videoLatent.dim(0)
 
-            // Sample random sigma
+            // Sample random sigma — flow-matching noise schedule
             let sigma = MLXRandom.uniform(0..<1, [batchSize, 1]).asType(.float32)
             let videoNoise = MLXRandom.normal(videoLatent.shape).asType(videoLatent.dtype)
             let sigmaVideo = sigma.asType(videoLatent.dtype)
             let noisyVideo = (1 - sigmaVideo) * videoLatent + sigmaVideo * videoNoise
             let sigmaFlat = sigma.squeezed(axis: 1)
 
-            if let ltx2 = model as? LTX2Transformer,
-               arrays.count >= 6 {
-                // Dual video/audio path
-                let audioLatent = arrays[3]
-                let audioEmbeddings = arrays[4]
-                let audioMask = arrays[5]
-                let audioNumFrames = audioLatent.dim(1)
-
-                let audioNoise = MLXRandom.normal(audioLatent.shape).asType(audioLatent.dtype)
-                let sigmaAudio = sigma.asType(audioLatent.dtype)
-                let noisyAudio = (1 - sigmaAudio) * audioLatent + sigmaAudio * audioNoise
-
-                let (predVideo, predAudio) = ltx2(
+            if let ltx2 = model as? LTX2Transformer {
+                // LTX2 requires both video+audio inputs; pass zero audio for video-only training
+                let dummyAudioLatent = MLXArray.zeros([batchSize, 1, 128]).asType(DType.bfloat16)
+                let (predVideo, _) = ltx2(
                     videoLatent: noisyVideo.asType(DType.bfloat16),
-                    audioLatent: noisyAudio.asType(DType.bfloat16),
+                    audioLatent: dummyAudioLatent,
                     videoContext: promptEmbeddings,
-                    audioContext: audioEmbeddings,
+                    audioContext: promptEmbeddings,
                     videoTimesteps: sigmaFlat,
                     audioTimesteps: sigmaFlat,
-                    videoContextMask: promptMask,
-                    audioContextMask: audioMask,
+                    videoContextMask: nil,
+                    audioContextMask: nil,
                     videoLatentShape: (lFrames, lHeight, lWidth),
-                    audioNumFrames: audioNumFrames
+                    audioNumFrames: 1
                 )
-
-                let videoTarget = (videoNoise - videoLatent).asType(predVideo.dtype)
-                let audioTarget = (audioNoise - audioLatent).asType(predAudio.dtype)
-                let videoLoss = mseLoss(predictions: predVideo, targets: videoTarget, reduction: .mean)
-                let audioLoss = mseLoss(predictions: predAudio, targets: audioTarget, reduction: .mean)
-                return [videoLoss + audioWeight * audioLoss]
+                let target = (videoNoise - videoLatent).asType(predVideo.dtype)
+                return [mseLoss(predictions: predVideo, targets: target, reduction: .mean)]
             } else if let ltx = model as? LTXTransformer {
-                // Video-only path
+                // Video-only transformer (legacy)
                 let predicted = ltx(
                     latent: noisyVideo.asType(DType.bfloat16),
                     context: promptEmbeddings,
@@ -230,47 +230,18 @@ public class LoRATrainer {
                 let target = (videoNoise - videoLatent).asType(predicted.dtype)
                 return [mseLoss(predictions: predicted, targets: target, reduction: .mean)]
             } else {
-                // Fallback — shouldn't happen
-                return [MLXArray(Float(0))]
+                fatalError("Unknown transformer type: \(type(of: model))")
             }
         }
 
+        let accumSteps = config.gradientAccumulationSteps
+        let accumScale = 1.0 / Float(accumSteps)
         var bestLoss: Float = .infinity
+        var lossHistory: [(step: Int, loss: Float)] = []
         let loopStart = Date()
 
         for step in 0..<config.maxSteps {
-            // Get random sample
-            guard let sample = cache.randomSample() else {
-                throw TrainingError.datasetError("No cached samples available")
-            }
-
-            // Pack inputs
-            var inputs: [MLXArray] = [
-                sample.videoLatent,
-                sample.promptEmbeddings,
-                sample.promptMask,
-            ]
-
-            if config.includeAudio {
-                inputs.append(sample.audioLatent ?? MLXArray.zeros([1, 1, 128]))
-                inputs.append(sample.audioEmbeddings ?? sample.promptEmbeddings)
-                inputs.append(sample.audioMask ?? sample.promptMask)
-            }
-
-            // Compute loss and gradients
-            let (losses, grads) = lossGradFn(transformer, inputs)
-            let loss = losses[0]
-
-            // Update parameters
-            optimizer.update(model: transformer, gradients: grads)
-
-            // Materialize computation
-            eval(loss, transformer.trainableParameters())
-            Memory.clearCache()
-
-            let lossValue = loss.item(Float.self)
-
-            // Apply LR warmup
+            // Apply LR warmup (before optimizer step)
             let currentLR: Float
             if step < config.warmupSteps {
                 currentLR = config.learningRate * Float(step + 1) / Float(config.warmupSteps)
@@ -279,30 +250,99 @@ public class LoRATrainer {
                 currentLR = config.learningRate
             }
 
+            // Gradient accumulation loop
+            var accumGrads: ModuleParameters? = nil
+            var accumLoss: Float = 0
+
+            for _ in 0..<accumSteps {
+                guard let sample = cache.randomSample() else {
+                    throw TrainingError.datasetError("No cached samples available")
+                }
+
+                let inputs: [MLXArray] = [
+                    sample.videoLatent,
+                    sample.promptEmbeddings,
+                    sample.promptMask,
+                    MLXArray(Int32(sample.latentFrames)),
+                    MLXArray(Int32(sample.latentHeight)),
+                    MLXArray(Int32(sample.latentWidth)),
+                ]
+
+                let (losses, grads) = lossGradFn(transformer, inputs)
+                let loss = losses[0]
+
+                // Scale gradients by 1/accumSteps
+                let scaledGrads: ModuleParameters
+                if accumSteps > 1 {
+                    scaledGrads = scaleParameters(grads, by: accumScale)
+                } else {
+                    scaledGrads = grads
+                }
+
+                // Accumulate
+                if var existing = accumGrads {
+                    addParameters(scaledGrads, to: &existing)
+                    accumGrads = existing
+                } else {
+                    accumGrads = scaledGrads
+                }
+
+                eval(loss)
+                accumLoss += loss.item(Float.self)
+            }
+
+            accumLoss /= Float(accumSteps)
+
+            // Gradient clipping (max norm)
+            if config.maxGradNorm > 0, var grads = accumGrads {
+                let gradNorm = computeGradNorm(grads)
+                if gradNorm > config.maxGradNorm {
+                    let clipScale = config.maxGradNorm / gradNorm
+                    grads = scaleParameters(grads, by: clipScale)
+                }
+                accumGrads = grads
+            }
+
+            // Update parameters
+            optimizer.update(model: transformer, gradients: accumGrads!)
+
+            // Materialize computation
+            eval(transformer.trainableParameters())
+            Memory.clearCache()
+
             // Progress callback
             let elapsed = Date().timeIntervalSince(loopStart)
             let progress = TrainingProgress(
                 step: step + 1,
                 totalSteps: config.maxSteps,
-                loss: lossValue,
+                loss: accumLoss,
                 learningRate: currentLR,
                 elapsedSeconds: elapsed,
                 samplesPerSecond: Double(step + 1) / elapsed
             )
             onProgress?(progress)
 
-            // Track best loss
-            if lossValue < bestLoss {
-                bestLoss = lossValue
+            // Track best loss and record for learning curve
+            if accumLoss < bestLoss {
+                bestLoss = accumLoss
+            }
+            lossHistory.append((step: step + 1, loss: accumLoss))
+            if lossHistory.count >= 2 {
+                LearningCurveSVG.generate(
+                    lossHistory: lossHistory,
+                    outputDir: outputDir,
+                    smoothingWindow: 20
+                )
             }
 
             // Save checkpoint
             if (step + 1) % config.saveEvery == 0 || step == config.maxSteps - 1 {
                 print("  Saving checkpoint at step \(step + 1)...")
+                fflush(stdout)
                 try LoRASaver.saveCheckpoint(
                     model: transformer,
                     step: step + 1,
-                    loss: lossValue,
+                    loss: accumLoss,
                     outputDir: outputDir,
                     rank: config.rank,
                     alpha: config.alpha
@@ -325,4 +365,31 @@ public class LoRATrainer {
         print("  Best loss: \(String(format: "%.6f", bestLoss))")
         print("  Saved \(savedCount) LoRA layers to \(finalPath)")
     }
+}
+
+// MARK: - Gradient Helpers
+
+/// Scale all leaf arrays in a ModuleParameters tree by a scalar factor
+private func scaleParameters(_ params: ModuleParameters, by factor: Float) -> ModuleParameters {
+    let factorArray = MLXArray(factor)
+    return params.mapValues { (arr: MLXArray) -> MLXArray in
+        arr * factorArray
+    }
+}
+
+/// Add source parameters into destination (element-wise accumulation)
+private func addParameters(_ source: ModuleParameters, to destination: inout ModuleParameters) {
+    destination = destination.mapValues(source) { dst, src in
+        dst + (src ?? MLXArray(Float(0)))
+    }
+}
+
+/// Compute global L2 norm of all gradient arrays
+private func computeGradNorm(_ params: ModuleParameters) -> Float {
+    var sumSq = MLXArray(Float(0))
+    for arr in params.flattenedValues() {
+        sumSq = sumSq + (arr * arr).sum()
+    }
+    eval(sumSq)
+    return sqrt(sumSq.item(Float.self))
 }

@@ -11,7 +11,7 @@ struct LTXVideoCLI: AsyncParsableCommand {
         commandName: "ltx-video",
         abstract: "LTX-2.3 video generation on Mac with MLX",
         version: "0.1.0",
-        subcommands: [Generate.self, Retake.self, Download.self, Train.self, Info.self],
+        subcommands: [Generate.self, Retake.self, Download.self, Train.self, Models.self, Info.self],
         defaultSubcommand: Info.self
     )
 }
@@ -567,6 +567,18 @@ struct Download: AsyncParsableCommand {
         print("Text encoder: \(paths.textEncoderDir.path)")
         print("Tokenizer: \(paths.tokenizerDir.path)")
         print("Unified weights: \(paths.unifiedWeightsPath.path)")
+    }
+}
+
+// MARK: - Models Command
+
+struct Models: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "List available models and their capabilities"
+    )
+
+    mutating func run() throws {
+        LTXModel.printModelList()
     }
 }
 

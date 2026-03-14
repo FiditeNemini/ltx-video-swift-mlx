@@ -11,6 +11,7 @@ Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video gen
 | Video-to-Video (Retake) | **Done** | Full + partial temporal retake |
 | Audio generation (I2V + audio) | **Done** | Dual video/audio denoising |
 | LoRA inference | **Done** | Fuse any LTX-2.3 compatible LoRA |
+| LoRA training (QLoRA) | **Beta** | Fine-tune 22B transformer on Apple Silicon |
 | Quantization (qint8/int4) | **Done** | [Benchmarked](docs/benchmarks/) — int4 halves memory |
 
 ## Requirements
@@ -93,6 +94,40 @@ ltx-video generate "A car engine starting" \
     --image car.png --audio -w 768 -h 512 -f 121
 ```
 
+### LoRA Training (Beta)
+
+> **Status**: Theoretically functional, currently under validation. The full training pipeline runs end-to-end (dataset loading, latent caching, gradient computation, checkpoint saving, LoRA export). Validation is in progress with the [Cakeify dataset](https://huggingface.co/datasets/Lightricks/Cakeify-Dataset).
+
+Train a LoRA on the dev model using QLoRA (int4 quantization) to fit on Apple Silicon:
+
+```bash
+# Prepare dataset: directory of video.mp4 + video.txt pairs
+# Each .txt file contains a caption for the corresponding video
+
+# Train with trigger word (e.g., Cakeify style)
+ltx-video train dataset/ -o /tmp/my-lora \
+    --model dev --rank 64 --steps 2000 --save-every 500 \
+    -w 384 -h 384 -f 9 --transformer-quant int4 \
+    --trigger-word "MYSTYLE" \
+    --ltx-weights /path/to/ltx-2.3-22b-dev.safetensors
+
+# Use the trained LoRA for generation
+ltx-video generate "MYSTYLE a red car on a road" \
+    --lora /tmp/my-lora/lora-final.safetensors \
+    -w 768 -h 512 -f 121
+```
+
+A `learning_curve.svg` is generated live in the output directory for monitoring.
+
+**Memory presets** (all use int4 quantization for the 22B model):
+
+| Preset | RAM | Rank | Resolution | Frames |
+|--------|-----|------|-----------|--------|
+| `compact` | 32GB | 16 | 256x256 | 9 |
+| `balanced` | 64GB | 32 | 384x384 | 9 |
+| `quality` | 96GB | 64 | 512x512 | 9 |
+| `max` | 192GB+ | 128 | 512x512 (bf16) | 9 |
+
 Models (~30 GB total) are downloaded automatically on first run from [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) and [mlx-community/gemma-3-12b-it-qat-4bit](https://huggingface.co/mlx-community/gemma-3-12b-it-qat-4bit).
 
 ## Swift Package Integration
@@ -104,6 +139,8 @@ dependencies: [
     .package(url: "https://github.com/VincentGourbin/ltx-video-swift-mlx.git", branch: "main")
 ]
 ```
+
+### Inference
 
 ```swift
 import LTXVideo
@@ -123,6 +160,56 @@ try await VideoExporter.exportVideo(
     frames: result.frames, width: 768, height: 512,
     to: URL(fileURLWithPath: "output.mp4")
 )
+```
+
+### LoRA Training (Beta)
+
+```swift
+import LTXVideo
+
+let config = LoRATrainingConfig(
+    rank: 64,
+    learningRate: 2e-4,
+    maxSteps: 2000,
+    saveEvery: 500,
+    width: 384,
+    height: 384,
+    numFrames: 9,
+    transformerQuant: "int4",
+    triggerWord: "MYSTYLE",
+    ltxWeightsPath: "/path/to/ltx-2.3-22b-dev.safetensors"
+)
+
+let trainer = LoRATrainer(
+    config: config,
+    datasetPath: "/path/to/dataset",  // mp4 + txt pairs
+    outputDir: "/tmp/my-lora"
+)
+
+try await trainer.train { progress in
+    print(progress.status)  // "Step 42/2000 [2%] loss=0.523 lr=2.00e-04"
+}
+// Outputs: lora-final.safetensors, checkpoint-stepN.safetensors, learning_curve.svg
+```
+
+### Model Registry
+
+```swift
+import LTXVideo
+
+// List available models
+for model in LTXModel.allCases {
+    print("\(model.rawValue): inference=\(model.isForInference), training=\(model.isForTraining)")
+    print("  \(model.variantDescription)")
+    print("  Size: \(model.estimatedSizeGB)GB, License: \(model.license)")
+}
+
+// Print formatted table
+LTXModel.printModelList()
+
+// Check system compatibility
+let ram = LTXModelRegistry.systemRAMGB
+print("System RAM: \(ram) GB")
 ```
 
 ## Pipeline Architecture
@@ -188,6 +275,32 @@ flowchart TD
 | `--seed` | random | Random seed |
 | `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
 | `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+
+### `ltx-video train`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<dataset>` | required | Path to dataset directory (mp4 + txt pairs) |
+| `-o, --output` | required | Output directory for checkpoints and LoRA |
+| `--model` | `dev` | Model variant (`dev` required for training) |
+| `--rank` | `16` | LoRA rank |
+| `--alpha` | same as rank | LoRA alpha |
+| `--lr` | `2e-4` | Learning rate |
+| `--steps` | `2000` | Max training steps |
+| `--save-every` | `250` | Checkpoint interval |
+| `-w, --width` | `256` | Training video width (divisible by 32) |
+| `-h, --height` | `256` | Training video height (divisible by 32) |
+| `-f, --frames` | `9` | Frame count (must be 8n+1) |
+| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+| `--trigger-word` | none | Trigger word to prepend to captions |
+| `--grad-accum` | `1` | Gradient accumulation steps |
+| `--max-grad-norm` | `1.0` | Gradient clipping norm |
+| `--warmup-steps` | `100` | LR warmup steps |
+| `--preset` | none | Memory preset: `compact`, `balanced`, `quality`, `max` |
+
+### `ltx-video models`
+
+List available models with capabilities (inference, training, license).
 
 ### `ltx-video download`
 

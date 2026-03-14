@@ -34,8 +34,20 @@ struct LTXModelTests {
 
     @Test func testCaseIterable() {
         let allCases = LTXModel.allCases
-        #expect(allCases.count == 1)
+        #expect(allCases.count == 2)
         #expect(allCases.contains(.distilled))
+        #expect(allCases.contains(.dev))
+    }
+
+    @Test func testDevProperties() {
+        let model = LTXModel.dev
+        #expect(model.rawValue == "dev")
+        #expect(model.displayName == "LTX-2.3 Dev (~46GB)")
+        #expect(model.defaultSteps == 30)
+        #expect(model.estimatedVRAM == 46)
+        #expect(model.huggingFaceRepo == "Lightricks/LTX-2.3")
+        #expect(model.unifiedWeightsFilename == "ltx-2.3-22b-dev.safetensors")
+        #expect(model.transformerConfig.gatedAttention == true)
     }
 }
 

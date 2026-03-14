@@ -39,8 +39,11 @@ struct LoRASaver {
         for (swiftPath, down, up) in loraWeights {
             let loraKey = LoRAKeyMapper.modelKeyToLoraKey(swiftPath)
 
-            saveDict["\(loraKey).lora_down.weight"] = down
-            saveDict["\(loraKey).lora_up.weight"] = up
+            // Training uses mlx-examples convention: loraA=(inF, rank), loraB=(rank, outF)
+            // Diffusers format expects: lora_down=(rank, inF), lora_up=(outF, rank)
+            // Transpose to match the inference loader's getDelta: matmul(up, down)
+            saveDict["\(loraKey).lora_down.weight"] = down.transposed()
+            saveDict["\(loraKey).lora_up.weight"] = up.transposed()
 
             // Save alpha for each layer
             saveDict["\(loraKey).alpha"] = MLXArray(alpha)

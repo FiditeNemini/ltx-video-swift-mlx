@@ -36,12 +36,12 @@ struct CachedSample: Sendable {
 /// Manages the latent cache directory
 class LatentCache {
     let cacheDir: String
-    let includeAudio: Bool
+    let triggerWord: String?
     private var cachedSamples: [CachedSample] = []
 
-    init(cacheDir: String, includeAudio: Bool = false) {
+    init(cacheDir: String, triggerWord: String? = nil) {
         self.cacheDir = cacheDir
-        self.includeAudio = includeAudio
+        self.triggerWord = triggerWord
     }
 
     /// Build cache from dataset using the pipeline's encoder components.
@@ -76,19 +76,33 @@ class LatentCache {
             let videoLatent = try await pipeline.encodeVideoLatents(frames: sample.frames)
             eval(videoLatent)
 
-            // Encode text through Gemma + connector
-            let textResult = try await pipeline.encodeText(sample.caption)
+            // Encode text through Gemma + connector (prepend trigger word if set)
+            let caption: String
+            if let trigger = triggerWord {
+                caption = "\(trigger) \(sample.caption)"
+            } else {
+                caption = sample.caption
+            }
+            let textResult = try await pipeline.encodeText(caption)
             eval(textResult.embeddings, textResult.mask)
 
-            // Build save dictionary
+            // Compute latent spatial dimensions from input frames (1, 3, T, H, W)
+            let numFrames = sample.frames.dim(2)
+            let latentFrames = (numFrames - 1) / 8 + 1
+            let frameH = sample.frames.dim(3)
+            let frameW = sample.frames.dim(4)
+            let latentH = frameH / 32
+            let latentW = frameW / 32
+
+            // Build save dictionary with shape metadata
             let saveDict: [String: MLXArray] = [
                 "video_latent": videoLatent,
                 "prompt_embeddings": textResult.embeddings,
                 "prompt_mask": textResult.mask,
+                "latent_frames": MLXArray(Int32(latentFrames)),
+                "latent_height": MLXArray(Int32(latentH)),
+                "latent_width": MLXArray(Int32(latentW)),
             ]
-
-            // Audio latent caching removed — AudioProcessor dependency was removed.
-            // Audio training support will need to be re-added when AudioProcessor is restored.
 
             // Save to disk
             let url = URL(fileURLWithPath: cachePath)
@@ -122,20 +136,31 @@ class LatentCache {
                 continue
             }
 
-            // Infer latent shape from video latent
-            // Video latent is (1, T*H*W, C) — we need the original spatial dims
-            // Store them as metadata in a separate approach, or infer from config
+            // Read shape metadata (stored during build)
+            let lFrames: Int
+            let lHeight: Int
+            let lWidth: Int
+            if let f = arrays["latent_frames"], let h = arrays["latent_height"], let w = arrays["latent_width"] {
+                lFrames = Int(f.item(Int32.self))
+                lHeight = Int(h.item(Int32.self))
+                lWidth = Int(w.item(Int32.self))
+            } else {
+                // Legacy cache without shape metadata — cannot use
+                print("Warning: Cache file \(file) missing shape metadata, skipping (rebuild cache)")
+                continue
+            }
+
             let sample = CachedSample(
                 videoLatent: videoLatent,
-                latentFrames: 0,  // Will be set from config
-                latentHeight: 0,
-                latentWidth: 0,
+                latentFrames: lFrames,
+                latentHeight: lHeight,
+                latentWidth: lWidth,
                 promptEmbeddings: promptEmbeddings,
                 promptMask: promptMask,
-                audioLatent: arrays["audio_latent"],
-                audioEmbeddings: arrays["audio_embeddings"],
-                audioMask: arrays["audio_mask"],
-                audioNumFrames: arrays["audio_latent"].map { $0.dim(1) },
+                audioLatent: nil,
+                audioEmbeddings: nil,
+                audioMask: nil,
+                audioNumFrames: nil,
                 filename: (file as NSString).deletingPathExtension
             )
             cachedSamples.append(sample)
@@ -162,6 +187,26 @@ class LatentCache {
 
     /// Whether the cache is populated
     var isEmpty: Bool { cachedSamples.isEmpty }
+
+    /// Validate that cached sample shapes match training config
+    func validate(config: LoRATrainingConfig) throws {
+        let expectedFrames = (config.numFrames - 1) / 8 + 1
+        let expectedHeight = config.height / 32
+        let expectedWidth = config.width / 32
+
+        for sample in cachedSamples {
+            if sample.latentFrames != expectedFrames ||
+               sample.latentHeight != expectedHeight ||
+               sample.latentWidth != expectedWidth {
+                throw TrainingError.datasetError(
+                    "Cache shape mismatch for \(sample.filename): " +
+                    "cached (\(sample.latentFrames)×\(sample.latentHeight)×\(sample.latentWidth)) " +
+                    "vs config (\(expectedFrames)×\(expectedHeight)×\(expectedWidth)). " +
+                    "Delete the latent_cache directory and re-run to rebuild."
+                )
+            }
+        }
+    }
 
     // MARK: - Private
 

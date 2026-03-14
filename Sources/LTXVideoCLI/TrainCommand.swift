@@ -16,7 +16,7 @@ struct Train: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Output directory for LoRA weights and checkpoints")
     var output: String = "./lora-output"
 
-    @Option(name: .shortAndLong, help: "Model variant: dev or distilled")
+    @Option(name: .shortAndLong, help: "Model variant: dev (required for training) or distilled")
     var model: String = "dev"
 
     @Option(name: .long, help: "LoRA rank (default: 16)")
@@ -25,8 +25,8 @@ struct Train: AsyncParsableCommand {
     @Option(name: .long, help: "LoRA alpha (default: same as rank)")
     var alpha: Float?
 
-    @Option(name: .long, help: "Learning rate (default: 1e-4)")
-    var lr: Float = 1e-4
+    @Option(name: .long, help: "Learning rate (default: 2e-4)")
+    var lr: Float = 2e-4
 
     @Option(name: .long, help: "Weight decay (default: 0.01)")
     var weightDecay: Float = 0.01
@@ -52,8 +52,14 @@ struct Train: AsyncParsableCommand {
     @Option(name: .long, help: "Gradient accumulation steps (default: 1)")
     var gradAccum: Int = 1
 
+    @Option(name: .long, help: "Max gradient norm for clipping (default: 1.0, 0=disabled)")
+    var maxGradNorm: Float = 1.0
+
     @Option(name: .long, help: "LR warmup steps (default: 100)")
     var warmupSteps: Int = 100
+
+    @Option(name: .long, help: "Trigger word to prepend to all captions (e.g., CAKEIFY)")
+    var triggerWord: String?
 
     @Option(name: .long, help: "Random seed")
     var seed: UInt64?
@@ -70,14 +76,14 @@ struct Train: AsyncParsableCommand {
     @Option(name: .long, help: "Path to unified LTX-2 weights file")
     var ltxWeights: String?
 
-    @Flag(name: .long, help: "Train on audio+video (dual transformer)")
+    @Flag(name: .long, help: "Train on audio+video (not yet supported)")
     var audio: Bool = false
 
     @Option(name: .long, help: "Audio loss weight (default: 0.5)")
     var audioLossWeight: Float = 0.5
 
-    @Flag(name: .long, inversion: .prefixedNo, help: "Include FFN layers in LoRA targets (default: yes)")
-    var includeFFN: Bool = true
+    @Flag(name: .long, inversion: .prefixedNo, help: "Include FFN layers in LoRA targets (default: no)")
+    var includeFFN: Bool = false
 
     @Option(name: .long, help: "Memory preset: compact (32GB), balanced (64GB), quality (96GB), max (192GB)")
     var preset: String?
@@ -85,6 +91,13 @@ struct Train: AsyncParsableCommand {
     mutating func run() async throws {
         print("LTX-2 LoRA Training")
         print("===================")
+
+        // Guard audio flag
+        if audio {
+            print("Error: Audio LoRA training is not yet supported.")
+            print("Audio latent caching will be added in a future version.")
+            throw ExitCode.failure
+        }
 
         // Apply preset if specified
         var config: LoRATrainingConfig
@@ -118,21 +131,31 @@ struct Train: AsyncParsableCommand {
         config.includeFFN = includeFFN
         config.transformerQuant = transformerQuant
         config.gradientAccumulationSteps = gradAccum
+        config.maxGradNorm = maxGradNorm
         config.warmupSteps = warmupSteps
+        config.triggerWord = triggerWord
         config.seed = seed
         config.hfToken = hfToken
         config.modelsDir = modelsDir
         config.gemmaPath = gemmaPath
         config.ltxWeightsPath = ltxWeights
 
-        print("Dataset: \(dataset)")
-        print("Output: \(output)")
-        print("Model: \(model)")
-        print("Resolution: \(width)x\(height), Frames: \(frames)")
-        print("Rank: \(rank), Alpha: \(config.alpha), LR: \(lr)")
-        print("Steps: \(steps), Save every: \(saveEvery)")
-        print("Quant: \(transformerQuant)")
-        if audio { print("Audio: enabled (weight: \(audioLossWeight))") }
+        // Print training plan summary
+        print()
+        print("Training Plan:")
+        print("  Dataset: \(dataset)")
+        print("  Output: \(output)")
+        print("  Model: \(model)")
+        print("  Resolution: \(config.width)x\(config.height), Frames: \(config.numFrames)")
+        print("  Rank: \(config.rank), Alpha: \(config.alpha), LR: \(config.learningRate)")
+        print("  Steps: \(config.maxSteps), Save every: \(config.saveEvery)")
+        print("  Quant: \(config.transformerQuant)")
+        print("  Targets: attention\(config.includeFFN ? " + FFN" : " only")")
+        print("  Grad accumulation: \(config.gradientAccumulationSteps)")
+        print("  Grad clip norm: \(config.maxGradNorm > 0 ? String(format: "%.1f", config.maxGradNorm) : "disabled")")
+        if let trigger = config.triggerWord {
+            print("  Trigger word: \(trigger)")
+        }
         print()
 
         let trainer = LoRATrainer(

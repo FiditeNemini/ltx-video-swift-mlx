@@ -9,6 +9,7 @@ import Foundation
 ///
 /// Uses unified safetensors format from `Lightricks/LTX-2.3`:
 /// - `ltx-2.3-22b-distilled.safetensors` — Distilled model (transformer + VAE + connector)
+/// - `ltx-2.3-22b-dev.safetensors` — Dev model (transformer + VAE + connector)
 ///
 /// Audio VAE and vocoder are downloaded from `Lightricks/LTX-2` (shared components).
 /// VLM Gemma is shared across all variants (`mlx-community/gemma-3-12b-it-qat-4bit`).
@@ -16,13 +17,22 @@ public enum LTXModel: String, CaseIterable, Sendable {
     /// LTX-2.3 Distilled - 8 steps, no CFG, two-stage pipeline
     case distilled = "distilled"
 
+    /// LTX-2.3 Dev - 30 steps, CFG 3.0, required for LoRA training
+    case dev = "dev"
+
     public var displayName: String {
-        return "LTX-2.3 Distilled (~46GB)"
+        switch self {
+        case .distilled: return "LTX-2.3 Distilled (~46GB)"
+        case .dev: return "LTX-2.3 Dev (~46GB)"
+        }
     }
 
     /// Default number of inference steps
     public var defaultSteps: Int {
-        return 8
+        switch self {
+        case .distilled: return 8
+        case .dev: return 30
+        }
     }
 
     /// Estimated VRAM usage in GB (with 3-phase loading)
@@ -37,12 +47,91 @@ public enum LTXModel: String, CaseIterable, Sendable {
 
     /// Unified weights filename (single file containing transformer, VAE, connector)
     public var unifiedWeightsFilename: String {
-        return "ltx-2.3-22b-distilled.safetensors"
+        switch self {
+        case .distilled: return "ltx-2.3-22b-distilled.safetensors"
+        case .dev: return "ltx-2.3-22b-dev.safetensors"
+        }
     }
 
     /// Get the transformer configuration for this model
     public var transformerConfig: LTXTransformerConfig {
         return .ltx23
+    }
+
+    // MARK: - Model Capabilities
+
+    /// Whether this model can be used for inference
+    public var isForInference: Bool { true }
+
+    /// Whether this model can be used for LoRA training
+    public var isForTraining: Bool {
+        switch self {
+        case .dev: return true
+        case .distilled: return false
+        }
+    }
+
+    /// Whether the model requires authentication to download
+    public var isGated: Bool { false }
+
+    /// License identifier
+    public var license: String { "lightricks-ltx-2.3" }
+
+    /// Whether commercial use is allowed
+    public var isCommercialUseAllowed: Bool { true }
+
+    /// Estimated model size on disk in GB
+    public var estimatedSizeGB: Float { 46.1 }
+
+    /// Default CFG guidance scale
+    public var defaultGuidance: Float {
+        switch self {
+        case .dev: return 3.0
+        case .distilled: return 1.0
+        }
+    }
+
+    /// Default STG scale
+    public var defaultSTGScale: Float {
+        switch self {
+        case .dev: return 1.0
+        case .distilled: return 0.0
+        }
+    }
+
+    /// Short description of this model variant
+    public var variantDescription: String {
+        switch self {
+        case .distilled: return "Fast inference (8 steps), two-stage pipeline"
+        case .dev: return "Full quality (30 steps), CFG 3.0, LoRA training"
+        }
+    }
+
+    /// Print a summary of all available models
+    public static func printModelList() {
+        print("Available LTX-2.3 Models:")
+        print(String(repeating: "-", count: 80))
+        let header = "Variant".padding(toLength: 12, withPad: " ", startingAt: 0)
+            + "Inference".padding(toLength: 10, withPad: " ", startingAt: 0)
+            + "Training".padding(toLength: 10, withPad: " ", startingAt: 0)
+            + "Steps".padding(toLength: 8, withPad: " ", startingAt: 0)
+            + "Size".padding(toLength: 10, withPad: " ", startingAt: 0)
+            + "Gated".padding(toLength: 8, withPad: " ", startingAt: 0)
+            + "License"
+        print(header)
+        print(String(repeating: "-", count: 80))
+        for model in LTXModel.allCases {
+            let line = model.rawValue.padding(toLength: 12, withPad: " ", startingAt: 0)
+                + (model.isForInference ? "yes" : "no").padding(toLength: 10, withPad: " ", startingAt: 0)
+                + (model.isForTraining ? "yes" : "no").padding(toLength: 10, withPad: " ", startingAt: 0)
+                + "\(model.defaultSteps)".padding(toLength: 8, withPad: " ", startingAt: 0)
+                + "\(String(format: "%.1f", model.estimatedSizeGB))GB".padding(toLength: 10, withPad: " ", startingAt: 0)
+                + (model.isGated ? "yes" : "no").padding(toLength: 8, withPad: " ", startingAt: 0)
+                + model.license
+            print(line)
+        }
+        print(String(repeating: "-", count: 80))
+        print("Shared components: VLM Gemma (~7.5GB), Audio VAE (~100MB), Vocoder (~106MB)")
     }
 }
 

@@ -16,7 +16,7 @@ import MLXNN
 /// - `attn1.to_q/k/v/to_out` (self-attention video)
 /// - `attn2.to_q/k/v/to_out` (cross-attention)
 /// - `ff.project_in.proj`, `ff.project_out` (FFN)
-/// - Audio: `audio_attn*`, `audio_ff*`, `av_ca_*`
+/// - Audio: `audio_attn*`, `audio_ff*`, `audio_to_video_attn`, `video_to_audio_attn`
 struct LoRAInjector {
 
     /// Result of LoRA injection
@@ -97,25 +97,34 @@ struct LoRAInjector {
 
     // MARK: - Private
 
+    /// Extract the last dot-separated component from a module path
+    private static func lastDotComponent(_ path: String) -> String {
+        if let lastDot = path.lastIndex(of: ".") {
+            return String(path[path.index(after: lastDot)...])
+        }
+        return path
+    }
+
     /// Check if a module path should be targeted for LoRA injection
     private static func shouldTarget(path: String, includeAudio: Bool, includeFFN: Bool) -> Bool {
         // Must be inside a transformer block
         guard path.contains("transformer_blocks") else { return false }
 
+        let last = lastDotComponent(path)
+
         // Attention projections (video)
         if path.contains("attn1.") || path.contains("attn2.") {
-            let lastComponent = (path as NSString).lastPathComponent
-            if ["to_q", "to_k", "to_v", "to_out"].contains(lastComponent) {
+            if ["to_q", "to_k", "to_v", "to_out"].contains(last) {
                 return true
             }
         }
 
         // FFN projections (video)
         if includeFFN {
-            if path.contains(".ff.project_in.") && path.hasSuffix("proj") {
+            if path.contains(".ff.project_in.") && last == "proj" {
                 return true
             }
-            if path.hasSuffix(".ff.project_out") {
+            if last == "project_out" && path.contains(".ff.") {
                 return true
             }
         }
@@ -124,24 +133,22 @@ struct LoRAInjector {
         if includeAudio {
             // Audio attention
             if path.contains("audio_attn1.") || path.contains("audio_attn2.") {
-                let lastComponent = (path as NSString).lastPathComponent
-                if ["to_q", "to_k", "to_v", "to_out"].contains(lastComponent) {
+                if ["to_q", "to_k", "to_v", "to_out"].contains(last) {
                     return true
                 }
             }
             // Audio FFN
             if includeFFN {
-                if path.contains(".audio_ff.project_in.") && path.hasSuffix("proj") {
+                if path.contains(".audio_ff.project_in.") && last == "proj" {
                     return true
                 }
-                if path.hasSuffix(".audio_ff.project_out") {
+                if last == "project_out" && path.contains(".audio_ff.") {
                     return true
                 }
             }
-            // Cross-modal attention
-            if path.contains("av_ca_") {
-                let lastComponent = (path as NSString).lastPathComponent
-                if ["to_q", "to_k", "to_v", "to_out"].contains(lastComponent) {
+            // Cross-modal attention (audio ↔ video)
+            if path.contains("audio_to_video_attn.") || path.contains("video_to_audio_attn.") {
+                if ["to_q", "to_k", "to_v", "to_out"].contains(last) {
                     return true
                 }
             }
