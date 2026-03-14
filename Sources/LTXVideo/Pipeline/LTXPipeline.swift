@@ -30,23 +30,34 @@ import Hub
 /// )
 /// ```
 public struct GenerationProgress: Sendable {
-    /// Current denoising step (0-indexed)
+    /// Pipeline phase
+    public enum Phase: String, Sendable {
+        /// Main denoising (single-stage or stage 1 of two-stage)
+        case denoising = "denoising"
+        /// Refinement at full resolution (stage 2 of two-stage)
+        case refinement = "refinement"
+    }
+
+    /// Current step within the current phase (0-indexed)
     public let currentStep: Int
 
-    /// Total number of denoising steps
+    /// Total steps across all phases
     public let totalSteps: Int
 
     /// Current noise sigma value (decreases from 1.0 toward 0.0)
     public let sigma: Float
+
+    /// Current phase
+    public let phase: Phase
 
     /// Progress fraction from 0.0 (start) to 1.0 (complete)
     public var progress: Double {
         Double(currentStep + 1) / Double(totalSteps)
     }
 
-    /// Human-readable status string, e.g. `"Step 3/8 (σ=0.7250)"`
+    /// Human-readable status, e.g. `"Step 3/11 [denoising] (σ=0.7250)"`
     public var status: String {
-        "Step \(currentStep + 1)/\(totalSteps) (σ=\(String(format: "%.4f", sigma)))"
+        "Step \(currentStep + 1)/\(totalSteps) [\(phase.rawValue)] (σ=\(String(format: "%.4f", sigma)))"
     }
 }
 
@@ -694,6 +705,8 @@ public actor LTXPipeline {
 
         // === STAGE 1: Denoise at half resolution ===
         let stage1NumSteps = stage1Sigmas.count - 1
+        let stage2NumStepsForProgress = STAGE_2_DISTILLED_SIGMA_VALUES.count - 1
+        let totalStepsForProgress = stage1NumSteps + stage2NumStepsForProgress
         LTXDebug.log("=== Stage 1: Half-resolution \(hasAudio ? "dual" : "video-only") denoising (\(stage1NumSteps) steps) ===")
         let stage1Start = Date()
 
@@ -703,7 +716,7 @@ public actor LTXPipeline {
             let sigmaNext = stage1Sigmas[step + 1]
 
             onProgress?(GenerationProgress(
-                currentStep: step, totalSteps: stage1NumSteps, sigma: sigma
+                currentStep: step, totalSteps: totalStepsForProgress, sigma: sigma, phase: .denoising
             ))
 
             // I2V: inject noise to conditioned frame
@@ -897,7 +910,7 @@ public actor LTXPipeline {
             let sigmaNext = stage2Sigmas[step + 1]
 
             onProgress?(GenerationProgress(
-                currentStep: stage1NumSteps + step, totalSteps: stage1NumSteps + stage2NumSteps, sigma: sigma
+                currentStep: stage1NumSteps + step, totalSteps: totalStepsForProgress, sigma: sigma, phase: .refinement
             ))
 
             // I2V: inject noise to conditioned frame
@@ -1237,6 +1250,8 @@ public actor LTXPipeline {
 
         // Stage 1 denoising
         let modeStr = isPartialRetake ? "partial" : "full"
+        let retakeStage2Steps = STAGE_2_DISTILLED_SIGMA_VALUES.count - 1
+        let retakeTotalSteps = stage1NumSteps + retakeStage2Steps
         LTXDebug.log("=== Stage 1: Half-resolution \(modeStr) retake denoising (\(stage1NumSteps) steps) ===")
         let stage1Start = Date()
 
@@ -1246,7 +1261,7 @@ public actor LTXPipeline {
             let sigmaNext = stage1Sigmas[step + 1]
 
             onProgress?(GenerationProgress(
-                currentStep: step, totalSteps: stage1NumSteps + 3, sigma: sigma
+                currentStep: step, totalSteps: retakeTotalSteps, sigma: sigma, phase: .denoising
             ))
 
             // Per-token timestep: kept frames get σ=0, regenerated frames get σ
@@ -1406,8 +1421,9 @@ public actor LTXPipeline {
 
             onProgress?(GenerationProgress(
                 currentStep: stage1NumSteps + step,
-                totalSteps: stage1NumSteps + stage2NumSteps,
-                sigma: sigma
+                totalSteps: retakeTotalSteps,
+                sigma: sigma,
+                phase: .refinement
             ))
 
             let videoTimestep: MLXArray
@@ -1582,7 +1598,8 @@ public actor LTXPipeline {
             onProgress?(GenerationProgress(
                 currentStep: step,
                 totalSteps: numSteps,
-                sigma: sigma
+                sigma: sigma,
+                phase: .denoising
             ))
 
             // Inject noise to conditioned frame BEFORE transformer (Diffusers pattern)
@@ -2227,14 +2244,32 @@ public actor LTXPipeline {
 
     // MARK: - Memory Management
 
-    /// Clear all loaded models
+    /// Clear all loaded models and release GPU memory.
+    ///
+    /// Call this before setting the pipeline to `nil` to ensure all model
+    /// tensors are released within the actor's isolation context. This avoids
+    /// a race where `Memory.clearCache()` runs before ARC has released the
+    /// model references.
     public func clearAll() {
+        // Release all model references
         gemmaModel = nil
         tokenizer = nil
         textEncoder = nil
         transformer = nil
         vaeDecoder = nil
-        LTXDebug.log("All models cleared")
+        vaeEncoder = nil
+        ltx2Transformer = nil
+        audioVAE = nil
+        vocoder = nil
+        loraOriginalWeights = nil
+        loraFusedPath = nil
+
+        // Clear GPU cache from within the actor's isolation context
+        // so ARC has already released the model refs above
+        Memory.clearCache()
+        eval([MLXArray]())
+
+        LTXDebug.log("All models cleared and GPU cache flushed")
     }
 
     /// Clear only Gemma model (to save memory after encoding)

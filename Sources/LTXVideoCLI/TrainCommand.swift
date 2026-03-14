@@ -117,7 +117,7 @@ struct Train: AsyncParsableCommand {
 
         // Override with explicit flags
         config.rank = rank
-        if let a = alpha { config.alpha = a }
+        config.alpha = alpha ?? Float(rank)
         config.learningRate = lr
         config.weightDecay = weightDecay
         config.maxSteps = steps

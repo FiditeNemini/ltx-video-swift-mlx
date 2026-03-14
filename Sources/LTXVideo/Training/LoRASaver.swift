@@ -5,11 +5,14 @@ import Foundation
 @preconcurrency import MLX
 import MLXNN
 
-/// Saves trained LoRA weights in ComfyUI/Diffusers-compatible format.
+/// Saves trained LoRA weights in PEFT/HuggingFace-compatible format.
 ///
 /// Output format: `.safetensors` with keys like:
-///   `diffusion_model.transformer_blocks.0.attn1.to_q.lora_down.weight`
-///   `diffusion_model.transformer_blocks.0.attn1.to_q.lora_up.weight`
+///   `diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight`
+///   `diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight`
+///
+/// No per-layer alpha is saved — the scale (alpha/rank) is baked into the
+/// weights during training, so the inference loader uses effectiveScale=1.0.
 struct LoRASaver {
 
     /// Save LoRA weights from a model with injected LoRALinear layers.
@@ -36,17 +39,20 @@ struct LoRASaver {
         // Build save dictionary with ComfyUI/Diffusers key format
         var saveDict: [String: MLXArray] = [:]
 
+        // Scale factor baked into weights: the inference loader will use
+        // effectiveScale=1.0 (no alpha key), so we pre-scale here.
+        let loraScale = alpha / Float(rank)
+        let scaleArray = MLXArray(loraScale)
+
         for (swiftPath, down, up) in loraWeights {
             let loraKey = LoRAKeyMapper.modelKeyToLoraKey(swiftPath)
 
             // Training uses mlx-examples convention: loraA=(inF, rank), loraB=(rank, outF)
-            // Diffusers format expects: lora_down=(rank, inF), lora_up=(outF, rank)
-            // Transpose to match the inference loader's getDelta: matmul(up, down)
-            saveDict["\(loraKey).lora_down.weight"] = down.transposed()
-            saveDict["\(loraKey).lora_up.weight"] = up.transposed()
-
-            // Save alpha for each layer
-            saveDict["\(loraKey).alpha"] = MLXArray(alpha)
+            // PEFT format: lora_A=(rank, inF), lora_B=(outF, rank)
+            // Transpose to match the inference loader's getDelta: matmul(B, A)
+            // Bake scale into lora_B so effectiveScale=1.0 at inference
+            saveDict["\(loraKey).lora_A.weight"] = down.transposed()
+            saveDict["\(loraKey).lora_B.weight"] = (up * scaleArray).transposed()
         }
 
         // Save as safetensors
