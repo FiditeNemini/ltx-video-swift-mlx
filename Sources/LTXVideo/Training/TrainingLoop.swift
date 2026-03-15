@@ -39,14 +39,28 @@ public class LoRATrainer {
     let datasetPath: String
     let outputDir: String
 
+    /// Controller for pause/resume/stop (optional, nil = no control)
+    public var controller: TrainingController?
+
     public init(config: LoRATrainingConfig, datasetPath: String, outputDir: String) {
         self.config = config
         self.datasetPath = datasetPath
         self.outputDir = outputDir
     }
 
-    /// Run the full training pipeline
+    /// Run the full training pipeline.
+    ///
+    /// Supports pause/resume/stop via ``TrainingController``:
+    /// - **Pause**: saves checkpoint, blocks until resumed or stopped
+    /// - **Stop**: saves checkpoint, exits cleanly
+    /// - **Resume**: auto-detects latest checkpoint in output directory
+    ///
+    /// - Parameters:
+    ///   - resumeFromStep: If set, resume from this checkpoint step instead of starting fresh.
+    ///     Pass `nil` to auto-detect the latest checkpoint, or `0` to force a fresh start.
+    ///   - onProgress: Callback invoked at each training step with progress info.
     public func train(
+        resumeFromStep: Int? = nil,
         onProgress: TrainingProgressCallback? = nil
     ) async throws {
         try config.validate()
@@ -164,10 +178,72 @@ public class LoRATrainer {
         // Step 6: Set up optimizer
         let optimizer = AdamW(learningRate: config.learningRate, weightDecay: config.weightDecay)
 
+        // Step 6b: Handle resume from checkpoint
+        var firstStep = 0
+        var trainingState = TrainingState(
+            totalSteps: config.maxSteps,
+            modelType: config.model,
+            loraRank: config.rank,
+            loraAlpha: config.alpha,
+            learningRate: config.learningRate,
+            rngSeed: config.seed
+        )
+
+        // Determine resume step
+        let requestedStep = resumeFromStep
+        let checkpoint: (step: Int, path: String)?
+        if let step = requestedStep, step > 0 {
+            // Explicit resume from a specific step
+            let jsonPath = (outputDir as NSString).appendingPathComponent("checkpoint-step\(step).json")
+            checkpoint = (step, jsonPath)
+        } else if requestedStep == nil {
+            // Auto-detect latest checkpoint
+            checkpoint = TrainingState.findLatestCheckpoint(in: outputDir)
+        } else {
+            // resumeFromStep == 0 → force fresh start
+            checkpoint = nil
+        }
+
+        if let ckpt = checkpoint {
+            let weightsPath = (outputDir as NSString).appendingPathComponent("checkpoint-step\(ckpt.step).safetensors")
+            let fm = FileManager.default
+            if fm.fileExists(atPath: weightsPath) && fm.fileExists(atPath: ckpt.path) {
+                // Load saved state
+                let savedState = try TrainingState.load(from: ckpt.path)
+                guard savedState.isCompatible(
+                    modelType: config.model, rank: config.rank,
+                    alpha: config.alpha, lr: config.learningRate
+                ) else {
+                    throw TrainingError.checkpointError(
+                        "Checkpoint at step \(ckpt.step) is incompatible with current config " +
+                        "(model/rank/alpha/lr mismatch)"
+                    )
+                }
+
+                // Load LoRA weights from checkpoint into the injected model
+                let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: weightsPath))
+                // The checkpoint is in PEFT format (lora_A/lora_B, transposed).
+                // We need to load them back into the LoRALinear layers.
+                try LoRAInjector.loadLoRAWeights(loraWeights, into: transformer, rank: config.rank)
+
+                firstStep = savedState.currentStep
+                trainingState = savedState
+                trainingState.status = .running
+                print("Resumed from checkpoint at step \(firstStep)")
+            }
+        }
+
+        // Clean up control files from previous runs
+        TrainingController.cleanupControlFiles(outputDir: outputDir)
+        controller?.setStatus(.running)
+
         // Step 7: Training loop
         print("\nStarting training...")
         print("Steps: \(config.maxSteps), LR: \(config.learningRate), Rank: \(config.rank)")
         print("Resolution: \(config.width)x\(config.height), Frames: \(config.numFrames)")
+        if firstStep > 0 {
+            print("Resuming from step \(firstStep)")
+        }
         if config.gradientAccumulationSteps > 1 {
             print("Gradient accumulation: \(config.gradientAccumulationSteps) steps")
         }
@@ -236,11 +312,49 @@ public class LoRATrainer {
 
         let accumSteps = config.gradientAccumulationSteps
         let accumScale = 1.0 / Float(accumSteps)
-        var bestLoss: Float = .infinity
-        var lossHistory: [(step: Int, loss: Float)] = []
+        var bestLoss: Float = trainingState.bestLoss.isFinite ? trainingState.bestLoss : .infinity
+        var lossHistory: [(step: Int, loss: Float)] = trainingState.recentLosses.enumerated().map {
+            (step: $0.offset + 1, loss: $0.element)
+        }
         let loopStart = Date()
+        var wasStopped = false
 
-        for step in 0..<config.maxSteps {
+        for step in firstStep..<config.maxSteps {
+            // --- Control: force stop ---
+            if let ctrl = controller {
+                if ctrl.shouldForceStop() {
+                    wasStopped = true
+                    break
+                }
+                // --- Control: graceful stop (save checkpoint first) ---
+                if ctrl.shouldStop() {
+                    print("  Stop requested, saving checkpoint...")
+                    try saveCheckpoint(
+                        model: transformer, step: step, loss: bestLoss,
+                        state: &trainingState
+                    )
+                    ctrl.setStatus(.cancelled)
+                    ctrl.notifyObservers { $0.trainingFinished(success: true, message: "Stopped at step \(step)") }
+                    wasStopped = true
+                    break
+                }
+                // --- Control: pause (save checkpoint, then block) ---
+                if ctrl.shouldPause() {
+                    print("  Pausing at step \(step)...")
+                    try saveCheckpoint(
+                        model: transformer, step: step, loss: lossHistory.last?.loss ?? 0,
+                        state: &trainingState, isPause: true
+                    )
+                    ctrl.notifyObservers { $0.trainingPaused(atStep: step) }
+                    // Block until resumed or stopped
+                    if !ctrl.waitWhilePaused() {
+                        wasStopped = true
+                        break
+                    }
+                    print("  Resumed at step \(step)")
+                    ctrl.notifyObservers { $0.trainingResumed(atStep: step) }
+                }
+            }
             // Apply LR warmup (before optimizer step)
             let currentLR: Float
             if step < config.warmupSteps {
@@ -250,7 +364,7 @@ public class LoRATrainer {
                 currentLR = config.learningRate
             }
 
-            // Gradient accumulation loop
+            // Training step
             var accumGrads: ModuleParameters? = nil
             var accumLoss: Float = 0
 
@@ -271,20 +385,16 @@ public class LoRATrainer {
                 let (losses, grads) = lossGradFn(transformer, inputs)
                 let loss = losses[0]
 
-                // Scale gradients by 1/accumSteps
-                let scaledGrads: ModuleParameters
                 if accumSteps > 1 {
-                    scaledGrads = scaleParameters(grads, by: accumScale)
+                    let scaledGrads = scaleParameters(grads, by: accumScale)
+                    if var existing = accumGrads {
+                        addParameters(scaledGrads, to: &existing)
+                        accumGrads = existing
+                    } else {
+                        accumGrads = scaledGrads
+                    }
                 } else {
-                    scaledGrads = grads
-                }
-
-                // Accumulate
-                if var existing = accumGrads {
-                    addParameters(scaledGrads, to: &existing)
-                    accumGrads = existing
-                } else {
-                    accumGrads = scaledGrads
+                    accumGrads = grads
                 }
 
                 eval(loss)
@@ -303,12 +413,9 @@ public class LoRATrainer {
                 accumGrads = grads
             }
 
-            // Update parameters
+            // Update parameters and materialize
             optimizer.update(model: transformer, gradients: accumGrads!)
-
-            // Materialize computation
-            eval(transformer.trainableParameters())
-            Memory.clearCache()
+            eval(transformer, optimizer)
 
             // Progress callback
             let elapsed = Date().timeIntervalSince(loopStart)
@@ -327,6 +434,9 @@ public class LoRATrainer {
                 bestLoss = accumLoss
             }
             lossHistory.append((step: step + 1, loss: accumLoss))
+            trainingState.recordLoss(accumLoss, atStep: step + 1)
+            trainingState.totalTrainingTime = elapsed
+
             if lossHistory.count >= 2 {
                 LearningCurveSVG.generate(
                     lossHistory: lossHistory,
@@ -335,35 +445,76 @@ public class LoRATrainer {
                 )
             }
 
-            // Save checkpoint
-            if (step + 1) % config.saveEvery == 0 || step == config.maxSteps - 1 {
+            // Notify controller
+            controller?.notifyStepCompleted(step: step + 1, totalSteps: config.maxSteps, loss: accumLoss)
+
+            // Save checkpoint (scheduled, on-demand, or final step)
+            let isManualCheckpoint = controller?.shouldCheckpoint() ?? false
+            let isScheduledCheckpoint = (step + 1) % config.saveEvery == 0
+            let isFinalStep = step == config.maxSteps - 1
+            if isScheduledCheckpoint || isManualCheckpoint || isFinalStep {
                 print("  Saving checkpoint at step \(step + 1)...")
                 fflush(stdout)
-                try LoRASaver.saveCheckpoint(
-                    model: transformer,
-                    step: step + 1,
-                    loss: accumLoss,
-                    outputDir: outputDir,
-                    rank: config.rank,
-                    alpha: config.alpha
+                try saveCheckpoint(
+                    model: transformer, step: step + 1, loss: accumLoss,
+                    state: &trainingState
                 )
             }
         }
 
-        // Save final LoRA
-        let finalPath = (outputDir as NSString).appendingPathComponent("lora-final.safetensors")
-        let savedCount = try LoRASaver.save(
-            model: transformer,
-            to: finalPath,
+        // Save final LoRA (unless force-stopped)
+        if !wasStopped || !(controller?.shouldForceStop() ?? false) {
+            let finalPath = (outputDir as NSString).appendingPathComponent("lora-final.safetensors")
+            let savedCount = try LoRASaver.save(
+                model: transformer,
+                to: finalPath,
+                rank: config.rank,
+                alpha: config.alpha
+            )
+
+            let totalTime = Date().timeIntervalSince(startTime)
+            print("\nTraining complete!")
+            print("  Total time: \(String(format: "%.1f", totalTime))s")
+            print("  Best loss: \(String(format: "%.6f", bestLoss))")
+            print("  Saved \(savedCount) LoRA layers to \(finalPath)")
+            controller?.setStatus(.completed)
+            controller?.notifyObservers { $0.trainingFinished(success: true, message: "Completed at step \(config.maxSteps)") }
+        } else {
+            let totalTime = Date().timeIntervalSince(startTime)
+            print("\nTraining stopped.")
+            print("  Total time: \(String(format: "%.1f", totalTime))s")
+            print("  Best loss: \(String(format: "%.6f", bestLoss))")
+            controller?.setStatus(.cancelled)
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    private func saveCheckpoint(
+        model: Module,
+        step: Int,
+        loss: Float,
+        state: inout TrainingState,
+        isPause: Bool = false
+    ) throws {
+        state.lastCheckpointAt = Date()
+        state.status = isPause ? .paused : .checkpointing
+        state.isPauseCheckpoint = isPause
+
+        try LoRASaver.saveCheckpoint(
+            model: model,
+            step: step,
+            loss: loss,
+            outputDir: outputDir,
             rank: config.rank,
             alpha: config.alpha
         )
 
-        let totalTime = Date().timeIntervalSince(startTime)
-        print("\nTraining complete!")
-        print("  Total time: \(String(format: "%.1f", totalTime))s")
-        print("  Best loss: \(String(format: "%.6f", bestLoss))")
-        print("  Saved \(savedCount) LoRA layers to \(finalPath)")
+        // Save training state alongside the checkpoint
+        let statePath = (outputDir as NSString).appendingPathComponent("checkpoint-step\(step).json")
+        try state.save(to: statePath)
+
+        controller?.notifyObservers { $0.trainingCheckpointSaved(step: step, path: outputDir) }
     }
 }
 
@@ -384,11 +535,14 @@ private func addParameters(_ source: ModuleParameters, to destination: inout Mod
     }
 }
 
-/// Compute global L2 norm of all gradient arrays
+/// Compute global L2 norm of all gradient arrays.
+/// Uses a single MLX graph to avoid CPU-GPU round trips per tensor.
 private func computeGradNorm(_ params: ModuleParameters) -> Float {
-    var sumSq = MLXArray(Float(0))
-    for arr in params.flattenedValues() {
-        sumSq = sumSq + (arr * arr).sum()
+    let values = params.flattenedValues()
+    guard !values.isEmpty else { return 0 }
+    // Build a single sum-of-squares across all grad tensors in one graph
+    let sumSq = values.reduce(MLXArray(Float(0))) { acc, arr in
+        acc + (arr * arr).sum()
     }
     eval(sumSq)
     return sqrt(sumSq.item(Float.self))

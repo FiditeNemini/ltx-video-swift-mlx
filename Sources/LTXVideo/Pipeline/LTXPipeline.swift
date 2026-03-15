@@ -1058,7 +1058,8 @@ public actor LTXPipeline {
             generationTime: generationTime,
             timings: profile ? timings : nil,
             audioWaveform: audioWaveform,
-            audioSampleRate: audioSampleRate
+            audioSampleRate: audioSampleRate,
+            effectivePrompt: effectivePrompt
         )
     }
 
@@ -1515,7 +1516,8 @@ public actor LTXPipeline {
             generationTime: generationTime,
             timings: profile ? timings : nil,
             audioWaveform: nil,
-            audioSampleRate: nil
+            audioSampleRate: nil,
+            effectivePrompt: effectivePrompt
         )
     }
 

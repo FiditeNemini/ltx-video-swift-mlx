@@ -328,13 +328,19 @@ public struct VideoGenerationResult: @unchecked Sendable {
     /// Audio sample rate in Hz (e.g. 24000). Only set when ``audioWaveform`` is present.
     public let audioSampleRate: Int?
 
+    /// The prompt actually used for generation.
+    /// When prompt enhancement is enabled, this is the VLM-enhanced version.
+    /// When disabled, this equals the original input prompt.
+    public let effectivePrompt: String?
+
     public init(
         frames: MLXArray,
         seed: UInt64,
         generationTime: TimeInterval,
         timings: GenerationTimings? = nil,
         audioWaveform: MLXArray? = nil,
-        audioSampleRate: Int? = nil
+        audioSampleRate: Int? = nil,
+        effectivePrompt: String? = nil
     ) {
         self.frames = frames
         self.seed = seed
@@ -342,6 +348,7 @@ public struct VideoGenerationResult: @unchecked Sendable {
         self.timings = timings
         self.audioWaveform = audioWaveform
         self.audioSampleRate = audioSampleRate
+        self.effectivePrompt = effectivePrompt
     }
 }
 

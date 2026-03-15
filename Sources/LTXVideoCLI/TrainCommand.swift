@@ -88,6 +88,12 @@ struct Train: AsyncParsableCommand {
     @Option(name: .long, help: "Memory preset: compact (32GB), balanced (64GB), quality (96GB), max (192GB)")
     var preset: String?
 
+    @Flag(name: .long, help: "Resume from latest checkpoint in output directory")
+    var resume: Bool = false
+
+    @Option(name: .long, help: "Resume from a specific checkpoint step")
+    var resumeStep: Int?
+
     mutating func run() async throws {
         print("LTX-2 LoRA Training")
         print("===================")
@@ -164,7 +170,29 @@ struct Train: AsyncParsableCommand {
             outputDir: output
         )
 
-        try await trainer.train { progress in
+        // Set up training controller for pause/resume/stop
+        let controller = TrainingController(outputDir: output)
+        trainer.controller = controller
+
+        // Handle Ctrl+C for graceful stop
+        signal(SIGINT) { _ in
+            print("\n  Ctrl+C received, stopping gracefully...")
+            // Use file-based signaling since we can't capture the controller
+            let outputDir = CommandLine.arguments.dropFirst().first { !$0.hasPrefix("-") } ?? "."
+            TrainingController.stopTraining(outputDir: outputDir)
+        }
+
+        // Determine resume behavior
+        let resumeFromStep: Int?
+        if let step = resumeStep {
+            resumeFromStep = step
+        } else if resume {
+            resumeFromStep = nil  // auto-detect latest
+        } else {
+            resumeFromStep = 0  // force fresh start
+        }
+
+        try await trainer.train(resumeFromStep: resumeFromStep) { progress in
             if progress.step % 10 == 0 || progress.step == 1 {
                 print(progress.status)
                 fflush(stdout)

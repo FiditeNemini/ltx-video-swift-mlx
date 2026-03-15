@@ -95,6 +95,47 @@ struct LoRAInjector {
         return results
     }
 
+    /// Load saved LoRA weights (PEFT format) back into injected LoRALinear layers.
+    ///
+    /// Used for resuming training from a checkpoint. The checkpoint stores weights
+    /// in PEFT format (lora_A/lora_B, transposed). This reverses the transpose
+    /// and loads them into the matching LoRALinear layers.
+    ///
+    /// - Parameters:
+    ///   - weights: Dictionary of weight arrays from the checkpoint safetensors file
+    ///   - model: The model with injected LoRALinear layers
+    ///   - rank: Expected LoRA rank (for validation)
+    static func loadLoRAWeights(_ weights: [String: MLXArray], into model: Module, rank: Int) throws {
+        var loadedCount = 0
+
+        for (path, module) in model.leafModules().flattened() {
+            guard let loraLinear = module as? LoRALinear else { continue }
+
+            let loraKey = LoRAKeyMapper.modelKeyToLoraKey(path)
+            let aKey = "\(loraKey).lora_A.weight"
+            let bKey = "\(loraKey).lora_B.weight"
+
+            guard let savedA = weights[aKey], let savedB = weights[bKey] else {
+                continue
+            }
+
+            // Reverse the transpose from save: PEFT (rank, inF) → mlx-examples (inF, rank)
+            loraLinear.loraA = savedA.transposed().asType(.float32)
+            // lora_B has scale baked in. Reverse transpose: PEFT (outF, rank) → (rank, outF)
+            // Also remove the baked scale so training continues correctly
+            let scale = loraLinear.loraScale
+            if scale != 0 {
+                loraLinear.loraB = (savedB.transposed() / MLXArray(scale)).asType(.float32)
+            } else {
+                loraLinear.loraB = savedB.transposed().asType(.float32)
+            }
+            loadedCount += 1
+        }
+
+        eval(model.trainableParameters())
+        LTXDebug.log("Loaded \(loadedCount) LoRA layers from checkpoint")
+    }
+
     // MARK: - Private
 
     /// Extract the last dot-separated component from a module path
