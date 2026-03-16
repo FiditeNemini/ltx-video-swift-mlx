@@ -220,7 +220,7 @@ public actor VideoExporter {
 
     /// Write video frames to an MP4 file (no audio)
     @discardableResult
-    private func writeVideoOnly(
+    func writeVideoOnly(
         frames: [CGImage],
         width: Int,
         height: Int,
@@ -431,7 +431,7 @@ public actor VideoExporter {
     }
 
     /// Mux a video file and an audio file into a single MP4 using AVMutableComposition
-    private func muxVideoAndAudio(
+    func muxVideoAndAudio(
         videoURL: URL,
         audioURL: URL,
         to outputURL: URL
@@ -664,6 +664,7 @@ extension VideoExporter {
         audioWaveform: MLXArray? = nil,
         audioSampleRate: Int = 24000,
         audioGain: Float = 1.0,
+        sourceAudioURL: URL? = nil,
         config: VideoExportConfig = .default,
         to outputURL: URL
     ) async throws -> URL {
@@ -673,6 +674,26 @@ extension VideoExporter {
 
         guard !images.isEmpty else {
             throw LTXError.exportFailed("Failed to convert tensor to images")
+        }
+
+        // Source audio passthrough: mux audio track directly from source file (no re-encode)
+        if let audioSourceURL = sourceAudioURL {
+            LTXDebug.log("exportVideo: using source audio passthrough from \(audioSourceURL.lastPathComponent)")
+            let exporter = VideoExporter(config: config)
+            // Write video only first
+            let tempDir = FileManager.default.temporaryDirectory
+            let videoTempURL = tempDir.appendingPathComponent("ltx_video_\(UUID().uuidString).mp4")
+            defer { try? FileManager.default.removeItem(at: videoTempURL) }
+
+            try await exporter.writeVideoOnly(
+                frames: images, width: width, height: height,
+                fps: fps, to: videoTempURL
+            )
+            // Mux with source audio track
+            try await exporter.muxVideoAndAudio(
+                videoURL: videoTempURL, audioURL: audioSourceURL, to: outputURL
+            )
+            return outputURL
         }
 
         // Convert audio waveform to interleaved Int16 PCM data

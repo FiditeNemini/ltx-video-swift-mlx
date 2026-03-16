@@ -485,20 +485,19 @@ struct Retake: AsyncParsableCommand {
             print("Using target bitrate: \(kbps) kbps")
         }
 
+        // Use source audio passthrough (copy audio track directly, no re-encode)
+        let sourceAudioURL = URL(fileURLWithPath: video)
         let videoURL = try await VideoExporter.exportVideo(
             frames: result.frames,
             width: width,
             height: height,
             fps: 24.0,
-            audioWaveform: result.audioWaveform,
-            audioSampleRate: result.audioSampleRate ?? 16000,
+            sourceAudioURL: sourceAudioURL,
             config: exportConfig,
             to: outputURL
         )
         print("Video saved to: \(videoURL.path)")
-        if result.audioWaveform != nil {
-            print("Audio: source audio preserved")
-        }
+        print("Audio: source audio preserved")
 
         // Print summary
         print("\n--- Summary ---")
