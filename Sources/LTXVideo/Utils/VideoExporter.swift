@@ -713,6 +713,10 @@ extension VideoExporter {
         if audio.ndim == 3 {
             audio = audio.squeezed(axis: 0)  // (C, samples)
         }
+        if audio.ndim == 1 {
+            // Mono (samples,) → stereo (2, samples) by duplicating
+            audio = MLX.stacked([audio, audio], axis: 0)
+        }
 
         let numChannels = audio.dim(0)
         let numSamples = audio.dim(1)

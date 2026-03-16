@@ -1123,20 +1123,28 @@ public actor LTXPipeline {
         )
         unloadVAEEncoder()
 
-        // Phase 0a: Encode source audio if audio models are loaded
+        // Phase 0a: Extract source audio (for passthrough and optional cross-modal attention)
+        let audioProcessor = AudioProcessor(sampleRate: Self.audioSampleRate)
+        var sourceAudioWaveform: MLXArray? = nil
         var frozenAudioLatentPacked: MLXArray? = nil
         var retakeAudioNumFrames: Int = 1
-        if ltx2Transformer != nil, let audioVAE = audioVAE {
-            LTXDebug.log("Encoding source audio for retake...")
-            let audioProcessor = AudioProcessor()
-            let waveform = try await audioProcessor.loadAudio(from: videoPath)
+
+        // Always extract audio from source video for passthrough to output
+        let sourceWaveform = try await audioProcessor.loadAudio(from: videoPath)
+        if sourceWaveform.dim(0) > 0 {
+            sourceAudioWaveform = sourceWaveform
+            LTXDebug.log("Source audio extracted: \(sourceWaveform.dim(0)) samples (\(String(format: "%.1f", Float(sourceWaveform.dim(0)) / Float(Self.audioSampleRate)))s)")
+        }
+
+        // Encode audio latents for cross-modal attention if LTX2Transformer is loaded
+        if ltx2Transformer != nil, let audioVAE = audioVAE, let waveform = sourceAudioWaveform {
+            LTXDebug.log("Encoding source audio for cross-modal attention...")
             let melSpec = audioProcessor.melSpectrogram(waveform)
             eval(melSpec)
 
             let audioLatent = audioVAE.encode(melSpec)  // (1, 8, T_latent, 16)
             eval(audioLatent)
 
-            // Pack: (1, 8, T, 16) → (1, T, 128) for transformer
             retakeAudioNumFrames = audioLatent.dim(2)
             let packed = audioLatent.transposed(0, 2, 1, 3)  // (1, T, 8, 16)
             frozenAudioLatentPacked = packed.reshaped([1, retakeAudioNumFrames, Self.audioPackedChannels]).asType(DType.bfloat16)
@@ -1540,8 +1548,8 @@ public actor LTXPipeline {
             seed: config.seed ?? 0,
             generationTime: generationTime,
             timings: profile ? timings : nil,
-            audioWaveform: nil,
-            audioSampleRate: nil,
+            audioWaveform: sourceAudioWaveform,
+            audioSampleRate: sourceAudioWaveform != nil ? Self.audioSampleRate : nil,
             effectivePrompt: effectivePrompt
         )
     }

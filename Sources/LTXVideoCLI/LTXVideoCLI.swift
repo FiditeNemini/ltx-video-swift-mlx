@@ -490,10 +490,15 @@ struct Retake: AsyncParsableCommand {
             width: width,
             height: height,
             fps: 24.0,
+            audioWaveform: result.audioWaveform,
+            audioSampleRate: result.audioSampleRate ?? 16000,
             config: exportConfig,
             to: outputURL
         )
         print("Video saved to: \(videoURL.path)")
+        if result.audioWaveform != nil {
+            print("Audio: source audio preserved")
+        }
 
         // Print summary
         print("\n--- Summary ---")
