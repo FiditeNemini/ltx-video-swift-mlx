@@ -1123,6 +1123,26 @@ public actor LTXPipeline {
         )
         unloadVAEEncoder()
 
+        // Phase 0a: Encode source audio if audio models are loaded
+        var frozenAudioLatentPacked: MLXArray? = nil
+        var retakeAudioNumFrames: Int = 1
+        if ltx2Transformer != nil, let audioVAE = audioVAE {
+            LTXDebug.log("Encoding source audio for retake...")
+            let audioProcessor = AudioProcessor()
+            let waveform = try await audioProcessor.loadAudio(from: videoPath)
+            let melSpec = audioProcessor.melSpectrogram(waveform)
+            eval(melSpec)
+
+            let audioLatent = audioVAE.encode(melSpec)  // (1, 8, T_latent, 16)
+            eval(audioLatent)
+
+            // Pack: (1, 8, T, 16) → (1, T, 128) for transformer
+            retakeAudioNumFrames = audioLatent.dim(2)
+            let packed = audioLatent.transposed(0, 2, 1, 3)  // (1, T, 8, 16)
+            frozenAudioLatentPacked = packed.reshaped([1, retakeAudioNumFrames, Self.audioPackedChannels]).asType(DType.bfloat16)
+            LTXDebug.log("Audio encoded: \(retakeAudioNumFrames) latent frames")
+        }
+
         // Phase 0b: Optionally enhance prompt
         let effectivePrompt: String
         if config.enhancePrompt {
@@ -1276,17 +1296,20 @@ public actor LTXPipeline {
             let videoPatchified = patchify(videoLatent).asType(.bfloat16)
 
             if let ltx2 = ltx2Transformer {
+                // Use encoded source audio (frozen at σ=0) for cross-modal attention context
+                let audioInput = frozenAudioLatentPacked ?? MLXArray.zeros([videoPatchified.dim(0), 1, 128]).asType(DType.bfloat16)
+                let audioFrames = frozenAudioLatentPacked != nil ? retakeAudioNumFrames : 1
                 let (videoVelPred, _) = ltx2(
                     videoLatent: videoPatchified,
-                    audioLatent: videoPatchified,
+                    audioLatent: audioInput,
                     videoContext: videoTextEmbeddings.asType(.bfloat16),
                     audioContext: videoTextEmbeddings.asType(.bfloat16),
                     videoTimesteps: videoTimestep,
-                    audioTimesteps: videoTimestep,
+                    audioTimesteps: MLXArray([Float(0)]),  // σ=0 → frozen audio
                     videoContextMask: textMask,
                     audioContextMask: nil,
                     videoLatentShape: (frames: stage1Shape.frames, height: stage1Shape.height, width: stage1Shape.width),
-                    audioNumFrames: 0
+                    audioNumFrames: audioFrames
                 )
                 let videoVelocity = unpatchify(videoVelPred, shape: stage1Shape).asType(.float32)
                 videoLatent = stage1Scheduler.step(
@@ -1437,17 +1460,19 @@ public actor LTXPipeline {
             let videoPatchified = patchify(videoLatent).asType(.bfloat16)
 
             if let ltx2 = ltx2Transformer {
+                let audioInput = frozenAudioLatentPacked ?? MLXArray.zeros([videoPatchified.dim(0), 1, 128]).asType(DType.bfloat16)
+                let audioFrames = frozenAudioLatentPacked != nil ? retakeAudioNumFrames : 1
                 let (videoVelPred, _) = ltx2(
                     videoLatent: videoPatchified,
-                    audioLatent: videoPatchified,
+                    audioLatent: audioInput,
                     videoContext: videoTextEmbeddings.asType(.bfloat16),
                     audioContext: videoTextEmbeddings.asType(.bfloat16),
                     videoTimesteps: videoTimestep,
-                    audioTimesteps: videoTimestep,
+                    audioTimesteps: MLXArray([Float(0)]),  // σ=0 → frozen audio
                     videoContextMask: textMask,
                     audioContextMask: nil,
                     videoLatentShape: (frames: stage2Shape.frames, height: stage2Shape.height, width: stage2Shape.width),
-                    audioNumFrames: 0
+                    audioNumFrames: audioFrames
                 )
                 let videoVelocity = unpatchify(videoVelPred, shape: stage2Shape).asType(.float32)
                 let dt = sigmaNext - sigma
