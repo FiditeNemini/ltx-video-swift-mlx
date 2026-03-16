@@ -1208,8 +1208,16 @@ public actor LTXPipeline {
         if isPartialRetake {
             let fps: Float = 24.0
             let totalDuration = Float(config.numFrames) / fps
-            let startTime = config.retakeStartTime ?? 0.0
-            let endTime = config.retakeEndTime ?? totalDuration
+            let startTime = min(config.retakeStartTime ?? 0.0, totalDuration)
+            let endTime = min(config.retakeEndTime ?? totalDuration, totalDuration)
+
+            guard startTime < endTime else {
+                throw LTXError.invalidConfiguration(
+                    "Retake start time (\(startTime)s) must be before end time (\(endTime)s). " +
+                    "Output duration is \(String(format: "%.1f", totalDuration))s (\(config.numFrames) frames at \(Int(fps))fps). " +
+                    "Increase --frames to cover the full source video duration."
+                )
+            }
 
             // Convert time range to latent frame indices
             // Each latent frame covers 8 pixel frames (+ frame 0 is shared)
@@ -1220,8 +1228,8 @@ public actor LTXPipeline {
             let endPixelFrame = min(Int(endTime * fps), config.numFrames - 1)
 
             // Latent frame i covers pixel frames [i*8, (i+1)*8] (approx)
-            let startLatentFrame = max(0, startPixelFrame / 8)
-            let endLatentFrame = min(latentFrames - 1, (endPixelFrame + 7) / 8)
+            let startLatentFrame = max(0, min(startPixelFrame / 8, latentFrames - 1))
+            let endLatentFrame = max(startLatentFrame, min(latentFrames - 1, (endPixelFrame + 7) / 8))
 
             LTXDebug.log("Partial retake: time \(startTime)s-\(endTime)s → latent frames \(startLatentFrame)-\(endLatentFrame) of \(latentFrames)")
 
@@ -1397,12 +1405,12 @@ public actor LTXPipeline {
 
             let fps: Float = 24.0
             let totalDuration = Float(config.numFrames) / fps
-            let startTime = config.retakeStartTime ?? 0.0
-            let endTime = config.retakeEndTime ?? totalDuration
+            let startTime = min(config.retakeStartTime ?? 0.0, totalDuration)
+            let endTime = min(config.retakeEndTime ?? totalDuration, totalDuration)
             let startPixelFrame = Int(startTime * fps)
             let endPixelFrame = min(Int(endTime * fps), config.numFrames - 1)
-            let startLatentFrame = max(0, startPixelFrame / 8)
-            let endLatentFrame = min(stage2ShapeTmp.frames - 1, (endPixelFrame + 7) / 8)
+            let startLatentFrame = max(0, min(startPixelFrame / 8, stage2ShapeTmp.frames - 1))
+            let endLatentFrame = max(startLatentFrame, min(stage2ShapeTmp.frames - 1, (endPixelFrame + 7) / 8))
             let tokensPerFrame = stage2ShapeTmp.height * stage2ShapeTmp.width
 
             var maskValues = [Float](repeating: 1.0, count: stage2ShapeTmp.tokenCount)
