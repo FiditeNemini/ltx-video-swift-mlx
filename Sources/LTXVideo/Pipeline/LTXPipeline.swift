@@ -1136,8 +1136,8 @@ public actor LTXPipeline {
             LTXDebug.log("Source audio extracted: \(sourceWaveform.dim(0)) samples (\(String(format: "%.1f", Float(sourceWaveform.dim(0)) / Float(Self.audioSampleRate)))s)")
         }
 
-        // Encode audio latents for cross-modal attention if LTX2Transformer is loaded
-        if ltx2Transformer != nil, let audioVAE = audioVAE, let waveform = sourceAudioWaveform {
+        // Encode audio latents for cross-modal attention if LTX2Transformer + AudioVAE encoder are loaded
+        if ltx2Transformer != nil, let audioVAE = audioVAE, audioVAE.encoder != nil, let waveform = sourceAudioWaveform {
             LTXDebug.log("Encoding source audio for cross-modal attention...")
             let melSpec = audioProcessor.melSpectrogram(waveform)
             eval(melSpec)
