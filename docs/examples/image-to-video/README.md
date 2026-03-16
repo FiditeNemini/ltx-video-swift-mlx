@@ -91,7 +91,7 @@ ltx-video generate \
 | Steps | 8 (stage 1) + 3 (stage 2) = 11 total |
 | Seed | 42 |
 | Prompt enhancement | Yes (multimodal I2V) |
-| Inference time | *work in progress — full benchmark pending LTX 2.3 adaptation* |
+| Inference time | ~39s (excl. model loading) |
 
 [![I2V 768x512 preview](i2v-768x512-9f-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/image-to-video/i2v-768x512-9f.mp4)
 
@@ -117,7 +117,7 @@ ltx-video generate \
 | Steps | 8 (stage 1) + 3 (stage 2) = 11 total |
 | Seed | 42 |
 | Prompt enhancement | Yes (multimodal I2V) |
-| Inference time | *work in progress — full benchmark pending LTX 2.3 adaptation* |
+| Inference time | ~755s (~12.5 min, excl. model loading) |
 
 [![I2V 1024x576 10s preview](i2v-1024x576-10s-thumb.png)](https://github.com/VincentGourbin/ltx-video-swift-mlx/raw/main/docs/examples/image-to-video/i2v-1024x576-10s.mp4)
 
@@ -129,4 +129,4 @@ ltx-video generate \
 
 - Apple Silicon M3 Max 96GB
 - macOS 26.3 (Tahoe)
-- Inference times will be benchmarked after full LTX 2.3 adaptation is complete
+- Inference times measured March 2026 (macOS 26.3, Release build)
