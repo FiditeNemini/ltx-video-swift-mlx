@@ -333,6 +333,16 @@ public struct VideoGenerationResult: @unchecked Sendable {
     /// When disabled, this equals the original input prompt.
     public let effectivePrompt: String?
 
+    /// Path to the source audio file for passthrough export (retake only).
+    ///
+    /// When set, use ``VideoExporter/exportVideo(frames:width:height:fps:sourceAudioURL:config:to:)``
+    /// with this path to copy the audio track directly from the source file
+    /// (no re-encoding, no quality loss). This avoids AAC encoder issues with
+    /// non-standard sample rates.
+    ///
+    /// - Note: Prefer `sourceAudioPath` over `audioWaveform` for retake results.
+    public let sourceAudioPath: String?
+
     public init(
         frames: MLXArray,
         seed: UInt64,
@@ -340,7 +350,8 @@ public struct VideoGenerationResult: @unchecked Sendable {
         timings: GenerationTimings? = nil,
         audioWaveform: MLXArray? = nil,
         audioSampleRate: Int? = nil,
-        effectivePrompt: String? = nil
+        effectivePrompt: String? = nil,
+        sourceAudioPath: String? = nil
     ) {
         self.frames = frames
         self.seed = seed
@@ -349,6 +360,7 @@ public struct VideoGenerationResult: @unchecked Sendable {
         self.audioWaveform = audioWaveform
         self.audioSampleRate = audioSampleRate
         self.effectivePrompt = effectivePrompt
+        self.sourceAudioPath = sourceAudioPath
     }
 }
 

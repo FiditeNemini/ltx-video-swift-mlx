@@ -1556,9 +1556,8 @@ public actor LTXPipeline {
             seed: config.seed ?? 0,
             generationTime: generationTime,
             timings: profile ? timings : nil,
-            audioWaveform: sourceAudioWaveform,
-            audioSampleRate: sourceAudioWaveform != nil ? Self.audioSampleRate : nil,
-            effectivePrompt: effectivePrompt
+            effectivePrompt: effectivePrompt,
+            sourceAudioPath: videoPath
         )
     }
 
