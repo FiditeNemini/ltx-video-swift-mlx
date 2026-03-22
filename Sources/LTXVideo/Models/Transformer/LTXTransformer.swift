@@ -21,6 +21,11 @@ class LTXTransformer: Module {
     /// Set to true to dump detailed intermediates on the next forward pass (step 0 diagnostics)
     nonisolated(unsafe) static var dumpNextForwardPass = false
 
+    /// Number of leading transformer blocks that are frozen (no LoRA).
+    /// When > 0, stopGradient is inserted after block `frozenBlockCount - 1`
+    /// to prevent backward graph from tracing into frozen blocks.
+    var frozenBlockCount: Int = 0
+
     let config: LTXTransformerConfig
     let ropeType: LTXRopeType
     let normEps: Float
@@ -398,117 +403,124 @@ class LTXTransformer: Module {
         let blocksStart = Date()
 
         // If dumpMode, manually trace block 0 first
-        if dumpMode {
-            let block0 = transformerBlocks[0]
-            let sst = block0.scaleShiftTable
-            eval(sst)
-            print("[DUMP] block0 SST shape=\(sst.shape), dtype=\(sst.dtype)")
-            print("[DUMP] block0 SST [0,:5]=\(sst[0, ..<5].asType(.float32).asArray(Float.self))")
-            print("[DUMP] block0 SST [3,:5]=\(sst[3, ..<5].asType(.float32).asArray(Float.self))")
-            print("[DUMP] block0 SST mean=\(sst.mean().item(Float.self))")
-
-            // Compute AdaLN values for self-attention (indices 0,1,2)
-            let tableSliceAttn = sst[0..<3]  // (3, D)
-            let tableExpAttn = tableSliceAttn.reshaped([1, 1, 3, -1])
-            let tsSliceAttn = args.timesteps[0..., 0..., 0..<3, 0...]
-            let adaAttn = tableExpAttn + tsSliceAttn
-            eval(adaAttn)
-
-            let shiftMSA = adaAttn[0..., 0..., 0, 0...]
-            let scaleMSA = adaAttn[0..., 0..., 1, 0...]
-            let gateMSA = adaAttn[0..., 0..., 2, 0...]
-            eval(shiftMSA, scaleMSA, gateMSA)
-            print("[DUMP] block0 shift_msa mean=\(shiftMSA.mean().item(Float.self)), [0,0,:5]=\(shiftMSA[0, 0, ..<5].asType(.float32).asArray(Float.self))")
-            print("[DUMP] block0 scale_msa mean=\(scaleMSA.mean().item(Float.self)), [0,0,:5]=\(scaleMSA[0, 0, ..<5].asType(.float32).asArray(Float.self))")
-            print("[DUMP] block0 gate_msa mean=\(gateMSA.mean().item(Float.self)), [0,0,:5]=\(gateMSA[0, 0, ..<5].asType(.float32).asArray(Float.self))")
-
-            // Apply RMSNorm + AdaLN
-            let weight0 = MLXArray.ones([x.dim(-1)]).asType(x.dtype)
-            let normedX = MLXFast.rmsNorm(x, weight: weight0, eps: normEps)
-            let adalNormed = normedX * (1 + scaleMSA) + shiftMSA
-            eval(adalNormed)
-            print("[DUMP] block0 after AdaLN norm mean=\(adalNormed.mean().item(Float.self)), [0,0,:5]=\(adalNormed[0, 0, ..<5].asType(.float32).asArray(Float.self))")
-
-            // Self-attention
-            let selfAttnOut = block0.attn1(adalNormed, pe: args.positionalEmbeddings)
-            eval(selfAttnOut)
-            print("[DUMP] block0 self-attn output mean=\(selfAttnOut.mean().item(Float.self)), [0,0,:5]=\(selfAttnOut[0, 0, ..<5].asType(.float32).asArray(Float.self))")
-
-            let xAfterAttn1 = x + selfAttnOut * gateMSA
-            eval(xAfterAttn1)
-            print("[DUMP] block0 after self-attn residual mean=\(xAfterAttn1.mean().item(Float.self))")
-
-            // Cross-attention (no pre-norm, matching Diffusers)
-            let crossOut = block0.attn2(xAfterAttn1, context: args.context, mask: args.contextMask)
-            eval(crossOut)
-            print("[DUMP] block0 cross-attn output mean=\(crossOut.mean().item(Float.self)), [0,0,:5]=\(crossOut[0, 0, ..<5].asType(.float32).asArray(Float.self))")
-
-            let xAfterAttn2 = xAfterAttn1 + crossOut
-            eval(xAfterAttn2)
-            print("[DUMP] block0 after cross-attn residual mean=\(xAfterAttn2.mean().item(Float.self))")
-
-            // FFN AdaLN
-            let tableSliceFF = sst[3..<6]
-            let tableExpFF = tableSliceFF.reshaped([1, 1, 3, -1])
-            let tsSliceFF = args.timesteps[0..., 0..., 3..<6, 0...]
-            let adaFF = tableExpFF + tsSliceFF
-            eval(adaFF)
-
-            let shiftMLP = adaFF[0..., 0..., 0, 0...]
-            let scaleMLP = adaFF[0..., 0..., 1, 0...]
-            let gateMLP = adaFF[0..., 0..., 2, 0...]
-
-            let normedFF = MLXFast.rmsNorm(xAfterAttn2, weight: MLXArray.ones([xAfterAttn2.dim(-1)]).asType(xAfterAttn2.dtype), eps: normEps)
-            let ffInput = normedFF * (1 + scaleMLP) + shiftMLP
-            let ffOut = block0.ff(ffInput)
-            eval(ffOut)
-            print("[DUMP] block0 FFN output mean=\(ffOut.mean().item(Float.self)), [0,0,:5]=\(ffOut[0, 0, ..<5].asType(.float32).asArray(Float.self))")
-
-            let xAfterFF = xAfterAttn2 + ffOut * gateMLP
-            eval(xAfterFF)
-            print("[DUMP] block0 output mean=\(xAfterFF.mean().item(Float.self)), [0,0,:5]=\(xAfterFF[0, 0, ..<5].asType(.float32).asArray(Float.self))")
-
-            // Now run block 0 normally through the standard path to update args
-            args = block0(args)
-            eval(args.x)
-
-            // Verify the normal block 0 output matches our manual trace
-            let block0Mean = args.x.mean().item(Float.self)
-            print("[DUMP] block0 (via normal path) mean=\(block0Mean)")
-            print("[BLOCK_MEAN] block 0: mean=\(block0Mean)")
-
-            // Now turn off dump mode and skip block 0 in the normal loop
-            LTXTransformer.dumpNextForwardPass = false
-        }
-
-        for (i, block) in transformerBlocks.enumerated() {
-            // Skip block 0 if we already traced it in dump mode
-            if dumpMode && i == 0 { continue }
-
-            args = block(args)
-
             if dumpMode {
-                // In dump mode: eval every block for accurate per-block means
+                let block0 = transformerBlocks[0]
+                let sst = block0.scaleShiftTable
+                eval(sst)
+                print("[DUMP] block0 SST shape=\(sst.shape), dtype=\(sst.dtype)")
+                print("[DUMP] block0 SST [0,:5]=\(sst[0, ..<5].asType(.float32).asArray(Float.self))")
+                print("[DUMP] block0 SST [3,:5]=\(sst[3, ..<5].asType(.float32).asArray(Float.self))")
+                print("[DUMP] block0 SST mean=\(sst.mean().item(Float.self))")
+
+                // Compute AdaLN values for self-attention (indices 0,1,2)
+                let tableSliceAttn = sst[0..<3]  // (3, D)
+                let tableExpAttn = tableSliceAttn.reshaped([1, 1, 3, -1])
+                let tsSliceAttn = args.timesteps[0..., 0..., 0..<3, 0...]
+                let adaAttn = tableExpAttn + tsSliceAttn
+                eval(adaAttn)
+
+                let shiftMSA = adaAttn[0..., 0..., 0, 0...]
+                let scaleMSA = adaAttn[0..., 0..., 1, 0...]
+                let gateMSA = adaAttn[0..., 0..., 2, 0...]
+                eval(shiftMSA, scaleMSA, gateMSA)
+                print("[DUMP] block0 shift_msa mean=\(shiftMSA.mean().item(Float.self)), [0,0,:5]=\(shiftMSA[0, 0, ..<5].asType(.float32).asArray(Float.self))")
+                print("[DUMP] block0 scale_msa mean=\(scaleMSA.mean().item(Float.self)), [0,0,:5]=\(scaleMSA[0, 0, ..<5].asType(.float32).asArray(Float.self))")
+                print("[DUMP] block0 gate_msa mean=\(gateMSA.mean().item(Float.self)), [0,0,:5]=\(gateMSA[0, 0, ..<5].asType(.float32).asArray(Float.self))")
+
+                // Apply RMSNorm + AdaLN
+                let weight0 = MLXArray.ones([x.dim(-1)]).asType(x.dtype)
+                let normedX = MLXFast.rmsNorm(x, weight: weight0, eps: normEps)
+                let adalNormed = normedX * (1 + scaleMSA) + shiftMSA
+                eval(adalNormed)
+                print("[DUMP] block0 after AdaLN norm mean=\(adalNormed.mean().item(Float.self)), [0,0,:5]=\(adalNormed[0, 0, ..<5].asType(.float32).asArray(Float.self))")
+
+                // Self-attention
+                let selfAttnOut = block0.attn1(adalNormed, pe: args.positionalEmbeddings)
+                eval(selfAttnOut)
+                print("[DUMP] block0 self-attn output mean=\(selfAttnOut.mean().item(Float.self)), [0,0,:5]=\(selfAttnOut[0, 0, ..<5].asType(.float32).asArray(Float.self))")
+
+                let xAfterAttn1 = x + selfAttnOut * gateMSA
+                eval(xAfterAttn1)
+                print("[DUMP] block0 after self-attn residual mean=\(xAfterAttn1.mean().item(Float.self))")
+
+                // Cross-attention (no pre-norm, matching Diffusers)
+                let crossOut = block0.attn2(xAfterAttn1, context: args.context, mask: args.contextMask)
+                eval(crossOut)
+                print("[DUMP] block0 cross-attn output mean=\(crossOut.mean().item(Float.self)), [0,0,:5]=\(crossOut[0, 0, ..<5].asType(.float32).asArray(Float.self))")
+
+                let xAfterAttn2 = xAfterAttn1 + crossOut
+                eval(xAfterAttn2)
+                print("[DUMP] block0 after cross-attn residual mean=\(xAfterAttn2.mean().item(Float.self))")
+
+                // FFN AdaLN
+                let tableSliceFF = sst[3..<6]
+                let tableExpFF = tableSliceFF.reshaped([1, 1, 3, -1])
+                let tsSliceFF = args.timesteps[0..., 0..., 3..<6, 0...]
+                let adaFF = tableExpFF + tsSliceFF
+                eval(adaFF)
+
+                let shiftMLP = adaFF[0..., 0..., 0, 0...]
+                let scaleMLP = adaFF[0..., 0..., 1, 0...]
+                let gateMLP = adaFF[0..., 0..., 2, 0...]
+
+                let normedFF = MLXFast.rmsNorm(xAfterAttn2, weight: MLXArray.ones([xAfterAttn2.dim(-1)]).asType(xAfterAttn2.dtype), eps: normEps)
+                let ffInput = normedFF * (1 + scaleMLP) + shiftMLP
+                let ffOut = block0.ff(ffInput)
+                eval(ffOut)
+                print("[DUMP] block0 FFN output mean=\(ffOut.mean().item(Float.self)), [0,0,:5]=\(ffOut[0, 0, ..<5].asType(.float32).asArray(Float.self))")
+
+                let xAfterFF = xAfterAttn2 + ffOut * gateMLP
+                eval(xAfterFF)
+                print("[DUMP] block0 output mean=\(xAfterFF.mean().item(Float.self)), [0,0,:5]=\(xAfterFF[0, 0, ..<5].asType(.float32).asArray(Float.self))")
+
+                // Now run block 0 normally through the standard path to update args
+                args = block0(args)
                 eval(args.x)
-                let xMean = args.x.mean().item(Float.self)
-                print("[BLOCK_MEAN] block \(i): mean=\(xMean)")
-            } else if memoryOptimization.evalFrequency > 0
-                        && (i + 1) % memoryOptimization.evalFrequency == 0 {
-                // Periodic eval to bound compute graph memory (flux-2 pattern)
-                eval(args.x)
-                if memoryOptimization.clearCacheOnEval {
+
+                // Verify the normal block 0 output matches our manual trace
+                let block0Mean = args.x.mean().item(Float.self)
+                print("[DUMP] block0 (via normal path) mean=\(block0Mean)")
+                print("[BLOCK_MEAN] block 0: mean=\(block0Mean)")
+
+                // Now turn off dump mode and skip block 0 in the normal loop
+                LTXTransformer.dumpNextForwardPass = false
+            }
+
+            for (i, block) in transformerBlocks.enumerated() {
+                // Skip block 0 if we already traced it in dump mode
+                if dumpMode && i == 0 { continue }
+
+                args = block(args)
+
+                // Cut backward graph after last frozen block (selective LoRA)
+                if frozenBlockCount > 0 && i == frozenBlockCount - 1 {
+                    args.x = stopGradient(args.x)
+                    eval(args.x)
                     Memory.clearCache()
                 }
+
+                if dumpMode {
+                    // In dump mode: eval every block for accurate per-block means
+                    eval(args.x)
+                    let xMean = args.x.mean().item(Float.self)
+                    print("[BLOCK_MEAN] block \(i): mean=\(xMean)")
+                } else if memoryOptimization.evalFrequency > 0
+                            && (i + 1) % memoryOptimization.evalFrequency == 0 {
+                    // Periodic eval to bound compute graph memory (flux-2 pattern)
+                    eval(args.x)
+                    if memoryOptimization.clearCacheOnEval {
+                        Memory.clearCache()
+                    }
+                }
             }
-        }
-        // Final eval if not already done at the last block
-        if !dumpMode {
-            let lastDone = memoryOptimization.evalFrequency > 0
-                && transformerBlocks.count % memoryOptimization.evalFrequency == 0
-            if !lastDone {
-                eval(args.x)
+            // Final eval if not already done at the last block
+            if !dumpMode {
+                let lastDone = memoryOptimization.evalFrequency > 0
+                    && transformerBlocks.count % memoryOptimization.evalFrequency == 0
+                if !lastDone {
+                    eval(args.x)
+                }
             }
-        }
         now = Date()
         LTXDebug.log("  [TIME] all transformer blocks: \(String(format: "%.3f", now.timeIntervalSince(blocksStart)))s")
         lastTime = now

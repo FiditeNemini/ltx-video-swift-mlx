@@ -6,7 +6,7 @@ import CoreImage
 import Foundation
 @preconcurrency import MLX
 
-/// A training sample: video frames + caption + optional audio waveform
+/// A training sample: video frames + caption + optional audio waveform + optional conditioning image
 struct TrainingSample: Sendable {
     /// Video frames as MLXArray (1, 3, T, H, W) in [-1, 1]
     let frames: MLXArray
@@ -14,6 +14,8 @@ struct TrainingSample: Sendable {
     let caption: String
     /// Audio waveform (optional), float32 1D array
     let audioWaveform: MLXArray?
+    /// I2V conditioning image (optional), loaded as (1, 3, 1, H, W) in [-1, 1]
+    let image: MLXArray?
     /// Source file name (for logging)
     let filename: String
 }
@@ -34,9 +36,9 @@ class VideoDataset {
     /// All available samples
     let samples: [SampleInfo]
 
-    /// Target resolution
-    let width: Int
-    let height: Int
+    /// Maximum resolution budget (each video fits within this box preserving aspect ratio)
+    let maxWidth: Int
+    let maxHeight: Int
 
     /// Target frame count
     let numFrames: Int
@@ -51,6 +53,8 @@ class VideoDataset {
         let videoPath: String
         let captionPath: String
         let filename: String
+        /// Path to a conditioning image (.png alongside the video), if present
+        let imagePath: String?
     }
 
     init(
@@ -61,8 +65,8 @@ class VideoDataset {
         extractAudio: Bool = false,
         audioSampleRate: Int = 16000
     ) throws {
-        self.width = width
-        self.height = height
+        self.maxWidth = width
+        self.maxHeight = height
         self.numFrames = numFrames
         self.extractAudio = extractAudio
         self.audioSampleRate = audioSampleRate
@@ -89,10 +93,16 @@ class VideoDataset {
                 continue
             }
 
+            // Check for optional I2V conditioning image (baseName.png alongside the video)
+            let imageName = baseName + ".png"
+            let imagePath = (directory as NSString).appendingPathComponent(imageName)
+            let resolvedImagePath: String? = fm.fileExists(atPath: imagePath) ? imagePath : nil
+
             foundSamples.append(SampleInfo(
                 videoPath: (directory as NSString).appendingPathComponent(file),
                 captionPath: captionPath,
-                filename: file
+                filename: file,
+                imagePath: resolvedImagePath
             ))
         }
 
@@ -111,8 +121,11 @@ class VideoDataset {
         let caption = try String(contentsOfFile: info.captionPath, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Extract video frames
-        let frames = try await extractFrames(from: info.videoPath)
+        // Compute per-video resolution (fit within budget, preserve aspect ratio)
+        let res = try await targetResolution(forVideoAt: info.videoPath)
+
+        // Extract video frames at the computed resolution
+        let frames = try await extractFrames(from: info.videoPath, width: res.width, height: res.height)
 
         // Extract audio if needed
         var audioWaveform: MLXArray? = nil
@@ -120,10 +133,17 @@ class VideoDataset {
             audioWaveform = try await extractAudioWaveform(from: info.videoPath)
         }
 
+        // Load I2V conditioning image if available (same resolution as video)
+        var image: MLXArray? = nil
+        if let imgPath = info.imagePath {
+            image = try loadImageFrame(from: imgPath, width: res.width, height: res.height)
+        }
+
         return TrainingSample(
             frames: frames,
             caption: caption,
             audioWaveform: audioWaveform,
+            image: image,
             filename: info.filename
         )
     }
@@ -131,10 +151,58 @@ class VideoDataset {
     /// Number of samples
     var count: Int { samples.count }
 
+    // MARK: - Resolution Helpers
+
+    /// Compute target resolution for a video, fitting within the max budget and preserving aspect ratio.
+    /// Both dimensions are rounded down to the nearest multiple of 32 (required by VAE).
+    func targetResolution(forVideoAt path: String) async throws -> (width: Int, height: Int) {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard let track = tracks.first else {
+            throw TrainingError.datasetError("No video track in \(path)")
+        }
+        let size = try await track.load(.naturalSize)
+        let transform = try await track.load(.preferredTransform)
+        // Apply transform to get the actual displayed dimensions (handles rotation)
+        let transformed = CGRectApplyAffineTransform(
+            CGRect(origin: .zero, size: size), transform
+        )
+        let srcW = abs(transformed.width)
+        let srcH = abs(transformed.height)
+
+        return Self.fitResolution(
+            srcWidth: srcW, srcHeight: srcH,
+            maxWidth: maxWidth, maxHeight: maxHeight
+        )
+    }
+
+    /// Fit source dimensions into a max budget, preserving aspect ratio, rounding to 32.
+    static func fitResolution(
+        srcWidth: CGFloat, srcHeight: CGFloat,
+        maxWidth: Int, maxHeight: Int
+    ) -> (width: Int, height: Int) {
+        let scale = min(
+            CGFloat(maxWidth) / srcWidth,
+            CGFloat(maxHeight) / srcHeight
+        )
+        // Round down to nearest 32 (minimum 32)
+        let w = max(32, Int(srcWidth * scale) / 32 * 32)
+        let h = max(32, Int(srcHeight * scale) / 32 * 32)
+        return (w, h)
+    }
+
+    // MARK: - Image Loading
+
+    /// Load a single image file as a (1, 3, 1, H, W) tensor in [-1, 1].
+    /// Center-cropped and resized to the given dimensions.
+    private func loadImageFrame(from path: String, width: Int, height: Int) throws -> MLXArray {
+        return try loadImage(from: path, width: width, height: height)
+    }
+
     // MARK: - Frame Extraction
 
     /// Extract frames from a video file using AVFoundation
-    private func extractFrames(from path: String) async throws -> MLXArray {
+    private func extractFrames(from path: String, width: Int, height: Int) async throws -> MLXArray {
         let url = URL(fileURLWithPath: path)
         let asset = AVURLAsset(url: url)
 
@@ -150,12 +218,11 @@ class VideoDataset {
             frameTimes.append(CMTime(seconds: t, preferredTimescale: 600))
         }
 
-        // Set up image generator
+        // Set up image generator (no maximumSize — we handle resize ourselves)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = CMTime(seconds: 0.05, preferredTimescale: 600)
         generator.requestedTimeToleranceAfter = CMTime(seconds: 0.05, preferredTimescale: 600)
-        generator.maximumSize = CGSize(width: width, height: height)
 
         // Extract frames
         var frameArrays: [MLXArray] = []
@@ -164,13 +231,36 @@ class VideoDataset {
         for time in frameTimes {
             let (image, _) = try await generator.image(at: time)
 
-            // Convert CGImage to MLXArray (3, H, W) in [-1, 1]
+            // Convert CGImage to CIImage for processing
             let ciImage = CIImage(cgImage: image)
 
-            // Render to exact target size
-            let scaleX = CGFloat(width) / ciImage.extent.width
-            let scaleY = CGFloat(height) / ciImage.extent.height
-            let scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            // Center-crop to target aspect ratio, then resize (preserves proportions)
+            let srcW = ciImage.extent.width
+            let srcH = ciImage.extent.height
+            let targetAspect = CGFloat(width) / CGFloat(height)
+            let srcAspect = srcW / srcH
+
+            let cropRect: CGRect
+            if srcAspect > targetAspect {
+                // Source is wider — crop horizontally
+                let cropW = srcH * targetAspect
+                let offsetX = (srcW - cropW) / 2
+                cropRect = CGRect(x: offsetX, y: 0, width: cropW, height: srcH)
+            } else {
+                // Source is taller — crop vertically
+                let cropH = srcW / targetAspect
+                let offsetY = (srcH - cropH) / 2
+                cropRect = CGRect(x: 0, y: offsetY, width: srcW, height: cropH)
+            }
+
+            let cropped = ciImage.cropped(to: cropRect)
+            // Translate to origin after crop, then scale to target size
+            let originImage = cropped.transformed(by: CGAffineTransform(
+                translationX: -cropRect.origin.x, y: -cropRect.origin.y
+            ))
+            let scaleX = CGFloat(width) / cropRect.width
+            let scaleY = CGFloat(height) / cropRect.height
+            let scaledImage = originImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
 
             // Get pixel data as RGBA
             let w = width

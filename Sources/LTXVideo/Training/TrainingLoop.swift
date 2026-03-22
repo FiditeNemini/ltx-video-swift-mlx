@@ -152,13 +152,21 @@ public class LoRATrainer {
         let transformerRef = try await pipeline.getTransformerForTraining()
         let transformer = transformerRef.module
 
-        print("Injecting LoRA (rank=\(config.rank), alpha=\(config.alpha))...")
+        // Configure selective LoRA (last N blocks only)
+        let totalBlocks = 48  // LTX-2.3 transformer block count
+        let loraBlockCount = config.loraBlocks > 0 ? min(config.loraBlocks, totalBlocks) : totalBlocks
+        let frozenBlockCount = totalBlocks - loraBlockCount
+        if let t = transformer as? LTXTransformer { t.frozenBlockCount = frozenBlockCount }
+        if let t = transformer as? LTX2Transformer { t.frozenBlockCount = frozenBlockCount }
+
+        print("Injecting LoRA (rank=\(config.rank), alpha=\(config.alpha), blocks=\(loraBlockCount)/\(totalBlocks))...")
         let injection = LoRAInjector.inject(
             into: transformer,
             rank: config.rank,
             alpha: config.alpha,
             includeAudio: false,
-            includeFFN: config.includeFFN
+            includeFFN: config.includeFFN,
+            lastNBlocks: config.loraBlocks
         )
         print("Injected \(injection.injectedCount) LoRA layers")
 
@@ -166,7 +174,6 @@ public class LoRATrainer {
         let trainableParams = transformer.trainableParameters().flattenedValues()
         let totalTrainableElements = trainableParams.reduce(0) { $0 + $1.size }
         print("Trainable parameters: \(totalTrainableElements) elements (\(trainableParams.count) tensors)")
-
 
         guard !trainableParams.isEmpty else {
             throw TrainingError.modelError(
@@ -253,10 +260,19 @@ public class LoRATrainer {
         print()
         fflush(stdout)
 
-
         // Create loss+grad function using valueAndGrad(model:_:) with [MLXArray] signature
         // Pack all inputs into an [MLXArray] and unpack inside the closure
         // latentShape is passed via the arrays to allow per-sample shapes from cache
+        //
+        // arrays layout:
+        //   [0] videoLatent5D  (1, C, T, H, W)
+        //   [1] promptEmbeddings
+        //   [2] promptMask
+        //   [3] latentFrames   (Int32 scalar)
+        //   [4] latentHeight   (Int32 scalar)
+        //   [5] latentWidth    (Int32 scalar)
+        //   [6] hasI2V         (Int32 scalar: 0 or 1)
+        //   [7] imageLatent5D  (1, C, 1, H, W) — only meaningful when hasI2V == 1
         let lossGradFn = valueAndGrad(model: transformer) {
             (model: Module, arrays: [MLXArray]) -> [MLXArray] in
             // Latent from cache is 5D (B,C,T,H,W) — patchify to 3D (B, T*H*W, C)
@@ -264,29 +280,62 @@ public class LoRATrainer {
             let videoLatent5D = arrays[0]
             let videoLatent = patchify(videoLatent5D)
             let promptEmbeddings = arrays[1]
-            let promptMask = arrays[2]
+            // arrays[2] promptMask — currently unused in loss (contextMask=nil matches inference)
             let lFrames = Int(arrays[3].item(Int32.self))
             let lHeight = Int(arrays[4].item(Int32.self))
             let lWidth = Int(arrays[5].item(Int32.self))
+            let isI2V = arrays[6].item(Int32.self) != 0
             let batchSize = videoLatent.dim(0)
 
             // Sample random sigma — flow-matching noise schedule
             let sigma = MLXRandom.uniform(0..<1, [batchSize, 1]).asType(.float32)
             let videoNoise = MLXRandom.normal(videoLatent.shape).asType(videoLatent.dtype)
             let sigmaVideo = sigma.asType(videoLatent.dtype)
-            let noisyVideo = (1 - sigmaVideo) * videoLatent + sigmaVideo * videoNoise
-            let sigmaFlat = sigma.squeezed(axis: 1)
+
+            // Build the noisy latent and timestep.
+            // I2V: frame 0 tokens stay CLEAN (sigma=0), all other frames are noised.
+            let noisyVideo: MLXArray
+            let videoTimesteps: MLXArray  // shape (batchSize,) for T2V or (batchSize, totalTokens) for I2V
+
+            if isI2V {
+                let tokensPerFrame = lHeight * lWidth
+                let otherFrames = lFrames - 1
+
+                // Noise only frames 1..N-1; frame 0 stays clean
+                let cleanFrame0 = videoLatent[0..., 0..<tokensPerFrame, 0...]   // (B, tpf, C)
+                let otherLatent = videoLatent[0..., tokensPerFrame..., 0...]     // (B, rest, C)
+                let otherNoise = videoNoise[0..., tokensPerFrame..., 0...]
+                let sigmaOther = sigma.asType(otherLatent.dtype)
+                let noisedOther = (1 - sigmaOther) * otherLatent + sigmaOther * otherNoise
+                noisyVideo = MLX.concatenated([cleanFrame0, noisedOther], axis: 1)
+
+                // Per-token timestep: frame 0 = 0, other frames = sigma
+                let frame0Ts = MLXArray.zeros([batchSize, tokensPerFrame]).asType(.float32)
+                let sigmaExpanded = MLX.broadcast(sigma, to: [batchSize, otherFrames * tokensPerFrame])
+                videoTimesteps = MLX.concatenated([frame0Ts, sigmaExpanded], axis: 1)
+            } else {
+                noisyVideo = (1 - sigmaVideo) * videoLatent + sigmaVideo * videoNoise
+                videoTimesteps = sigma.squeezed(axis: 1)  // (batchSize,)
+            }
+
+            // The flow-matching target: v = noise - clean_latent
+            // We compute the target over ALL tokens (including clean frame 0 for I2V,
+            // which is safe because its loss contribution reflects the clean velocity).
+            // Using the full noisy latent keeps gradients flowing consistently.
+            let sigmaFlat = sigma.squeezed(axis: 1)  // (batchSize,) for use as scalar timestep
 
             if let ltx2 = model as? LTX2Transformer {
                 // LTX2 requires both video+audio inputs; pass zero audio for video-only training
+                // Audio timestep = 0 disables cross-modal gates, preventing audio pollution
                 let dummyAudioLatent = MLXArray.zeros([batchSize, 1, 128]).asType(DType.bfloat16)
+                let zeroTimestep = MLXArray.zeros([batchSize]).asType(sigmaFlat.dtype)
                 let (predVideo, _) = ltx2(
                     videoLatent: noisyVideo.asType(DType.bfloat16),
                     audioLatent: dummyAudioLatent,
                     videoContext: promptEmbeddings,
-                    audioContext: promptEmbeddings,
-                    videoTimesteps: sigmaFlat,
-                    audioTimesteps: sigmaFlat,
+                    audioContext: MLXArray.zeros([batchSize, 1, ltx2.config.audioInnerDim]).asType(promptEmbeddings.dtype),
+                    videoTimesteps: videoTimesteps,
+                    audioTimesteps: zeroTimestep,
                     videoContextMask: nil,
                     audioContextMask: nil,
                     videoLatentShape: (lFrames, lHeight, lWidth),
@@ -299,8 +348,8 @@ public class LoRATrainer {
                 let predicted = ltx(
                     latent: noisyVideo.asType(DType.bfloat16),
                     context: promptEmbeddings,
-                    timesteps: sigmaFlat,
-                    contextMask: promptMask,
+                    timesteps: videoTimesteps,
+                    contextMask: nil,
                     latentShape: (lFrames, lHeight, lWidth)
                 )
                 let target = (videoNoise - videoLatent).asType(predicted.dtype)
@@ -373,6 +422,12 @@ public class LoRATrainer {
                     throw TrainingError.datasetError("No cached samples available")
                 }
 
+                // arrays[6] hasI2V flag, arrays[7] imageLatent placeholder or actual
+                let hasI2V = sample.imageLatent != nil
+                // Provide a zero-shape placeholder when there is no image latent so
+                // the arrays list always has the same length (required by valueAndGrad).
+                let imageLatentInput: MLXArray = sample.imageLatent
+                    ?? MLXArray.zeros([1, 128, 1, sample.latentHeight, sample.latentWidth])
                 let inputs: [MLXArray] = [
                     sample.videoLatent,
                     sample.promptEmbeddings,
@@ -380,6 +435,8 @@ public class LoRATrainer {
                     MLXArray(Int32(sample.latentFrames)),
                     MLXArray(Int32(sample.latentHeight)),
                     MLXArray(Int32(sample.latentWidth)),
+                    MLXArray(Int32(hasI2V ? 1 : 0)),
+                    imageLatentInput,
                 ]
 
                 let (losses, grads) = lossGradFn(transformer, inputs)
@@ -459,6 +516,17 @@ public class LoRATrainer {
                     model: transformer, step: step + 1, loss: accumLoss,
                     state: &trainingState
                 )
+                // Generate preview video using the saved LoRA weights (subprocess)
+                if config.generatePreview, let prompt = config.previewPrompt {
+                    let loraPath = (outputDir as NSString).appendingPathComponent("checkpoint-step\(step + 1).safetensors")
+                    let previewPath = (outputDir as NSString).appendingPathComponent("preview-step\(step + 1).mp4")
+                    generatePreviewVideo(
+                        prompt: prompt,
+                        loraPath: loraPath,
+                        outputPath: previewPath,
+                        config: config
+                    )
+                }
             }
         }
 
@@ -489,6 +557,76 @@ public class LoRATrainer {
     }
 
     // MARK: - Private Helpers
+
+    /// Run a quick I2V/T2V preview by invoking the CLI binary as a subprocess.
+    ///
+    /// The preview uses the distilled model (fast, 8 steps) with the just-saved
+    /// LoRA checkpoint.  We locate the binary that is currently running via
+    /// `CommandLine.arguments[0]` so this works regardless of installation path.
+    private func generatePreviewVideo(
+        prompt: String,
+        loraPath: String,
+        outputPath: String,
+        config: LoRATrainingConfig
+    ) {
+        // Locate the running binary (the CLI itself)
+        let binaryPath = CommandLine.arguments[0]
+        guard FileManager.default.fileExists(atPath: binaryPath) else {
+            print("  [preview] Binary not found at \(binaryPath), skipping preview")
+            return
+        }
+
+        // Use two-stage distilled pipeline for fast previews
+        var args: [String] = [
+            "generate", prompt,
+            "--width", "512",
+            "--height", "512",
+            "--frames", "65",
+            "--seed", "42",
+            "--lora", loraPath,
+            "--output", outputPath,
+        ]
+        // Forward I2V image if configured
+        if let imagePath = config.previewImage {
+            args += ["--image", imagePath]
+        }
+        // Forward model / weights paths so the subprocess can find models
+        if let modelsDir = config.modelsDir {
+            args += ["--models-dir", modelsDir]
+        }
+        if let gemmaPath = config.gemmaPath {
+            args += ["--gemma-path", gemmaPath]
+        }
+        if let ltxWeights = config.ltxWeightsPath {
+            args += ["--ltx-weights", ltxWeights]
+        }
+        if let token = config.hfToken {
+            args += ["--hf-token", token]
+        }
+
+        print("  [preview] Generating preview: \(outputPath)")
+        fflush(stdout)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binaryPath)
+        process.arguments = args
+        // Suppress subprocess output to avoid polluting training logs
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                print("  [preview] Saved: \(outputPath)")
+            } else {
+                print("  [preview] Preview generation failed (exit \(process.terminationStatus)), continuing training")
+            }
+        } catch {
+            print("  [preview] Could not launch preview process: \(error.localizedDescription)")
+        }
+        fflush(stdout)
+    }
 
     private func saveCheckpoint(
         model: Module,

@@ -211,9 +211,32 @@ func loadImage(from path: String, width: Int, height: Int) throws -> MLXArray {
         throw LTXError.fileNotFound("Cannot load image from: \(path)")
     }
 
-    LTXDebug.log("Loaded image: \(cgImage.width)x\(cgImage.height) -> resizing to \(width)x\(height)")
+    LTXDebug.log("Loaded image: \(cgImage.width)x\(cgImage.height) -> center-crop+resize to \(width)x\(height)")
 
-    // Resize to target dimensions using CoreGraphics
+    // Center-crop to target aspect ratio, then resize (preserves proportions)
+    let srcW = cgImage.width
+    let srcH = cgImage.height
+    let targetAspect = Double(width) / Double(height)
+    let srcAspect = Double(srcW) / Double(srcH)
+
+    let cropRect: CGRect
+    if srcAspect > targetAspect {
+        // Source is wider — crop horizontally
+        let cropW = Int(Double(srcH) * targetAspect)
+        let offsetX = (srcW - cropW) / 2
+        cropRect = CGRect(x: offsetX, y: 0, width: cropW, height: srcH)
+    } else {
+        // Source is taller — crop vertically
+        let cropH = Int(Double(srcW) / targetAspect)
+        let offsetY = (srcH - cropH) / 2
+        cropRect = CGRect(x: 0, y: offsetY, width: srcW, height: cropH)
+    }
+
+    guard let croppedImage = cgImage.cropping(to: cropRect) else {
+        throw LTXError.videoProcessingFailed("Failed to center-crop image")
+    }
+
+    // Resize cropped image to exact target dimensions
     let colorSpace = CGColorSpaceCreateDeviceRGB()
     guard let context = CGContext(
         data: nil,
@@ -228,7 +251,7 @@ func loadImage(from path: String, width: Int, height: Int) throws -> MLXArray {
     }
 
     context.interpolationQuality = .high
-    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    context.draw(croppedImage, in: CGRect(x: 0, y: 0, width: width, height: height))
 
     guard let data = context.data else {
         throw LTXError.videoProcessingFailed("Failed to get pixel data from resized image")

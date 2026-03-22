@@ -47,6 +47,9 @@ public struct LoRATrainingConfig: Sendable {
     /// Transformer quantization for QLoRA (bf16, qint8, int4)
     public var transformerQuant: String
 
+    /// Number of last transformer blocks to apply LoRA to (0 = all blocks)
+    public var loraBlocks: Int
+
     /// Gradient accumulation steps (effective batch size = gradientAccumulationSteps)
     public var gradientAccumulationSteps: Int
 
@@ -73,6 +76,17 @@ public struct LoRATrainingConfig: Sendable {
 
     /// LTX weights path
     public var ltxWeightsPath: String?
+
+    /// Text prompt used to generate a preview video after each checkpoint.
+    /// Set to `nil` to disable preview generation (default).
+    public var previewPrompt: String?
+
+    /// Optional image path for I2V preview generation at checkpoints.
+    public var previewImage: String?
+
+    /// Whether to generate a preview video at each checkpoint.
+    /// Automatically `true` when `previewPrompt` is non-nil.
+    public var generatePreview: Bool { previewPrompt != nil }
 
     // MARK: - Memory Presets (for 22B model)
 
@@ -119,6 +133,7 @@ public struct LoRATrainingConfig: Sendable {
         audioLossWeight: Float = 0.5,
         includeFFN: Bool = false,
         transformerQuant: String = "bf16",
+        loraBlocks: Int = 0,
         gradientAccumulationSteps: Int = 1,
         maxGradNorm: Float = 1.0,
         warmupSteps: Int = 100,
@@ -127,7 +142,9 @@ public struct LoRATrainingConfig: Sendable {
         hfToken: String? = nil,
         modelsDir: String? = nil,
         gemmaPath: String? = nil,
-        ltxWeightsPath: String? = nil
+        ltxWeightsPath: String? = nil,
+        previewPrompt: String? = nil,
+        previewImage: String? = nil
     ) {
         self.rank = rank
         self.alpha = alpha ?? Float(rank)
@@ -143,6 +160,7 @@ public struct LoRATrainingConfig: Sendable {
         self.audioLossWeight = audioLossWeight
         self.includeFFN = includeFFN
         self.transformerQuant = transformerQuant
+        self.loraBlocks = loraBlocks
         self.gradientAccumulationSteps = gradientAccumulationSteps
         self.maxGradNorm = maxGradNorm
         self.warmupSteps = warmupSteps
@@ -152,6 +170,8 @@ public struct LoRATrainingConfig: Sendable {
         self.modelsDir = modelsDir
         self.gemmaPath = gemmaPath
         self.ltxWeightsPath = ltxWeightsPath
+        self.previewPrompt = previewPrompt
+        self.previewImage = previewImage
     }
 
     /// Validate configuration

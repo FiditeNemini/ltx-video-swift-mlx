@@ -20,6 +20,11 @@ import MLXNN
 ///
 /// Weight keys match Python Diffusers `LTX2VideoTransformer3DModel`.
 class LTX2Transformer: Module {
+    /// Number of leading transformer blocks that are frozen (no LoRA).
+    /// When > 0, stopGradient is inserted after block `frozenBlockCount - 1`
+    /// to prevent backward graph from tracing into frozen blocks.
+    var frozenBlockCount: Int = 0
+
     let config: LTXTransformerConfig
     let ropeType: LTXRopeType
     let normEps: Float
@@ -421,17 +426,24 @@ class LTX2Transformer: Module {
 
         // --- Process through transformer blocks ---
         for (i, block) in transformerBlocks.enumerated() {
-            (videoArgs, audioArgs) = block(videoArgs, audio: audioArgs)
+                (videoArgs, audioArgs) = block(videoArgs, audio: audioArgs)
 
-            if memoryOptimization.evalFrequency > 0
-                && (i + 1) % memoryOptimization.evalFrequency == 0 {
-                eval(videoArgs.x, audioArgs.x)
-                if memoryOptimization.clearCacheOnEval {
+                // Cut backward graph after last frozen block (selective LoRA)
+                if frozenBlockCount > 0 && i == frozenBlockCount - 1 {
+                    videoArgs.x = stopGradient(videoArgs.x)
+                    audioArgs.x = stopGradient(audioArgs.x)
+                    eval(videoArgs.x, audioArgs.x)
                     Memory.clearCache()
                 }
-            }
 
-        }
+                if memoryOptimization.evalFrequency > 0
+                    && (i + 1) % memoryOptimization.evalFrequency == 0 {
+                    eval(videoArgs.x, audioArgs.x)
+                    if memoryOptimization.clearCacheOnEval {
+                        Memory.clearCache()
+                    }
+                }
+            }
         eval(videoArgs.x, audioArgs.x)
 
         // --- Video output ---

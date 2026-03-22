@@ -49,6 +49,9 @@ struct Train: AsyncParsableCommand {
     @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, int4")
     var transformerQuant: String = "bf16"
 
+    @Option(name: .long, help: "Number of last transformer blocks to apply LoRA to (0 = all, default)")
+    var loraBlocks: Int = 0
+
     @Option(name: .long, help: "Gradient accumulation steps (default: 1)")
     var gradAccum: Int = 1
 
@@ -94,6 +97,18 @@ struct Train: AsyncParsableCommand {
     @Option(name: .long, help: "Resume from a specific checkpoint step")
     var resumeStep: Int?
 
+    @Option(
+        name: .long,
+        help: "Generate a preview video at each checkpoint using this prompt. Runs the distilled model as a subprocess (fast, 8 steps). Omit to disable preview generation."
+    )
+    var previewPrompt: String?
+
+    @Option(
+        name: .long,
+        help: "Input image for I2V preview generation at checkpoints (used with --preview-prompt)."
+    )
+    var previewImage: String?
+
     mutating func run() async throws {
         print("LTX-2 LoRA Training")
         print("===================")
@@ -136,6 +151,7 @@ struct Train: AsyncParsableCommand {
         config.audioLossWeight = audioLossWeight
         config.includeFFN = includeFFN
         config.transformerQuant = transformerQuant
+        config.loraBlocks = loraBlocks
         config.gradientAccumulationSteps = gradAccum
         config.maxGradNorm = maxGradNorm
         config.warmupSteps = warmupSteps
@@ -145,6 +161,8 @@ struct Train: AsyncParsableCommand {
         config.modelsDir = modelsDir
         config.gemmaPath = gemmaPath
         config.ltxWeightsPath = ltxWeights
+        config.previewPrompt = previewPrompt
+        config.previewImage = previewImage
 
         // Print training plan summary
         print()
@@ -157,10 +175,19 @@ struct Train: AsyncParsableCommand {
         print("  Steps: \(config.maxSteps), Save every: \(config.saveEvery)")
         print("  Quant: \(config.transformerQuant)")
         print("  Targets: attention\(config.includeFFN ? " + FFN" : " only")")
+        if config.loraBlocks > 0 {
+            print("  LoRA blocks: last \(config.loraBlocks) of 48")
+        }
         print("  Grad accumulation: \(config.gradientAccumulationSteps)")
         print("  Grad clip norm: \(config.maxGradNorm > 0 ? String(format: "%.1f", config.maxGradNorm) : "disabled")")
         if let trigger = config.triggerWord {
             print("  Trigger word: \(trigger)")
+        }
+        if let preview = config.previewPrompt {
+            print("  Preview prompt: \(preview)")
+            if let img = config.previewImage {
+                print("  Preview image: \(img)")
+            }
         }
         print()
 

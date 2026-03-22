@@ -29,6 +29,9 @@ struct CachedSample: Sendable {
     let audioMask: MLXArray?
     /// Audio latent frames count — optional
     let audioNumFrames: Int?
+    /// I2V conditioning image latent (1, 128, 1, H/32, W/32) — optional.
+    /// Present when a .png conditioning image exists alongside the source video.
+    let imageLatent: MLXArray?
     /// Source filename
     let filename: String
 }
@@ -94,8 +97,18 @@ class LatentCache {
             let latentH = frameH / 32
             let latentW = frameW / 32
 
+            // Encode I2V conditioning image if present
+            var imageLatent: MLXArray? = nil
+            if let imageFrames = sample.image {
+                // imageFrames is (1, 3, 1, H, W) — encode as a single-frame video
+                let imgLatent = try await pipeline.encodeVideoLatents(frames: imageFrames)
+                eval(imgLatent)
+                imageLatent = imgLatent
+                LTXDebug.log("  Image latent encoded: \(imgLatent.shape)")
+            }
+
             // Build save dictionary with shape metadata
-            let saveDict: [String: MLXArray] = [
+            var saveDict: [String: MLXArray] = [
                 "video_latent": videoLatent,
                 "prompt_embeddings": textResult.embeddings,
                 "prompt_mask": textResult.mask,
@@ -103,6 +116,9 @@ class LatentCache {
                 "latent_height": MLXArray(Int32(latentH)),
                 "latent_width": MLXArray(Int32(latentW)),
             ]
+            if let imgLatent = imageLatent {
+                saveDict["image_latent"] = imgLatent
+            }
 
             // Save to disk
             let url = URL(fileURLWithPath: cachePath)
@@ -161,6 +177,7 @@ class LatentCache {
                 audioEmbeddings: nil,
                 audioMask: nil,
                 audioNumFrames: nil,
+                imageLatent: arrays["image_latent"],
                 filename: (file as NSString).deletingPathExtension
             )
             cachedSamples.append(sample)
@@ -188,20 +205,28 @@ class LatentCache {
     /// Whether the cache is populated
     var isEmpty: Bool { cachedSamples.isEmpty }
 
-    /// Validate that cached sample shapes match training config
+    /// Validate that cached sample shapes are valid.
+    ///
+    /// With per-video aspect ratio preservation, each sample may have different
+    /// spatial dimensions. We only check that frame count matches and that
+    /// spatial dimensions are within the configured budget.
     func validate(config: LoRATrainingConfig) throws {
         let expectedFrames = (config.numFrames - 1) / 8 + 1
-        let expectedHeight = config.height / 32
-        let expectedWidth = config.width / 32
+        let maxLatentH = config.height / 32
+        let maxLatentW = config.width / 32
 
         for sample in cachedSamples {
-            if sample.latentFrames != expectedFrames ||
-               sample.latentHeight != expectedHeight ||
-               sample.latentWidth != expectedWidth {
+            if sample.latentFrames != expectedFrames {
                 throw TrainingError.datasetError(
-                    "Cache shape mismatch for \(sample.filename): " +
-                    "cached (\(sample.latentFrames)×\(sample.latentHeight)×\(sample.latentWidth)) " +
-                    "vs config (\(expectedFrames)×\(expectedHeight)×\(expectedWidth)). " +
+                    "Cache frame count mismatch for \(sample.filename): " +
+                    "cached \(sample.latentFrames) vs config \(expectedFrames). " +
+                    "Delete the latent_cache directory and re-run to rebuild."
+                )
+            }
+            if sample.latentHeight > maxLatentH || sample.latentWidth > maxLatentW {
+                throw TrainingError.datasetError(
+                    "Cache spatial size exceeds budget for \(sample.filename): " +
+                    "cached \(sample.latentHeight)×\(sample.latentWidth) vs max \(maxLatentH)×\(maxLatentW). " +
                     "Delete the latent_cache directory and re-run to rebuild."
                 )
             }

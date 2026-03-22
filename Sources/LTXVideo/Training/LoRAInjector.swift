@@ -34,6 +34,7 @@ struct LoRAInjector {
     /// 2. Find all matching Linear leaf modules
     /// 3. Replace them with LoRALinear wrappers
     /// 4. Only loraA/loraB are trainable after injection
+    /// 5. If lastNBlocks > 0, freeze LoRA in early blocks (only last N are trainable)
     ///
     /// - Parameters:
     ///   - model: The transformer model to inject into
@@ -41,6 +42,10 @@ struct LoRAInjector {
     ///   - alpha: LoRA alpha (default: same as rank)
     ///   - includeAudio: Whether to target audio layers too
     ///   - includeFFN: Whether to target FFN layers
+    ///   - lastNBlocks: Only train LoRA in the last N transformer blocks (0 = all blocks).
+    ///     LoRA is injected into all blocks for structural compatibility, but early blocks
+    ///     are frozen. Combined with `stopGradient` in the transformer, this prevents
+    ///     backward from tracing through frozen blocks, saving memory.
     /// - Returns: Injection result with count and paths
     @discardableResult
     static func inject(
@@ -48,7 +53,8 @@ struct LoRAInjector {
         rank: Int = 16,
         alpha: Float? = nil,
         includeAudio: Bool = false,
-        includeFFN: Bool = true
+        includeFFN: Bool = true,
+        lastNBlocks: Int = 0
     ) -> InjectionResult {
         // Step 1: Freeze the entire model
         model.freeze()
@@ -70,7 +76,28 @@ struct LoRAInjector {
 
         let injectedPaths = updates.map { $0.0 }
 
-        // Step 4: Verify — only LoRA parameters should be trainable
+        // Step 4: Freeze LoRA in early blocks (selective training)
+        var frozenLoRACount = 0
+        if lastNBlocks > 0 {
+            var totalBlocks = 0
+            for path in injectedPaths {
+                if let idx = extractBlockIndex(from: path), idx + 1 > totalBlocks {
+                    totalBlocks = idx + 1
+                }
+            }
+            let firstTrainableBlock = totalBlocks - min(lastNBlocks, totalBlocks)
+            for (path, module) in model.leafModules().flattened() {
+                if let lora = module as? LoRALinear,
+                   let idx = extractBlockIndex(from: path),
+                   idx < firstTrainableBlock {
+                    lora.freeze()
+                    frozenLoRACount += 1
+                }
+            }
+            LTXDebug.log("LoRA selective: \(injectedPaths.count) total, \(frozenLoRACount) frozen (blocks 0..<\(firstTrainableBlock)), \(injectedPaths.count - frozenLoRACount) trainable (blocks \(firstTrainableBlock)..<\(totalBlocks))")
+        }
+
+        // Step 5: Verify — only LoRA parameters should be trainable
         let trainableCount = model.trainableParameters().flattenedValues().count
         LTXDebug.log("LoRA injected: \(injectedPaths.count) layers, \(trainableCount) trainable parameter tensors")
 
@@ -144,6 +171,15 @@ struct LoRAInjector {
             return String(path[path.index(after: lastDot)...])
         }
         return path
+    }
+
+    /// Extract the transformer block index from a module path
+    /// e.g. "transformer_blocks.42.attn1.to_q" → 42
+    private static func extractBlockIndex(from path: String) -> Int? {
+        guard let range = path.range(of: "transformer_blocks.") else { return nil }
+        let afterPrefix = path[range.upperBound...]
+        guard let dotIdx = afterPrefix.firstIndex(of: ".") else { return nil }
+        return Int(afterPrefix[..<dotIdx])
     }
 
     /// Check if a module path should be targeted for LoRA injection
