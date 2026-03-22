@@ -571,18 +571,15 @@ extension VideoExporter {
         let height = videoTensor.dim(1)
         let width = videoTensor.dim(2)
 
+        // Batch convert entire tensor to uint8 in a single GPU operation
+        let allScaled = MLX.clip(videoTensor, min: 0, max: 1) * 255
+        let allUint8 = allScaled.asType(.uint8)
+        MLX.eval(allUint8)  // Single eval for all frames
+
+        // CPU loop just extracts already-evaluated frames
         for f in 0..<numFrames {
-            // Extract frame (H, W, C)
-            let frame = videoTensor[f]
-
-            // Convert to UInt8 [0, 255]
-            let clipped = MLX.clip(frame, min: 0, max: 1)
-            let scaled = (clipped * 255).asType(.uint8)
-
-            // Evaluate and get data
-            MLX.eval(scaled)
-
-            if let image = createCGImage(from: scaled, width: width, height: height) {
+            let frame = allUint8[f]
+            if let image = createCGImage(from: frame, width: width, height: height) {
                 frames.append(image)
             }
         }

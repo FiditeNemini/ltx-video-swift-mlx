@@ -282,50 +282,22 @@ class VideoDecoder: Module {
 
         // Conv in
         x = convIn(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After conv_in: \(x.shape), mean=\(x.mean().item(Float.self))")
-        dumpTensor(x, name: "after_conv_in")
+        LTXDebug.log("After conv_in: \(x.shape)")
 
-        // Up blocks
+        // Up blocks — first half (high-channel ops, eval mid-point to bound memory)
         x = upBlocks0(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_0 (res 1024ch×2): \(x.shape)")
-
         x = upBlocks1(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_1 (d2s 2,2,2): \(x.shape)")
-        dumpTensor(x, name: "after_d2s_1")
-
         x = upBlocks2(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_2 (res 512ch×2): \(x.shape)")
-
         x = upBlocks3(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_3 (d2s 2,2,2): \(x.shape)")
-        dumpTensor(x, name: "after_d2s_3")
-
         x = upBlocks4(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_4 (res 512ch×4): \(x.shape)")
+        eval(x)  // Single mid-point eval to bound compute graph
+        Memory.clearCache()
 
+        // Up blocks — second half (lower channels, spatial upsampling)
         x = upBlocks5(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_5 (d2s 2,1,1): \(x.shape)")
-        dumpTensor(x, name: "after_d2s_5")
-
         x = upBlocks6(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_6 (res 256ch×6): \(x.shape)")
-
         x = upBlocks7(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_7 (d2s 1,2,2): \(x.shape)")
-        dumpTensor(x, name: "after_d2s_7")
-
         x = upBlocks8(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After up_blocks_8 (res 128ch×4): \(x.shape)")
 
         // Final norm + activation
         x = vaePixelNorm(x)
@@ -333,15 +305,11 @@ class VideoDecoder: Module {
 
         // Conv out
         x = convOut(x, causal: causal)
-        eval(x)
-        LTXDebug.log("After conv_out: \(x.shape), mean=\(x.mean().item(Float.self))")
-        dumpTensor(x, name: "after_conv_out")
 
         // Unpatchify: (B, 48, T, H, W) -> (B, 3, T, H*4, W*4)
         x = unpatchify(x, patchSizeHW: patchSize, patchSizeT: 1)
-        eval(x)
+        eval(x)  // Single final eval
         LTXDebug.log("After unpatchify: \(x.shape)")
-        dumpTensor(x, name: "after_unpatchify")
 
         return x
     }
@@ -432,8 +400,7 @@ private func decodeWithTemporalTiling(
         LTXDebug.log("  VAE tile \(chunkIdx): latent frames \(start)..<\(end) (\(end - start) frames)")
 
         let decoded = decoder(chunk)
-        eval(decoded)
-        Memory.clearCache()
+        eval(decoded)  // eval per tile (needed to bound memory)
 
         decodedChunks.append(decoded)
         chunkIdx += 1
@@ -441,6 +408,7 @@ private func decodeWithTemporalTiling(
         if end >= totalLatentFrames { break }
         start += stride
     }
+    Memory.clearCache()  // Single clear after all tiles decoded
 
     if decodedChunks.count == 1 {
         // Single chunk — no blending needed
@@ -449,6 +417,15 @@ private func decodeWithTemporalTiling(
         frames = frames[0]
         frames = frames.transposed(1, 2, 3, 0)
         return frames
+    }
+
+    // Pre-compute blend weights once (vectorized, not CPU loop)
+    let blendWeights: MLXArray?
+    if pixelOverlap > 0 {
+        blendWeights = MLX.linspace(Float(0), Float(1), count: pixelOverlap)
+            .reshaped([1, 1, pixelOverlap, 1, 1])
+    } else {
+        blendWeights = nil
     }
 
     // Blend overlapping regions with linear interpolation
@@ -460,13 +437,7 @@ private func decodeWithTemporalTiling(
         let resultFrames = result.dim(2)
         let nextFrames = next.dim(2)
 
-        if pixelOverlap > 0 && pixelOverlap < resultFrames && pixelOverlap < nextFrames {
-            // Create linear blend weights for the overlap region
-            // Shape: (1, 1, pixelOverlap, 1, 1) for broadcasting over (B, C, F, H, W)
-            let weights = MLXArray(
-                (0..<pixelOverlap).map { Float($0) / Float(pixelOverlap) }
-            ).reshaped([1, 1, pixelOverlap, 1, 1])
-
+        if let weights = blendWeights, pixelOverlap < resultFrames && pixelOverlap < nextFrames {
             // Extract overlap regions
             let resultOverlap = result[0..., 0..., (resultFrames - pixelOverlap)..., 0..., 0...]
             let nextOverlap = next[0..., 0..., 0..<pixelOverlap, 0..., 0...]
@@ -482,9 +453,8 @@ private func decodeWithTemporalTiling(
             // No overlap — just concatenate
             result = MLX.concatenated([result, next], axis: 2)
         }
-        eval(result)
-        Memory.clearCache()
     }
+    eval(result)  // Single eval after all blending
 
     LTXDebug.log("VAE tiled output: \(result.shape)")
 

@@ -34,8 +34,14 @@ public struct GenerationProgress: Sendable {
     public enum Phase: String, Sendable {
         /// Main denoising (single-stage or stage 1 of two-stage)
         case denoising = "denoising"
+        /// Spatial upscale between stages
+        case upscaling = "upscaling"
         /// Refinement at full resolution (stage 2 of two-stage)
         case refinement = "refinement"
+        /// VAE decoding latents to pixel frames
+        case decoding = "decoding"
+        /// MP4 video export (H.264 encoding)
+        case exporting = "exporting"
     }
 
     /// Current step within the current phase (0-indexed)
@@ -57,7 +63,12 @@ public struct GenerationProgress: Sendable {
 
     /// Human-readable status, e.g. `"Step 3/11 [denoising] (σ=0.7250)"`
     public var status: String {
-        "Step \(currentStep + 1)/\(totalSteps) [\(phase.rawValue)] (σ=\(String(format: "%.4f", sigma)))"
+        switch phase {
+        case .denoising, .refinement:
+            return "Step \(currentStep + 1)/\(totalSteps) [\(phase.rawValue)] (σ=\(String(format: "%.4f", sigma)))"
+        case .upscaling, .decoding, .exporting:
+            return "[\(phase.rawValue)]"
+        }
     }
 }
 
@@ -823,6 +834,9 @@ public actor LTXPipeline {
         }
 
         // === UPSCALE VIDEO 2x (audio unchanged) ===
+        onProgress?(GenerationProgress(
+            currentStep: totalStepsForProgress, totalSteps: totalStepsForProgress, sigma: 0, phase: .upscaling
+        ))
         LTXDebug.log("=== Upscaling video latent 2x ===")
         let upscaleStart = Date()
 
@@ -1013,6 +1027,9 @@ public actor LTXPipeline {
         }
 
         // Decode video
+        onProgress?(GenerationProgress(
+            currentStep: totalStepsForProgress, totalSteps: totalStepsForProgress, sigma: 0, phase: .decoding
+        ))
         LTXMemoryManager.setPhase(.vaeDecode)
         let vaeStart = Date()
         let videoTensor = decodeVideo(
@@ -1045,6 +1062,11 @@ public actor LTXPipeline {
             audioSampleRate = vocoder.outputSampleRate
             LTXDebug.log("Audio waveform: \(audioWaveform!.shape)")
         }
+
+        // Signal export phase
+        onProgress?(GenerationProgress(
+            currentStep: totalStepsForProgress, totalSteps: totalStepsForProgress, sigma: 0, phase: .exporting
+        ))
 
         LTXMemoryManager.resetCacheLimit()
         timings.capturePeakMemory()
@@ -1362,6 +1384,9 @@ public actor LTXPipeline {
         LTXDebug.log("Stage 1 complete: \(String(format: "%.1f", Date().timeIntervalSince(stage1Start)))s")
 
         // Phase 3: Upscale video 2x (same as generateVideo)
+        onProgress?(GenerationProgress(
+            currentStep: retakeTotalSteps, totalSteps: retakeTotalSteps, sigma: 0, phase: .upscaling
+        ))
         LTXDebug.log("=== Upscaling video latent 2x ===")
         let upscaleStart = Date()
 
@@ -1528,6 +1553,9 @@ public actor LTXPipeline {
         }
 
         // Phase 5: Decode + export
+        onProgress?(GenerationProgress(
+            currentStep: retakeTotalSteps, totalSteps: retakeTotalSteps, sigma: 0, phase: .decoding
+        ))
         LTXMemoryManager.setPhase(.vaeDecode)
         let vaeStart = Date()
         let videoTensor = decodeVideo(
