@@ -335,6 +335,9 @@ struct Retake: AsyncParsableCommand {
     @Flag(name: .long, help: "Enhance prompt using Gemma before generation")
     var enhancePrompt: Bool = false
 
+    @Flag(name: .long, help: "Use distilled model (8 steps, fast) instead of dev (30 steps + CFG)")
+    var distilled: Bool = false
+
     @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
     var transformerQuant: String = "bf16"
 
@@ -368,11 +371,10 @@ struct Retake: AsyncParsableCommand {
             LTXDebug.enableDebugMode()
         }
 
-        print("LTX-2.3 Video Retake (Two-Stage Distilled)")
-        print("============================================")
+        print("LTX-2.3 Video Retake (Single-Stage)")
+        print("====================================")
         print("Source video: \(video)")
         print("Prompt: \(prompt)")
-        print("Strength: \(strength)")
         if let st = startTime, let et = endTime {
             print("Partial retake: \(st)s - \(et)s")
         } else if let st = startTime {
@@ -381,7 +383,7 @@ struct Retake: AsyncParsableCommand {
             print("Partial retake: start - \(et)s")
         }
         print("Output: \(output)")
-        print("Resolution: \(width)x\(height) (stage 1: \(width/2)x\(height/2))")
+        print("Resolution: \(width)x\(height)")
         print("Frames: \(frames)")
         if let seed = seed {
             print("Seed: \(seed)")
@@ -400,10 +402,6 @@ struct Retake: AsyncParsableCommand {
         guard FileManager.default.fileExists(atPath: video) else {
             throw ValidationError("Source video not found: \(video)")
         }
-        guard strength > 0.0 && strength <= 1.0 else {
-            throw ValidationError("Strength must be in (0.0, 1.0]. Got \(strength)")
-        }
-
         // Parse quantization
         guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
             throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
@@ -411,14 +409,15 @@ struct Retake: AsyncParsableCommand {
         let quantConfig = LTXQuantizationConfig(transformer: quantOption)
 
         // Create pipeline
+        let retakeModel: LTXModel = distilled ? .distilled : .dev
         print("Creating pipeline...")
         fflush(stdout)
         let pipeline = LTXPipeline(
-            model: .distilled,
+            model: retakeModel,
             quantization: quantConfig,
             hfToken: hfToken
         )
-        print("Pipeline created")
+        print("Pipeline created (\(retakeModel.rawValue) model)")
         fflush(stdout)
 
         // Load models
@@ -435,12 +434,6 @@ struct Retake: AsyncParsableCommand {
         let loadTime = Date().timeIntervalSince(startLoad)
         print("Models loaded in \(String(format: "%.1f", loadTime))s")
 
-        // Download upscaler
-        print("Downloading upscaler weights (if needed)...")
-        fflush(stdout)
-        let upscalerPath = try await pipeline.downloadUpscalerWeights()
-        print("Upscaler weights ready")
-
         // Build config
         let config = LTXVideoGenerationConfig(
             width: width,
@@ -455,15 +448,15 @@ struct Retake: AsyncParsableCommand {
             retakeEndTime: endTime
         )
 
-        // Generate retake
-        print("\nGenerating retake (strength=\(strength))...")
+        // Generate retake (single-stage, no upscaler needed)
+        print("\nGenerating retake...")
         fflush(stdout)
         let startGen = Date()
 
         let result = try await pipeline.generateRetake(
             prompt: prompt,
             config: config,
-            upscalerWeightsPath: upscalerPath,
+            upscalerWeightsPath: "",  // unused in single-stage retake
             onProgress: { progress in
                 print("  \(progress.status)")
             },
