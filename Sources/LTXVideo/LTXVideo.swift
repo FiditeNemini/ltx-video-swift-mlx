@@ -167,65 +167,242 @@ public enum LTXDebug {
 
 // MARK: - Profiler
 
-/// Performance profiler for LTX-2 operations
-public actor LTXProfiler {
-    /// Shared profiler instance
-    public static let shared = LTXProfiler()
+/// Thread-safe performance profiler for LTX-2 operations.
+///
+/// Bridges with `ProfilingSession` for rich Chrome Trace export and memory timeline tracking.
+/// All state is protected by `NSLock` for safe concurrent access.
+public final class LTXVideoProfiler: @unchecked Sendable {
+    public static let shared = LTXVideoProfiler()
 
-    private var isEnabled = false
-    private var timings: [(name: String, duration: TimeInterval)] = []
-    private var startTimes: [String: Date] = [:]
+    private let lock = NSLock()
+    private var _isEnabled = false
+    private var _activeSession: ProfilingSession? = nil
+    private var timings: [TimingEntry] = []
+    private var stepTimes: [TimeInterval] = []
+    private var stepCount: Int = 0
+    private var totalStepsCount: Int = 0
+    private var activeTimers: [String: Date] = [:]
 
     private init() {}
 
-    /// Enable profiling
+    public var isEnabled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isEnabled
+    }
+
+    public var activeSession: ProfilingSession? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _activeSession
+        }
+        set {
+            lock.lock()
+            _activeSession = newValue
+            lock.unlock()
+        }
+    }
+
     public func enable() {
-        isEnabled = true
+        lock.lock()
+        _isEnabled = true
         timings.removeAll()
-        startTimes.removeAll()
+        activeTimers.removeAll()
+        stepTimes.removeAll()
+        stepCount = 0
+        totalStepsCount = 0
+        lock.unlock()
     }
 
-    /// Disable profiling
     public func disable() {
-        isEnabled = false
+        lock.lock()
+        _isEnabled = false
+        lock.unlock()
     }
 
-    /// Start timing an operation
+    public func setTotalSteps(_ total: Int) {
+        lock.lock()
+        totalStepsCount = total
+        stepCount = 0
+        lock.unlock()
+    }
+
     public func start(_ name: String) {
-        guard isEnabled else { return }
-        startTimes[name] = Date()
+        lock.lock()
+        guard _isEnabled else { lock.unlock(); return }
+        let session = _activeSession
+        activeTimers[name] = Date()
+        lock.unlock()
+
+        let category = ProfilingSession.inferCategory(name)
+        session?.beginPhase(name, category: category)
     }
 
-    /// End timing an operation
     public func end(_ name: String) {
-        guard isEnabled, let startTime = startTimes[name] else { return }
-        let duration = Date().timeIntervalSince(startTime)
-        timings.append((name: name, duration: duration))
-        startTimes.removeValue(forKey: name)
+        let endTime = Date()
+        lock.lock()
+        guard _isEnabled else { lock.unlock(); return }
+        let session = _activeSession
+        guard let startTime = activeTimers[name] else { lock.unlock(); return }
+        activeTimers.removeValue(forKey: name)
+
+        let entry = TimingEntry(
+            name: name,
+            duration: endTime.timeIntervalSince(startTime),
+            startTime: startTime,
+            endTime: endTime
+        )
+        timings.append(entry)
+        lock.unlock()
+
+        let category = ProfilingSession.inferCategory(name)
+        session?.endPhase(name, category: category)
     }
 
-    /// Generate a profiling report
+    public func record(_ name: String, duration: TimeInterval) {
+        let now = Date()
+        lock.lock()
+        guard _isEnabled else { lock.unlock(); return }
+        timings.append(TimingEntry(
+            name: name,
+            duration: duration,
+            startTime: now.addingTimeInterval(-duration),
+            endTime: now
+        ))
+        lock.unlock()
+    }
+
+    public func recordStep(duration: TimeInterval) {
+        lock.lock()
+        guard _isEnabled else { lock.unlock(); return }
+        stepTimes.append(duration)
+        stepCount += 1
+        let currentStep = stepCount
+        let total = totalStepsCount
+        let session = _activeSession
+        lock.unlock()
+
+        session?.recordDenoisingStep(
+            index: currentStep,
+            total: total,
+            durationUs: UInt64(duration * 1_000_000)
+        )
+    }
+
+    @discardableResult
+    public func measure<T>(_ name: String, _ operation: () throws -> T) rethrows -> T {
+        guard isEnabled else { return try operation() }
+
+        let startTime = Date()
+        let result = try operation()
+        let endTime = Date()
+
+        lock.lock()
+        timings.append(TimingEntry(
+            name: name,
+            duration: endTime.timeIntervalSince(startTime),
+            startTime: startTime,
+            endTime: endTime
+        ))
+        lock.unlock()
+
+        return result
+    }
+
+    public func reset() {
+        lock.lock()
+        timings.removeAll()
+        activeTimers.removeAll()
+        stepTimes.removeAll()
+        stepCount = 0
+        totalStepsCount = 0
+        lock.unlock()
+    }
+
+    public func getTimings() -> [TimingEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return timings
+    }
+
+    public func getStepTimes() -> [TimeInterval] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stepTimes
+    }
+
     public func generateReport() -> String {
-        guard !timings.isEmpty else {
-            return "No profiling data available"
+        lock.lock()
+        let currentTimings = timings
+        let currentStepTimes = stepTimes
+        lock.unlock()
+
+        guard !currentTimings.isEmpty else {
+            return "No timing data recorded."
         }
 
-        var report = "=== LTX Performance Report ===\n"
-        var total: TimeInterval = 0
+        let totalTime = currentTimings.map(\.duration).reduce(0, +)
 
-        for (name, duration) in timings {
-            report += String(format: "  %@: %.2fs\n", name, duration)
-            total += duration
+        var report = "\n"
+        report += "  PHASE TIMINGS:\n"
+        report += "  \(String(repeating: "\u{2500}", count: 60))\n"
+
+        for entry in currentTimings {
+            let percentage = totalTime > 0 ? (entry.duration / totalTime) * 100 : 0
+            let bar = String(repeating: "\u{2588}", count: min(20, Int(percentage / 5)))
+            let namePadded = entry.name.padding(toLength: 28, withPad: " ", startingAt: 0)
+            report += "  \(namePadded) \(formatDuration(entry.duration))  \(String(format: "%5.1f", percentage))% \(bar)\n"
         }
 
-        report += String(format: "  Total: %.2fs\n", total)
+        report += "  \(String(repeating: "\u{2500}", count: 60))\n"
+        report += "  \("TOTAL".padding(toLength: 28, withPad: " ", startingAt: 0)) \(formatDuration(totalTime))  100.0%\n"
+
+        if !currentStepTimes.isEmpty {
+            let total = currentStepTimes.reduce(0, +)
+            let average = total / Double(currentStepTimes.count)
+            let minStep = currentStepTimes.min() ?? 0
+            let maxStep = currentStepTimes.max() ?? 0
+
+            report += "\n  DENOISING STEP STATISTICS:\n"
+            report += "  \(String(repeating: "\u{2500}", count: 60))\n"
+            report += "  Steps:              \(currentStepTimes.count)\n"
+            report += "  Average per step:   \(formatDuration(average))\n"
+            report += "  Fastest step:       \(formatDuration(minStep))\n"
+            report += "  Slowest step:       \(formatDuration(maxStep))\n"
+        }
+
+        if let slowest = currentTimings.max(by: { $0.duration < $1.duration }) {
+            let percentage = totalTime > 0 ? (slowest.duration / totalTime) * 100 : 0
+            report += "\n  Bottleneck: \(slowest.name) (\(String(format: "%.1f", percentage))% of total)\n"
+        }
+
         return report
     }
+}
 
-    /// Clear all profiling data
-    public func clear() {
-        timings.removeAll()
-        startTimes.removeAll()
+/// Timing entry for a profiled operation
+public struct TimingEntry: Sendable {
+    public let name: String
+    public let duration: TimeInterval
+    public let startTime: Date
+    public let endTime: Date
+
+    public var durationMs: Double { duration * 1000 }
+
+    public var durationFormatted: String { formatDuration(duration) }
+}
+
+/// Format a duration for display
+internal func formatDuration(_ duration: TimeInterval) -> String {
+    if duration < 1 {
+        return String(format: "%7.1fms", duration * 1000)
+    } else if duration < 60 {
+        return String(format: "%7.2fs ", duration)
+    } else {
+        let minutes = Int(duration / 60)
+        let seconds = duration.truncatingRemainder(dividingBy: 60)
+        return String(format: "%dm %04.1fs", minutes, seconds)
     }
 }
 
