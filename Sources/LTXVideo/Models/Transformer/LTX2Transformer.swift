@@ -285,7 +285,8 @@ class LTX2Transformer: Module {
         videoContextMask: MLXArray? = nil,
         audioContextMask: MLXArray? = nil,
         videoLatentShape: (frames: Int, height: Int, width: Int),
-        audioNumFrames: Int
+        audioNumFrames: Int,
+        reuseCachedSelfAttention: Bool = false
     ) -> (video: MLXArray, audio: MLXArray) {
         let batchSize = videoLatent.dim(0)
         let videoDim = config.innerDim
@@ -408,6 +409,7 @@ class LTX2Transformer: Module {
             embeddedTimestep: videoEmbeddedTs,
             promptTimesteps: videoPromptTs
         )
+        videoArgs.reuseCachedSelfAttention = reuseCachedSelfAttention
 
         var audioArgs = AudioTransformerArgs(
             x: audioX,

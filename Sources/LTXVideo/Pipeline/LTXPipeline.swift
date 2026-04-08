@@ -767,6 +767,10 @@ public actor LTXPipeline {
 
             let videoPatchified = patchify(videoLatent).asType(.bfloat16)
 
+            // DiTFastAttn: reuse cached self-attention for middle steps
+            // Steps 0-2 and 7 are critical (initial/final transitions); steps 3-6 are redundant
+            let reuseAttn = config.fastAttention && (step >= 3 && step <= 6)
+
             if hasAudio, let ltx2 = ltx2Transformer {
                 // Dual video/audio denoising
                 let audioTimestep = MLXArray([sigma])
@@ -782,7 +786,8 @@ public actor LTXPipeline {
                     videoContextMask: textMask,
                     audioContextMask: nil,
                     videoLatentShape: (frames: stage1Shape.frames, height: stage1Shape.height, width: stage1Shape.width),
-                    audioNumFrames: audioNumFrames
+                    audioNumFrames: audioNumFrames,
+                    reuseCachedSelfAttention: reuseAttn
                 )
 
                 let videoVelocity = unpatchify(videoVelPred, shape: stage1Shape).asType(.float32)
@@ -812,7 +817,8 @@ public actor LTXPipeline {
                     context: videoTextEmbeddings.asType(.bfloat16),
                     timesteps: videoTimestep,
                     contextMask: nil,
-                    latentShape: (frames: stage1Shape.frames, height: stage1Shape.height, width: stage1Shape.width)
+                    latentShape: (frames: stage1Shape.frames, height: stage1Shape.height, width: stage1Shape.width),
+                    reuseCachedSelfAttention: reuseAttn
                 )
 
                 let videoVelocity = unpatchify(velocityPred, shape: stage1Shape).asType(.float32)
