@@ -323,7 +323,15 @@ public actor LTXPipeline {
         LTXDebug.log("[TIME] Eval transformer weights: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
         // Step 3b: Apply on-the-fly quantization if configured
-        if quantization.transformer.needsQuantization {
+        if let mixedConfig = quantization.mixedPrecision {
+            stepStart = Date()
+            LTXDebug.log("Applying mixed precision: \(mixedConfig.highPrecisionBlocks.count) blocks at \(mixedConfig.highPrecisionBits)-bit, rest at \(mixedConfig.lowPrecisionBits)-bit...")
+            progressCallback?(DownloadProgress(progress: 0.6, message: "Applying mixed precision quantization..."))
+            applyMixedPrecisionQuantization(to: transformer!, config: mixedConfig)
+            eval(transformer!.parameters())
+            Memory.clearCache()
+            LTXDebug.log("[TIME] Mixed precision quantization: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
+        } else if quantization.transformer.needsQuantization {
             stepStart = Date()
             let bits = quantization.transformer.bits
             let groupSize = quantization.transformer.groupSize
@@ -491,7 +499,12 @@ public actor LTXPipeline {
         try LTXWeightLoader.applyTransformerWeights(transformerWeights, to: ltx2, includeAudio: true)
 
         // Apply quantization if configured
-        if quantization.transformer == .qint8 || quantization.transformer == .int4 {
+        if let mixedConfig = quantization.mixedPrecision {
+            LTXDebug.log("Applying mixed precision to LTX2 transformer...")
+            applyMixedPrecisionQuantization(to: ltx2, config: mixedConfig)
+            eval(ltx2.parameters())
+            Memory.clearCache()
+        } else if quantization.transformer == .qint8 || quantization.transformer == .int4 {
             let bits = quantization.transformer == .qint8 ? 8 : 4
             LTXDebug.log("Quantizing LTX2 transformer to \(quantization.transformer)...")
             quantize(model: ltx2, groupSize: 64, bits: bits)
@@ -1754,6 +1767,39 @@ public actor LTXPipeline {
     ///
     /// - Parameters:
     ///   - loraPath: Path to LoRA .safetensors file
+    // MARK: - Mixed Precision Quantization
+
+    /// Apply per-block quantization: high-precision blocks get one bit level,
+    /// remaining blocks get another (typically lower) level.
+    private func applyMixedPrecisionQuantization(to model: Module, config: MixedPrecisionConfig) {
+        // Find transformer blocks via the module hierarchy
+        let blocks: [Module]
+        if let t = model as? LTXTransformer {
+            blocks = t.transformerBlocks
+        } else if let t = model as? LTX2Transformer {
+            blocks = t.transformerBlocks
+        } else {
+            // Fallback: uniform quantization at low precision
+            quantize(model: model, groupSize: config.groupSize, bits: config.lowPrecisionBits)
+            return
+        }
+
+        for (i, block) in blocks.enumerated() {
+            let bits = config.highPrecisionBlocks.contains(i) ? config.highPrecisionBits : config.lowPrecisionBits
+            if bits < 16 {
+                quantize(model: block, groupSize: config.groupSize, bits: bits)
+            }
+        }
+
+        // Quantize non-block components (projections, embeddings) at the high precision level
+        // by quantizing the full model then re-quantizing blocks — but that's wasteful.
+        // Instead, leave non-block params in bf16 (they're small relative to blocks).
+
+        let highCount = config.highPrecisionBlocks.filter { $0 < blocks.count }.count
+        let lowCount = blocks.count - highCount
+        LTXDebug.log("Mixed precision: \(highCount) blocks at \(config.highPrecisionBits)-bit, \(lowCount) blocks at \(config.lowPrecisionBits)-bit")
+    }
+
     ///   - scale: LoRA scale factor
     /// - Returns: Application result
     @discardableResult

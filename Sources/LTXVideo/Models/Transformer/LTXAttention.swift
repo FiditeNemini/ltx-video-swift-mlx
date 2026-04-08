@@ -131,6 +131,11 @@ class LTXAttention: Module {
     // Gated attention (LTX-2.3): per-head gate = 2 * sigmoid(gate_logits)
     @ModuleInfo(key: "to_gate_logits") var toGateLogits: Linear?
 
+    // Cross-attention KV cache: K and V projected from text context are identical
+    // across all denoising steps. Cache them to avoid redundant projections.
+    private var _cachedK: MLXArray?
+    private var _cachedV: MLXArray?
+
     init(
         queryDim: Int,
         contextDim: Int? = nil,
@@ -168,12 +173,19 @@ class LTXAttention: Module {
         }
     }
 
+    /// Clear the cross-attention KV cache (call between generations)
+    func clearKVCache() {
+        _cachedK = nil
+        _cachedV = nil
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         context: MLXArray? = nil,
         mask: MLXArray? = nil,
         pe: (cos: MLXArray, sin: MLXArray)? = nil,
-        kPe: (cos: MLXArray, sin: MLXArray)? = nil
+        kPe: (cos: MLXArray, sin: MLXArray)? = nil,
+        useKVCache: Bool = false
     ) -> MLXArray {
         let b = x.dim(0)
         let tQ = x.dim(1)
@@ -185,17 +197,29 @@ class LTXAttention: Module {
             gateLogits = gateProj(x)
         }
 
-        // Project to Q, K, V → (B, T, innerDim)
+        // Project Q from hidden states
         var q = toQ(x)
-        let ctx = context ?? x
-        let tK = ctx.dim(1)
-        var k = toK(ctx)
-        let v = toV(ctx)
-
-        // Apply RMSNorm across all heads on 3D tensor BEFORE reshape
-        // (matching Python LTX2AudioVideoAttnProcessor order)
         q = qNorm(q)
-        k = kNorm(k)
+
+        // Project K, V from context (or self), with optional caching.
+        // For cross-attention, context is text embeddings which don't change
+        // between denoising steps. Cache the normalized K and V to avoid
+        // redundant projections (48 blocks × N steps → 48 projections instead of 48×N).
+        var k: MLXArray
+        let v: MLXArray
+        if useKVCache, let cachedK = _cachedK, let cachedV = _cachedV {
+            k = cachedK
+            v = cachedV
+        } else {
+            let ctx = context ?? x
+            k = kNorm(toK(ctx))
+            v = toV(ctx)
+            if useKVCache {
+                _cachedK = k
+                _cachedV = v
+            }
+        }
+        let tK = k.dim(1)
 
         // Apply RoPE on 3D tensor BEFORE head reshape
         // applySplitRotaryEmb handles 3D input when cos is 4D:
@@ -303,8 +327,13 @@ class CrossAttention: Module {
     func callAsFunction(
         _ x: MLXArray,
         context: MLXArray,
-        mask: MLXArray? = nil
+        mask: MLXArray? = nil,
+        useKVCache: Bool = false
     ) -> MLXArray {
-        return attn(x, context: context, mask: mask, pe: nil)
+        return attn(x, context: context, mask: mask, pe: nil, useKVCache: useKVCache)
+    }
+
+    func clearKVCache() {
+        attn.clearKVCache()
     }
 }
