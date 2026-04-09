@@ -258,7 +258,7 @@ class GemmaFeaturesExtractor: Module {
         }
         MLX.eval(normedConcat)
 
-        do {
+        if LTXDebug.isEnabled {
             let ncF32 = normedConcat.asType(.float32)
             MLX.eval(ncF32)
             let ncMean = ncF32.mean().item(Float.self)
@@ -701,15 +701,17 @@ class VideoGemmaTextEncoderModel: Module {
         paddingSide: String = "left"
     ) -> VideoGemmaEncoderOutput {
         // Debug: Log Gemma hidden state stats for comparison with Python
-        LTXDebug.log("[TextEnc] Gemma hidden states: \(hiddenStates.count) layers")
-        for i in [0, 1, 24, 47, 48] {
-            if i < hiddenStates.count {
-                let s = hiddenStates[i].asType(.float32)
-                MLX.eval(s)
-                let mean = s.mean().item(Float.self)
-                let std = (s * s).mean().item(Float.self)
-                let stdVal = sqrt(std - mean * mean)
-                LTXDebug.log("[TextEnc]   layer_\(i): dtype=\(hiddenStates[i].dtype), mean=\(mean), std=\(stdVal)")
+        if LTXDebug.isEnabled {
+            LTXDebug.log("[TextEnc] Gemma hidden states: \(hiddenStates.count) layers")
+            for i in [0, 1, 24, 47, 48] {
+                if i < hiddenStates.count {
+                    let s = hiddenStates[i].asType(.float32)
+                    MLX.eval(s)
+                    let mean = s.mean().item(Float.self)
+                    let std = (s * s).mean().item(Float.self)
+                    let stdVal = sqrt(std - mean * mean)
+                    LTXDebug.log("[TextEnc]   layer_\(i): dtype=\(hiddenStates[i].dtype), mean=\(mean), std=\(stdVal)")
+                }
             }
         }
 
@@ -720,11 +722,13 @@ class VideoGemmaTextEncoderModel: Module {
             paddingSide: paddingSide
         )
         MLX.eval(encoded)
-        let encF32 = encoded.asType(.float32)
-        MLX.eval(encF32)
-        let encMean = encF32.mean().item(Float.self)
-        let encVar = (encF32 * encF32).mean().item(Float.self)
-        LTXDebug.log("[TextEnc] After FE: dtype=\(encoded.dtype), shape=\(encoded.shape), mean=\(encMean), std=\(sqrt(encVar - encMean*encMean))")
+        if LTXDebug.isEnabled {
+            let encF32 = encoded.asType(.float32)
+            MLX.eval(encF32)
+            let encMean = encF32.mean().item(Float.self)
+            let encVar = (encF32 * encF32).mean().item(Float.self)
+            LTXDebug.log("[TextEnc] After FE: dtype=\(encoded.dtype), shape=\(encoded.shape), mean=\(encMean), std=\(sqrt(encVar - encMean*encMean))")
+        }
 
         // Convert mask to additive format
         let connectorMask = convertToAdditiveMask(attentionMask, dtype: encoded.dtype)
@@ -732,11 +736,13 @@ class VideoGemmaTextEncoderModel: Module {
         // Step 3b: Connector (2-layer transformer with registers + RoPE)
         let (processed, outputMask) = embeddingsConnector(encoded, attentionMask: connectorMask)
         MLX.eval(processed)
-        let procF32 = processed.asType(.float32)
-        MLX.eval(procF32)
-        let procMean = procF32.mean().item(Float.self)
-        let procVar = (procF32 * procF32).mean().item(Float.self)
-        LTXDebug.log("[TextEnc] After connector: dtype=\(processed.dtype), mean=\(procMean), std=\(sqrt(procVar - procMean*procMean))")
+        if LTXDebug.isEnabled {
+            let procF32 = processed.asType(.float32)
+            MLX.eval(procF32)
+            let procMean = procF32.mean().item(Float.self)
+            let procVar = (procF32 * procF32).mean().item(Float.self)
+            LTXDebug.log("[TextEnc] After connector: dtype=\(processed.dtype), mean=\(procMean), std=\(sqrt(procVar - procMean*procMean))")
+        }
 
         // Convert mask back to binary for output
         let binaryMask = (outputMask.squeezed(axes: [1, 2]) .>= -0.5).asType(.int32)

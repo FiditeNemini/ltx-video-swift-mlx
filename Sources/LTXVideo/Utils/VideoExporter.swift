@@ -565,20 +565,23 @@ extension VideoExporter {
         let height = videoTensor.dim(1)
         let width = videoTensor.dim(2)
 
-        // Batch convert entire tensor to uint8 in a single GPU operation
-        let allScaled = MLX.clip(videoTensor, min: 0, max: 1) * 255
-        let allUint8 = allScaled.asType(.uint8)
+        // Convert RGB → ARGB on GPU (add alpha=255 channel) and scale to uint8
+        // This matches kCVPixelFormatType_32ARGB expected by AVAssetWriter,
+        // eliminating the CPU-side CGContext.draw() format conversion.
+        let scaled = MLX.clip(videoTensor, min: 0, max: 1) * 255  // (F, H, W, 3)
+        // Add alpha=255 channel to match ARGB pixel format (all on GPU)
+        let alpha = MLX.full([numFrames, height, width, 1], values: MLXArray(Float(255.0)))
+        let argb = MLX.concatenated([alpha, scaled], axis: -1)  // (F, H, W, 4) = A,R,G,B
+        let allUint8 = argb.asType(DType.uint8)
         MLX.eval(allUint8)
 
-        // Single bulk GPU→CPU transfer for ALL frames at once
-        // Instead of 121 individual .asData() calls (each a GPU sync),
-        // transfer the entire (F, H, W, 3) tensor in one operation.
-        let bulkData = allUint8.asData(access: .copy)  // One GPU→CPU copy
+        // Single bulk GPU→CPU transfer
+        let bulkData = allUint8.asData(access: MLXArray.AccessMethod.copy)
         let rawBytes = bulkData.data
-        let frameSize = height * width * 3
+        let frameSize = height * width * 4  // 4 bytes per pixel (ARGB)
 
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue)
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
 
         for f in 0..<numFrames {
             let offset = f * frameSize
@@ -587,7 +590,7 @@ extension VideoExporter {
             guard let provider = CGDataProvider(data: frameData as CFData) else { continue }
             guard let image = CGImage(
                 width: width, height: height,
-                bitsPerComponent: 8, bitsPerPixel: 24, bytesPerRow: width * 3,
+                bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
                 space: colorSpace, bitmapInfo: bitmapInfo,
                 provider: provider, decode: nil,
                 shouldInterpolate: false, intent: .defaultIntent

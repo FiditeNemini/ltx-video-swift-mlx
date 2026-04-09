@@ -113,9 +113,10 @@ public struct MemoryOptimizationConfig: Sendable {
             return .aggressive
         case 33...64:
             return .moderate
-        case 65...96:
+        case 65...95:
             return .light
         default:
+            // 96 GB+: eval every 8 blocks for maximum GPU utilization
             return .disabled
         }
     }
