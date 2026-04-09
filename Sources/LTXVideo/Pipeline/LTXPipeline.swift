@@ -644,17 +644,25 @@ public actor LTXPipeline {
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
         let textEncodingStart = Date()
+
+        profiler.start("Tokenization")
         let (inputIds, attentionMask) = tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
+        MLX.eval(inputIds, attentionMask)
+        profiler.end("Tokenization")
 
         guard let gemma = gemmaModel else {
             throw LTXError.modelNotLoaded("Gemma model not loaded")
         }
 
+        profiler.start("Gemma Forward")
         let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
         guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
             throw LTXError.generationFailed("Failed to extract Gemma hidden states")
         }
+        MLX.eval(states[states.count - 1])
+        profiler.end("Gemma Forward")
 
+        profiler.start("Feature Extractor + Connector")
         let encoderOutput = textEncoder.encodeFromHiddenStates(
             hiddenStates: states,
             attentionMask: attentionMask,
@@ -664,6 +672,7 @@ public actor LTXPipeline {
         let audioTextEmbeddings = encoderOutput.audioEncoding ?? videoTextEmbeddings
         let textMask = encoderOutput.attentionMask
         MLX.eval(videoTextEmbeddings, audioTextEmbeddings, textMask)
+        profiler.end("Feature Extractor + Connector")
 
         LTXDebug.log("Video text: \(videoTextEmbeddings.shape), Audio text: \(audioTextEmbeddings.shape)")
         timings.textEncoding = Date().timeIntervalSince(textEncodingStart)
@@ -1063,12 +1072,16 @@ public actor LTXPipeline {
         LTXMemoryManager.setPhase(.vaeDecode)
         profiler.start("VAE Decode")
         let vaeStart = Date()
+
+        profiler.start("VAE Forward Pass")
         let videoTensor = decodeVideo(
             latent: videoLatent, decoder: vaeDecoder, timestep: nil,
             temporalTileSize: memoryOptimization.vaeTemporalTileSize,
             temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
         )
         MLX.eval(videoTensor)
+        profiler.end("VAE Forward Pass")
+
         timings.vaeDecode = Date().timeIntervalSince(vaeStart)
         profiler.end("VAE Decode")
 

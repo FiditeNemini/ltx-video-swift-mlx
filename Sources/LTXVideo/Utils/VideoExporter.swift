@@ -636,8 +636,11 @@ extension VideoExporter {
         config: VideoExportConfig = .default,
         to outputURL: URL
     ) async throws -> URL {
+        let profiler = LTXVideoProfiler.shared
+        profiler.start("Frame Conversion")
         LTXDebug.log("exportVideo: converting tensor \(tensor.shape) to images...")
         let images = tensorToImages(tensor)
+        profiler.end("Frame Conversion")
         LTXDebug.log("exportVideo: converted \(images.count) images")
 
         guard !images.isEmpty else {
@@ -680,8 +683,9 @@ extension VideoExporter {
             audioChannels = 2
         }
 
+        profiler.start("Video Write")
         let exporter = VideoExporter(config: config)
-        return try await exporter.export(
+        let result = try await exporter.export(
             frames: images,
             width: width,
             height: height,
@@ -691,6 +695,8 @@ extension VideoExporter {
             audioChannels: audioChannels,
             to: outputURL
         )
+        profiler.end("Video Write")
+        return result
     }
 
     /// Convert an MLXArray waveform to interleaved Int16 PCM data
