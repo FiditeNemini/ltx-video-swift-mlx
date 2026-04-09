@@ -303,9 +303,13 @@ struct Generate: AsyncParsableCommand {
             print("Audio sample rate: \(result.audioSampleRate ?? 0) Hz")
         }
 
-        // Print profiling report
+        // Print profiling report + export Chrome Trace
         if let session = profilingSession {
             print(session.generateReport())
+            let traceData = ChromeTraceExporter.export(session: session)
+            let tracePath = output.replacingOccurrences(of: ".mp4", with: "_trace.json")
+            try traceData.write(to: URL(fileURLWithPath: tracePath))
+            print("Chrome Trace: \(tracePath)  (open in https://ui.perfetto.dev/)")
         }
     }
 }
@@ -543,6 +547,10 @@ struct Retake: AsyncParsableCommand {
 
         if let session = profilingSession {
             print(session.generateReport())
+            let traceData = ChromeTraceExporter.export(session: session)
+            let tracePath = output.replacingOccurrences(of: ".mp4", with: "_trace.json")
+            try traceData.write(to: URL(fileURLWithPath: tracePath))
+            print("Chrome Trace: \(tracePath)  (open in https://ui.perfetto.dev/)")
         }
     }
 }
