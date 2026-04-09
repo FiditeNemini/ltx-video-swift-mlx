@@ -408,53 +408,6 @@ internal func formatDuration(_ duration: TimeInterval) -> String {
 
 // MARK: - Video Generation Result
 
-/// Detailed timing breakdown for each phase of the generation pipeline.
-///
-/// Populated when profiling is enabled via `profile: true` on generation methods.
-public struct GenerationTimings: Sendable {
-    /// Text encoding time (Gemma + Feature Extractor + Connector)
-    public var textEncoding: TimeInterval = 0
-    /// Time per denoising step
-    public var denoiseSteps: [TimeInterval] = []
-    /// VAE decoding time
-    public var vaeDecode: TimeInterval = 0
-    /// Total denoising time
-    public var totalDenoise: TimeInterval { denoiseSteps.reduce(0, +) }
-    /// Average per-step denoising time
-    public var avgStepTime: TimeInterval { denoiseSteps.isEmpty ? 0 : totalDenoise / Double(denoiseSteps.count) }
-
-    /// Peak GPU memory usage in MB (sampled during generation)
-    public var peakMemoryMB: Int = 0
-    /// Mean GPU memory usage in MB (averaged over denoising steps)
-    public var meanMemoryMB: Int = 0
-    /// Memory samples collected during denoising (in bytes)
-    internal var memorySamples: [Int] = []
-
-    /// Record a memory sample and update peak/mean
-    internal mutating func sampleMemory() {
-        let snapshot = Memory.snapshot()
-        let activeBytes = snapshot.activeMemory
-        memorySamples.append(activeBytes)
-        let activeMB = activeBytes / (1024 * 1024)
-        if activeMB > peakMemoryMB {
-            peakMemoryMB = activeMB
-        }
-        if !memorySamples.isEmpty {
-            let totalBytes = memorySamples.reduce(0, +)
-            meanMemoryMB = totalBytes / memorySamples.count / (1024 * 1024)
-        }
-    }
-
-    /// Update peak from Memory.peakMemory (captures GPU-level peak)
-    internal mutating func capturePeakMemory() {
-        let snapshot = Memory.snapshot()
-        let peakMB = snapshot.peakMemory / (1024 * 1024)
-        if peakMB > peakMemoryMB {
-            peakMemoryMB = peakMB
-        }
-    }
-}
-
 /// The output of a video generation run.
 ///
 /// Contains the generated frames as an MLX tensor, the seed used for
@@ -494,10 +447,6 @@ public struct VideoGenerationResult: @unchecked Sendable {
     /// Total wall-clock generation time in seconds (excludes model loading)
     public let generationTime: TimeInterval
 
-    /// Per-phase timing breakdown. Only populated when `profile: true`
-    /// is passed to the generation method.
-    public let timings: GenerationTimings?
-
     /// Audio waveform (optional). Present when audio generation is enabled.
     /// Shape: `(samples,)` float32. Sample rate given by ``audioSampleRate``.
     public let audioWaveform: MLXArray?
@@ -524,7 +473,6 @@ public struct VideoGenerationResult: @unchecked Sendable {
         frames: MLXArray,
         seed: UInt64,
         generationTime: TimeInterval,
-        timings: GenerationTimings? = nil,
         audioWaveform: MLXArray? = nil,
         audioSampleRate: Int? = nil,
         effectivePrompt: String? = nil,
@@ -533,7 +481,6 @@ public struct VideoGenerationResult: @unchecked Sendable {
         self.frames = frames
         self.seed = seed
         self.generationTime = generationTime
-        self.timings = timings
         self.audioWaveform = audioWaveform
         self.audioSampleRate = audioSampleRate
         self.effectivePrompt = effectivePrompt

@@ -595,7 +595,6 @@ public actor LTXPipeline {
         profile: Bool = false
     ) async throws -> VideoGenerationResult {
         try config.validate()
-        var timings = GenerationTimings()
 
         let hasAudio = isAudioLoaded
 
@@ -643,7 +642,6 @@ public actor LTXPipeline {
         // 1. Text encoding
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
-        let textEncodingStart = Date()
 
         profiler.start("Tokenization")
         let (inputIds, attentionMask) = tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
@@ -675,7 +673,6 @@ public actor LTXPipeline {
         profiler.end("Feature Extractor + Connector")
 
         LTXDebug.log("Video text: \(videoTextEmbeddings.shape), Audio text: \(audioTextEmbeddings.shape)")
-        timings.textEncoding = Date().timeIntervalSince(textEncodingStart)
         profiler.end("Text Encoding")
 
         // Unload Gemma
@@ -846,8 +843,6 @@ public actor LTXPipeline {
 
             if (step + 1) % 5 == 0 { Memory.clearCache() }
             let stepDur = Date().timeIntervalSince(stepStart)
-            timings.denoiseSteps.append(stepDur)
-            timings.sampleMemory()
             profiler.recordStep(duration: stepDur)
 
             LTXDebug.log("Stage 1 step \(step)/\(stage1NumSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", stepDur))s")
@@ -1038,8 +1033,6 @@ public actor LTXPipeline {
             }
 
             let stepDur2 = Date().timeIntervalSince(stepStart)
-            timings.denoiseSteps.append(stepDur2)
-            timings.sampleMemory()
             profiler.recordStep(duration: stepDur2)
 
             LTXDebug.log("Stage 2 step \(step)/\(stage2NumSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", stepDur2))s")
@@ -1071,7 +1064,6 @@ public actor LTXPipeline {
         ))
         LTXMemoryManager.setPhase(.vaeDecode)
         profiler.start("VAE Decode")
-        let vaeStart = Date()
 
         profiler.start("VAE Forward Pass")
         let videoTensor = decodeVideo(
@@ -1082,7 +1074,6 @@ public actor LTXPipeline {
         MLX.eval(videoTensor)
         profiler.end("VAE Forward Pass")
 
-        timings.vaeDecode = Date().timeIntervalSince(vaeStart)
         profiler.end("VAE Decode")
 
         let trimmedVideo: MLXArray
@@ -1114,7 +1105,6 @@ public actor LTXPipeline {
         ))
 
         LTXMemoryManager.resetCacheLimit()
-        timings.capturePeakMemory()
 
         let generationTime = Date().timeIntervalSince(generationStart)
         LTXDebug.log("Total two-stage generation time: \(String(format: "%.1f", generationTime))s")
@@ -1123,7 +1113,7 @@ public actor LTXPipeline {
             frames: trimmedVideo,
             seed: config.seed ?? 0,
             generationTime: generationTime,
-            timings: profile ? timings : nil,
+            
             audioWaveform: audioWaveform,
             audioSampleRate: audioSampleRate,
             effectivePrompt: effectivePrompt
@@ -1154,7 +1144,6 @@ public actor LTXPipeline {
         profile: Bool = false
     ) async throws -> VideoGenerationResult {
         try config.validate()
-        var timings = GenerationTimings()
 
         guard let videoPath = config.videoPath else {
             throw LTXError.invalidConfiguration("videoPath must be set for retake mode")
@@ -1222,7 +1211,6 @@ public actor LTXPipeline {
         // Phase 1: Text encoding
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
-        let textEncodingStart = Date()
         let (inputIds, attentionMask) = tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
 
         guard let gemma = gemmaModel else {
@@ -1245,7 +1233,6 @@ public actor LTXPipeline {
         if let ae = audioTextEmbeddings { MLX.eval(ae) }
 
         LTXDebug.log("Text encoding: video=\(videoTextEmbeddings.shape), audio=\(audioTextEmbeddings?.shape.description ?? "nil")")
-        timings.textEncoding = Date().timeIntervalSince(textEncodingStart)
         profiler.end("Text Encoding")
 
         // Unload Gemma
@@ -1502,8 +1489,6 @@ public actor LTXPipeline {
 
             if (step + 1) % 5 == 0 { Memory.clearCache() }
             let stepDurR = Date().timeIntervalSince(stepStart)
-            timings.denoiseSteps.append(stepDurR)
-            timings.sampleMemory()
             profiler.recordStep(duration: stepDurR)
 
             LTXDebug.log("Step \(step)/\(numSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", stepDurR))s")
@@ -1525,14 +1510,12 @@ public actor LTXPipeline {
         ))
         LTXMemoryManager.setPhase(.vaeDecode)
         profiler.start("VAE Decode")
-        let vaeStart = Date()
         let videoTensor = decodeVideo(
             latent: videoLatent, decoder: vaeDecoder, timestep: nil,
             temporalTileSize: memoryOptimization.vaeTemporalTileSize,
             temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
         )
         MLX.eval(videoTensor)
-        timings.vaeDecode = Date().timeIntervalSince(vaeStart)
         profiler.end("VAE Decode")
 
         let trimmedVideo: MLXArray
@@ -1543,7 +1526,6 @@ public actor LTXPipeline {
         }
 
         LTXMemoryManager.resetCacheLimit()
-        timings.capturePeakMemory()
 
         let generationTime = Date().timeIntervalSince(generationStart)
         LTXDebug.log("Total retake generation time: \(String(format: "%.1f", generationTime))s")
@@ -1552,7 +1534,7 @@ public actor LTXPipeline {
             frames: trimmedVideo,
             seed: config.seed ?? 0,
             generationTime: generationTime,
-            timings: profile ? timings : nil,
+            
             effectivePrompt: effectivePrompt,
             sourceAudioPath: videoPath
         )
@@ -1623,8 +1605,7 @@ public actor LTXPipeline {
         conditioningMask: MLXArray? = nil,
         conditionedLatent: MLXArray? = nil,
         onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false,
-        timings: inout GenerationTimings
+        profile: Bool = false
     ) -> MLXArray {
         let numSteps = sigmas.count - 1
         var currentLatent = latent
@@ -1698,9 +1679,6 @@ public actor LTXPipeline {
                 Memory.clearCache()
             }
 
-            let stepDuration = Date().timeIntervalSince(stepStart)
-            timings.denoiseSteps.append(stepDuration)
-            timings.sampleMemory()
 
             if profile && LTXDebug.isEnabled {
                 // Only compute stats when debug is active — each .item() forces a GPU sync
