@@ -53,7 +53,8 @@ public final class ProfilingSession: @unchecked Sendable {
             memoryTimeline.append(MemoryTimelineEntry(
                 timestampUs: ts, context: "begin:\(name)",
                 mlxActiveMB: Double(snap.mlxActive) / 1_048_576, mlxCacheMB: Double(snap.mlxCache) / 1_048_576,
-                mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576
+                mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576,
+                cpuTimeSeconds: snap.cpuTime
             ))
         }
         lock.unlock()
@@ -73,7 +74,8 @@ public final class ProfilingSession: @unchecked Sendable {
             memoryTimeline.append(MemoryTimelineEntry(
                 timestampUs: ts, context: "end:\(name)",
                 mlxActiveMB: Double(snap.mlxActive) / 1_048_576, mlxCacheMB: Double(snap.mlxCache) / 1_048_576,
-                mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576
+                mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576,
+                cpuTimeSeconds: snap.cpuTime
             ))
         }
         lock.unlock()
@@ -104,7 +106,8 @@ public final class ProfilingSession: @unchecked Sendable {
             memoryTimeline.append(MemoryTimelineEntry(
                 timestampUs: ts, context: "step:\(index)/\(total)",
                 mlxActiveMB: Double(snap.mlxActive) / 1_048_576, mlxCacheMB: Double(snap.mlxCache) / 1_048_576,
-                mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576
+                mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576,
+                cpuTimeSeconds: snap.cpuTime
             ))
         }
         lock.unlock()
@@ -113,11 +116,16 @@ public final class ProfilingSession: @unchecked Sendable {
     public func recordMemorySnapshot(context: String) {
         let ts = currentTimestampUs()
         let snap = takeMemorySnapshot()
+        let activeMB = Double(snap.mlxActive) / 1_048_576
+        let cacheMB = Double(snap.mlxCache) / 1_048_576
+        let peakMB = Double(snap.mlxPeak) / 1_048_576
+        let footprintMB = Double(snap.processFootprint) / 1_048_576
         lock.lock()
         memoryTimeline.append(MemoryTimelineEntry(
             timestampUs: ts, context: context,
-            mlxActiveMB: Double(snap.mlxActive) / 1_048_576, mlxCacheMB: Double(snap.mlxCache) / 1_048_576,
-            mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576
+            mlxActiveMB: activeMB, mlxCacheMB: cacheMB,
+            mlxPeakMB: peakMB, processFootprintMB: footprintMB,
+            cpuTimeSeconds: snap.cpuTime
         ))
         lock.unlock()
     }
@@ -139,13 +147,14 @@ public final class ProfilingSession: @unchecked Sendable {
     // MARK: - Memory Snapshot
 
     private struct RawMemorySnapshot {
-        let mlxActive: Int; let mlxCache: Int; let mlxPeak: Int; let processFootprint: Int64
+        let mlxActive: Int; let mlxCache: Int; let mlxPeak: Int; let processFootprint: Int64; let cpuTime: Double
     }
 
     private func takeMemorySnapshot() -> RawMemorySnapshot {
         RawMemorySnapshot(
             mlxActive: Memory.activeMemory, mlxCache: Memory.cacheMemory,
-            mlxPeak: Memory.peakMemory, processFootprint: Self.getProcessFootprint()
+            mlxPeak: Memory.peakMemory, processFootprint: Self.getProcessFootprint(),
+            cpuTime: Self.getProcessCPUTime()
         )
     }
 
@@ -160,15 +169,30 @@ public final class ProfilingSession: @unchecked Sendable {
         return result == KERN_SUCCESS ? Int64(info.phys_footprint) : 0
     }
 
+    /// Get cumulative CPU time (user + system) for this process in seconds
+    private static func getProcessCPUTime() -> Double {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        let userSec = Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1_000_000
+        let sysSec = Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1_000_000
+        return userSec + sysSec
+    }
+
     // MARK: - Report Generation
 
     public func generateReport() -> String {
         let events = getEvents()
         let timeline = getMemoryTimeline()
 
-        var phases: [(name: String, category: ProfilingCategory, durationMs: Double)] = []
+        var phases: [(name: String, category: ProfilingCategory, durationMs: Double, cpuPct: Double)] = []
         var stepDurations: [Double] = []
         var beginTimestamps: [String: (ts: UInt64, cat: ProfilingCategory)] = [:]
+
+        // Build CPU time map from timeline (begin/end pairs)
+        var cpuTimeAtPoint: [String: Double] = [:]
+        for entry in timeline {
+            cpuTimeAtPoint[entry.context] = entry.cpuTimeSeconds
+        }
 
         for event in events {
             switch event.phase {
@@ -176,7 +200,16 @@ public final class ProfilingSession: @unchecked Sendable {
                 beginTimestamps[event.name] = (event.timestampUs, event.category)
             case .end:
                 if let begin = beginTimestamps[event.name] {
-                    phases.append((name: event.name, category: begin.cat, durationMs: Double(event.timestampUs - begin.ts) / 1000.0))
+                    let wallMs = Double(event.timestampUs - begin.ts) / 1000.0
+                    let wallSec = wallMs / 1000.0
+
+                    // Compute CPU % for this phase
+                    let cpuBegin = cpuTimeAtPoint["begin:\(event.name)"] ?? 0
+                    let cpuEnd = cpuTimeAtPoint["end:\(event.name)"] ?? 0
+                    let cpuDelta = cpuEnd - cpuBegin
+                    let cpuPct = wallSec > 0 ? (cpuDelta / wallSec) * 100 : 0
+
+                    phases.append((name: event.name, category: begin.cat, durationMs: wallMs, cpuPct: cpuPct))
                     beginTimestamps.removeValue(forKey: event.name)
                 }
             case .complete:
@@ -202,13 +235,14 @@ public final class ProfilingSession: @unchecked Sendable {
         report += "  Resolution: \(resolution)  Frames: \(frames)  Steps: \(steps)\n"
         report += "  Device: \(deviceArchitecture)  RAM: \(systemRAMGB)GB\n\n"
 
-        report += "  PHASE TIMINGS\n"
-        report += "  \(String(repeating: "\u{2500}", count: 58))\n"
+        report += "  PHASE TIMINGS                                        CPU%\n"
+        report += "  \(String(repeating: "\u{2500}", count: 62))\n"
         for phase in phases {
             let pct = totalMs > 0 ? (phase.durationMs / totalMs) * 100 : 0
-            let bar = String(repeating: "\u{2588}", count: min(20, Int(pct / 5)))
-            let name = phase.name.padding(toLength: 28, withPad: " ", startingAt: 0)
-            report += "  \(name) \(formatDuration(phase.durationMs / 1000))  \(String(format: "%5.1f", pct))% \(bar)\n"
+            let bar = String(repeating: "\u{2588}", count: min(12, Int(pct / 8)))
+            let name = phase.name.padding(toLength: 24, withPad: " ", startingAt: 0)
+            let cpuStr = phase.cpuPct > 0 ? String(format: "%5.1f%%", phase.cpuPct) : "   -  "
+            report += "  \(name) \(formatDuration(phase.durationMs / 1000))  \(String(format: "%5.1f", pct))% \(bar)  \(cpuStr)\n"
         }
         report += "  \(String(repeating: "\u{2500}", count: 58))\n"
         report += "  \("TOTAL".padding(toLength: 28, withPad: " ", startingAt: 0)) \(formatDuration(totalMs / 1000))  100.0%\n"

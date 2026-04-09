@@ -132,4 +132,6 @@ public struct MemoryTimelineEntry: Sendable, Codable {
     public let mlxCacheMB: Double
     public let mlxPeakMB: Double
     public let processFootprintMB: Double
+    /// Cumulative CPU time (user+system) in seconds at this point
+    public let cpuTimeSeconds: Double
 }
