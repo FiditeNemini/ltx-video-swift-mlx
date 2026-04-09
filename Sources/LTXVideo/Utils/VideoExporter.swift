@@ -553,10 +553,8 @@ extension VideoExporter {
         // Handle batch dimension if present
         let videoTensor: MLXArray
         if tensor.ndim == 5 {
-            // (B, F, H, W, C) -> take first batch
             videoTensor = tensor[0]
         } else if tensor.ndim == 4 {
-            // (F, H, W, C)
             videoTensor = tensor
         } else {
             LTXDebug.log("Invalid tensor shape for video: \(tensor.shape)")
@@ -570,58 +568,35 @@ extension VideoExporter {
         // Batch convert entire tensor to uint8 in a single GPU operation
         let allScaled = MLX.clip(videoTensor, min: 0, max: 1) * 255
         let allUint8 = allScaled.asType(.uint8)
-        MLX.eval(allUint8)  // Single eval for all frames
+        MLX.eval(allUint8)
 
-        // CPU loop just extracts already-evaluated frames
+        // Single bulk GPU→CPU transfer for ALL frames at once
+        // Instead of 121 individual .asData() calls (each a GPU sync),
+        // transfer the entire (F, H, W, 3) tensor in one operation.
+        let bulkData = allUint8.asData(access: .copy)  // One GPU→CPU copy
+        let rawBytes = bulkData.data
+        let frameSize = height * width * 3
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue)
+
         for f in 0..<numFrames {
-            let frame = allUint8[f]
-            if let image = createCGImage(from: frame, width: width, height: height) {
-                frames.append(image)
-            }
+            let offset = f * frameSize
+            let frameData = rawBytes.subdata(in: offset..<(offset + frameSize))
+
+            guard let provider = CGDataProvider(data: frameData as CFData) else { continue }
+            guard let image = CGImage(
+                width: width, height: height,
+                bitsPerComponent: 8, bitsPerPixel: 24, bytesPerRow: width * 3,
+                space: colorSpace, bitmapInfo: bitmapInfo,
+                provider: provider, decode: nil,
+                shouldInterpolate: false, intent: .defaultIntent
+            ) else { continue }
+
+            frames.append(image)
         }
 
         return frames
-    }
-
-    /// Create CGImage from MLXArray frame
-    private static func createCGImage(
-        from frame: MLXArray,
-        width: Int,
-        height: Int
-    ) -> CGImage? {
-        // Frame should be (H, W, C) with C = 3 (RGB)
-        guard frame.ndim == 3, frame.dim(2) == 3 else {
-            LTXDebug.log("Invalid frame shape: \(frame.shape)")
-            return nil
-        }
-
-        // Get raw bytes - need to copy since MLXArray data may not persist
-        let mlxData = frame.asData(access: .copy)
-
-        // Extract Foundation Data from MLXArrayData
-        let nsData = mlxData.data
-
-        // Create data provider
-        guard
-            let provider = CGDataProvider(data: nsData as CFData)
-        else {
-            return nil
-        }
-
-        // Create CGImage
-        return CGImage(
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 24,
-            bytesPerRow: width * 3,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
     }
 }
 
