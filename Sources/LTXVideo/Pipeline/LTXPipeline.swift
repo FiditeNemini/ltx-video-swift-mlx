@@ -1410,6 +1410,9 @@ public actor LTXPipeline {
                 sigma5d = MLXArray(sigma)
             }
 
+            // DiTFastAttn: reuse cached self-attention for middle steps
+            let reuseAttn = config.fastAttention && (step >= 3 && step <= 6)
+
             // Helper: run transformer and compute denoised x0
             func runTransformer(context: MLXArray, audioContext: MLXArray) -> MLXArray {
                 if let ltx2 = ltx2Transformer {
@@ -1425,7 +1428,8 @@ public actor LTXPipeline {
                         videoContextMask: nil,
                         audioContextMask: nil,
                         videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
-                        audioNumFrames: audioFrames
+                        audioNumFrames: audioFrames,
+                        reuseCachedSelfAttention: reuseAttn
                     )
                     let vel = unpatchify(velPred, shape: latentShape).asType(.float32)
                     return videoLatent - sigma5d * vel
@@ -1435,7 +1439,8 @@ public actor LTXPipeline {
                         context: context.asType(.bfloat16),
                         timesteps: videoTimestep,
                         contextMask: nil,
-                        latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
+                        latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
+                        reuseCachedSelfAttention: reuseAttn
                     )
                     let vel = unpatchify(velPred, shape: latentShape).asType(.float32)
                     return videoLatent - sigma5d * vel
@@ -1695,13 +1700,13 @@ public actor LTXPipeline {
             timings.denoiseSteps.append(stepDuration)
             timings.sampleMemory()
 
-            if profile {
+            if profile && LTXDebug.isEnabled {
+                // Only compute stats when debug is active — each .item() forces a GPU sync
                 let vMean = velocityPred.mean().item(Float.self)
                 let vStd = MLX.sqrt(MLX.variance(velocityPred)).item(Float.self)
                 let lMean = currentLatent.mean().item(Float.self)
                 let lStd = MLX.sqrt(MLX.variance(currentLatent)).item(Float.self)
                 LTXDebug.log("  Step \(step): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), vel mean=\(String(format: "%.4f", vMean)), std=\(String(format: "%.4f", vStd)), latent mean=\(String(format: "%.4f", lMean)), std=\(String(format: "%.4f", lStd))")
-                LTXDebug.log("  Step \(step) time: \(String(format: "%.2f", stepDuration))s")
             }
         }
 

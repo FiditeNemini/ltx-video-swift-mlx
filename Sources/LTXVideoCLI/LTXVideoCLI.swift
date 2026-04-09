@@ -354,6 +354,12 @@ struct Retake: AsyncParsableCommand {
     @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
     var transformerQuant: String = "bf16"
 
+    @Flag(name: .long, help: "Mixed precision: first/last 6 blocks qint8, middle blocks int4")
+    var mixedPrecision: Bool = false
+
+    @Flag(name: .long, help: "Fast attention: skip self-attention on middle steps")
+    var fastAttention: Bool = false
+
     @Option(name: .long, help: "Video bitrate in kbps (e.g., 1000 for 1 Mbps). Default: quality-based encoding")
     var bitrate: Int?
 
@@ -416,10 +422,15 @@ struct Retake: AsyncParsableCommand {
             throw ValidationError("Source video not found: \(video)")
         }
         // Parse quantization
-        guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
-            throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
+        let quantConfig: LTXQuantizationConfig
+        if mixedPrecision {
+            quantConfig = .mixedDefault
+        } else {
+            guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
+                throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
+            }
+            quantConfig = LTXQuantizationConfig(transformer: quantOption)
         }
-        let quantConfig = LTXQuantizationConfig(transformer: quantOption)
 
         // Create pipeline
         let retakeModel: LTXModel = distilled ? .distilled : .dev
@@ -458,7 +469,8 @@ struct Retake: AsyncParsableCommand {
             videoPath: video,
             retakeStrength: strength,
             retakeStartTime: startTime,
-            retakeEndTime: endTime
+            retakeEndTime: endTime,
+            fastAttention: fastAttention
         )
 
         // Generate retake (single-stage, no upscaler needed)

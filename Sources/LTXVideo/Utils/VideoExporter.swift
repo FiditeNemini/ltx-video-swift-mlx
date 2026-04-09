@@ -733,22 +733,21 @@ extension VideoExporter {
         }
 
         let numChannels = audio.dim(0)
-        let numSamples = audio.dim(1)
 
-        // Clamp and convert to float32 for sample extraction
-        let clamped = MLX.clip(audio, min: -1.0, max: 1.0).asType(.float32)
-        MLX.eval(clamped)
+        // Clamp, scale to int16 range, and interleave channels on GPU
+        let clamped = MLX.clip(audio, min: -1.0, max: 1.0)
+        let scaled = (clamped * 32767.0).asType(.int16)  // (numChannels, numSamples)
 
-        // Build interleaved PCM: [L0, R0, L1, R1, ...]
-        // Use explicit per-sample interleaving (matches AudioExporter.exportToWAV)
-        var pcmData = Data(capacity: numSamples * numChannels * 2)
-        for i in 0..<numSamples {
-            for ch in 0..<numChannels {
-                let sample = clamped[ch, i].item(Float.self)
-                let int16Val = Int16(max(-32768, min(32767, sample * 32767.0)))
-                var le = int16Val.littleEndian
-                pcmData.append(Data(bytes: &le, count: 2))
-            }
+        // Interleave: (2, N) → transpose to (N, 2) → flatten to (N*2,)
+        let interleaved = scaled.transposed(1, 0).reshaped([-1])
+        MLX.eval(interleaved)
+
+        // Single bulk GPU→CPU transfer instead of per-sample .item() calls
+        let int16Array = interleaved.asArray(Int16.self)
+        var pcmData = Data(capacity: int16Array.count * 2)
+        for sample in int16Array {
+            var le = sample.littleEndian
+            pcmData.append(Data(bytes: &le, count: 2))
         }
 
         return (pcmData, numChannels)
