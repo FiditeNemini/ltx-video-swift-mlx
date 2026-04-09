@@ -65,9 +65,6 @@ struct Generate: AsyncParsableCommand {
     @Flag(name: .long, help: "Mixed precision: first/last 6 blocks qint8, middle blocks int4")
     var mixedPrecision: Bool = false
 
-    @Flag(name: .long, help: "Fast attention: skip self-attention on middle steps (faster, slight quality trade-off)")
-    var fastAttention: Bool = false
-
     @Option(name: .long, help: "Video bitrate in kbps (e.g., 1000 for 1 Mbps). Default: quality-based encoding")
     var bitrate: Int?
 
@@ -208,8 +205,7 @@ struct Generate: AsyncParsableCommand {
             numSteps: 8,
             seed: seed,
             enhancePrompt: enhancePrompt,
-            imagePath: image,
-            fastAttention: fastAttention
+            imagePath: image
         )
 
         // Generate — ONE API call
@@ -357,9 +353,6 @@ struct Retake: AsyncParsableCommand {
     @Flag(name: .long, help: "Mixed precision: first/last 6 blocks qint8, middle blocks int4")
     var mixedPrecision: Bool = false
 
-    @Flag(name: .long, help: "Fast attention: skip self-attention on middle steps")
-    var fastAttention: Bool = false
-
     @Option(name: .long, help: "Video bitrate in kbps (e.g., 1000 for 1 Mbps). Default: quality-based encoding")
     var bitrate: Int?
 
@@ -469,8 +462,7 @@ struct Retake: AsyncParsableCommand {
             videoPath: video,
             retakeStrength: strength,
             retakeStartTime: startTime,
-            retakeEndTime: endTime,
-            fastAttention: fastAttention
+            retakeEndTime: endTime
         )
 
         // Generate retake (single-stage, no upscaler needed)

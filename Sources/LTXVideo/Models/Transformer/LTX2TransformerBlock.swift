@@ -76,9 +76,6 @@ class LTX2TransformerBlock: Module {
     /// When true, video self-attention is skipped (STG perturbation)
     var skipVideoSelfAttention: Bool = false
 
-    /// DiTFastAttn: cached video/audio self-attention outputs
-    private var _cachedVideoSelfAttnOut: MLXArray?
-    private var _cachedAudioSelfAttnOut: MLXArray?
 
     // --- Video modules ---
     @ModuleInfo(key: "norm1") var norm1: RMSNorm
@@ -235,28 +232,18 @@ class LTX2TransformerBlock: Module {
         )
 
         // Phase 1: Video self-attention (skip for STG perturbation)
-        let reuseCache = videoArgs.reuseCachedSelfAttention
         if skipVideoSelfAttention {
             // STG: skip video self-attention, residual unchanged
-        } else if reuseCache, let cached = _cachedVideoSelfAttnOut {
-            // DiTFastAttn: reuse cached output
-            videoX = videoX + cached * vGateMSA
         } else {
             let normV1 = norm1(videoX) * (1 + vScaleMSA) + vShiftMSA
             let vSelfOut = attn1(normV1, pe: videoArgs.positionalEmbeddings)
-            _cachedVideoSelfAttnOut = vSelfOut
             videoX = videoX + vSelfOut * vGateMSA
         }
 
         // Phase 2: Audio self-attention
         let normA1 = audioNorm1(audioX) * (1 + aScaleMSA) + aShiftMSA
-        if reuseCache, let cached = _cachedAudioSelfAttnOut {
-            audioX = audioX + cached * aGateMSA
-        } else {
-            let aSelfOut = audioAttn1(normA1, pe: audioArgs.positionalEmbeddings)
-            _cachedAudioSelfAttnOut = aSelfOut
-            audioX = audioX + aSelfOut * aGateMSA
-        }
+        let aSelfOut = audioAttn1(normA1, pe: audioArgs.positionalEmbeddings)
+        audioX = audioX + aSelfOut * aGateMSA
 
         // Phase 3-4: Text cross-attention
         if numSSTValues == 9 {
@@ -377,8 +364,4 @@ class LTX2TransformerBlock: Module {
         )
     }
 
-    func clearSelfAttnCache() {
-        _cachedVideoSelfAttnOut = nil
-        _cachedAudioSelfAttnOut = nil
-    }
 }

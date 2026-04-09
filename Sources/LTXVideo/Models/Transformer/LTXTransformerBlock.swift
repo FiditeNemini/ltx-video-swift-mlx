@@ -139,6 +139,7 @@ class BasicTransformerBlock: Module {
     /// When true, self-attention is skipped (STG perturbation for guidance)
     var skipSelfAttention: Bool = false
 
+
     init(
         dim: Int,
         numHeads: Int,
@@ -291,6 +292,7 @@ class BasicTransformerBlock: Module {
 
         return args.replacing(x: x)
     }
+
 }
 
 // MARK: - Transformer Blocks Stack

@@ -337,11 +337,6 @@ public struct LTXVideoGenerationConfig: Sendable {
     /// End time (seconds) for partial retake. nil = retake all frames.
     public var retakeEndTime: Float?
 
-    /// DiTFastAttn: skip self-attention on middle denoising steps and reuse
-    /// cached attention output from the previous step. Reduces denoising time
-    /// by ~25-35% with minimal quality impact on middle steps.
-    public var fastAttention: Bool
-
     public init(
         width: Int = 704,
         height: Int = 480,
@@ -354,8 +349,7 @@ public struct LTXVideoGenerationConfig: Sendable {
         videoPath: String? = nil,
         retakeStrength: Float = 0.8,
         retakeStartTime: Float? = nil,
-        retakeEndTime: Float? = nil,
-        fastAttention: Bool = false
+        retakeEndTime: Float? = nil
     ) {
         self.width = width
         self.height = height
@@ -369,7 +363,6 @@ public struct LTXVideoGenerationConfig: Sendable {
         self.retakeStrength = retakeStrength
         self.retakeStartTime = retakeStartTime
         self.retakeEndTime = retakeEndTime
-        self.fastAttention = fastAttention
     }
 
     /// Convenience initializer that applies model-specific defaults.
@@ -386,8 +379,7 @@ public struct LTXVideoGenerationConfig: Sendable {
         videoPath: String? = nil,
         retakeStrength: Float = 0.8,
         retakeStartTime: Float? = nil,
-        retakeEndTime: Float? = nil,
-        fastAttention: Bool = false
+        retakeEndTime: Float? = nil
     ) {
         self.width = width
         self.height = height
@@ -401,7 +393,6 @@ public struct LTXVideoGenerationConfig: Sendable {
         self.retakeStrength = retakeStrength
         self.retakeStartTime = retakeStartTime
         self.retakeEndTime = retakeEndTime
-        self.fastAttention = fastAttention
     }
 
     /// Validate the configuration

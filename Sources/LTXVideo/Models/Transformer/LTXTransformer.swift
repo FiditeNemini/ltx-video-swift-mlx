@@ -261,8 +261,7 @@ class LTXTransformer: Module {
         context: MLXArray,
         timesteps: MLXArray,
         contextMask: MLXArray? = nil,
-        latentShape: (frames: Int, height: Int, width: Int),
-        reuseCachedSelfAttention: Bool = false
+        latentShape: (frames: Int, height: Int, width: Int)
     ) -> MLXArray {
         let startTime = Date()
         var lastTime = startTime
@@ -399,8 +398,6 @@ class LTXTransformer: Module {
             embeddedTimestep: embeddedTimestep,
             promptTimesteps: promptTs
         )
-
-        args.reuseCachedSelfAttention = reuseCachedSelfAttention
 
         // Process through transformer blocks
         let blocksStart = Date()
