@@ -97,6 +97,26 @@ struct Generate: AsyncParsableCommand {
             LTXDebug.enableDebugMode()
         }
 
+        // Attach profiling session when --profile is enabled
+        var profilingSession: ProfilingSession? = nil
+        if profile {
+            let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
+            session.modelVariant = "distilled"
+            session.quantization = mixedPrecision ? "mixed" : transformerQuant
+            session.resolution = "\(width)x\(height)"
+            session.frames = frames
+            session.steps = 8
+            profilingSession = session
+            LTXVideoProfiler.shared.enable()
+            LTXVideoProfiler.shared.activeSession = session
+        }
+        defer {
+            if profile {
+                LTXVideoProfiler.shared.activeSession = nil
+                LTXVideoProfiler.shared.disable()
+            }
+        }
+
         let isI2V = image != nil
 
         print("LTX-2.3 Video Generation (Two-Stage Distilled)")
@@ -283,23 +303,9 @@ struct Generate: AsyncParsableCommand {
             print("Audio sample rate: \(result.audioSampleRate ?? 0) Hz")
         }
 
-        // Print detailed profiling if enabled
-        if profile, let t = result.timings {
-            let f = { (v: Double) -> String in String(format: "%.1f", v) }
-            print("\n--- Profiling ---")
-            print("Text Encoding (Gemma + FE + Connector): \(f(t.textEncoding))s")
-            print("Denoising (\(t.denoiseSteps.count) steps):                 \(f(t.totalDenoise))s")
-            for (i, stepTime) in t.denoiseSteps.enumerated() {
-                print("  Step \(i): \(f(stepTime))s")
-            }
-            print("  Average per step:                      \(f(t.avgStepTime))s")
-            print("VAE Decoding:                            \(f(t.vaeDecode))s")
-            print("Model Loading:                           \(f(loadTime))s")
-            let pipelineTotal = t.textEncoding + t.totalDenoise + t.vaeDecode
-            print("Pipeline total (excl. loading/export):   \(f(pipelineTotal))s")
-            print("\n--- Memory ---")
-            print("Peak GPU memory:                         \(t.peakMemoryMB) MB")
-            print("Mean GPU memory (denoising):              \(t.meanMemoryMB) MB")
+        // Print profiling report
+        if let session = profilingSession {
+            print(session.generateReport())
         }
     }
 }
@@ -381,6 +387,26 @@ struct Retake: AsyncParsableCommand {
 
         if debug {
             LTXDebug.enableDebugMode()
+        }
+
+        // Attach profiling session when --profile is enabled
+        var profilingSession: ProfilingSession? = nil
+        if profile {
+            let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
+            session.modelVariant = distilled ? "distilled" : "dev"
+            session.quantization = mixedPrecision ? "mixed" : transformerQuant
+            session.resolution = "\(width)x\(height)"
+            session.frames = frames
+            session.steps = distilled ? 8 : 30
+            profilingSession = session
+            LTXVideoProfiler.shared.enable()
+            LTXVideoProfiler.shared.activeSession = session
+        }
+        defer {
+            if profile {
+                LTXVideoProfiler.shared.activeSession = nil
+                LTXVideoProfiler.shared.disable()
+            }
         }
 
         print("LTX-2.3 Video Retake (Single-Stage)")
@@ -515,22 +541,8 @@ struct Retake: AsyncParsableCommand {
         print("Strength: \(strength)")
         print("Generation time: \(String(format: "%.1f", result.generationTime))s")
 
-        if profile, let t = result.timings {
-            let f = { (v: Double) -> String in String(format: "%.1f", v) }
-            print("\n--- Profiling ---")
-            print("Text Encoding (Gemma + FE + Connector): \(f(t.textEncoding))s")
-            print("Denoising (\(t.denoiseSteps.count) steps):                 \(f(t.totalDenoise))s")
-            for (i, stepTime) in t.denoiseSteps.enumerated() {
-                print("  Step \(i): \(f(stepTime))s")
-            }
-            print("  Average per step:                      \(f(t.avgStepTime))s")
-            print("VAE Decoding:                            \(f(t.vaeDecode))s")
-            print("Model Loading:                           \(f(loadTime))s")
-            let pipelineTotal = t.textEncoding + t.totalDenoise + t.vaeDecode
-            print("Pipeline total (excl. loading/export):   \(f(pipelineTotal))s")
-            print("\n--- Memory ---")
-            print("Peak GPU memory:                         \(t.peakMemoryMB) MB")
-            print("Mean GPU memory (denoising):              \(t.meanMemoryMB) MB")
+        if let session = profilingSession {
+            print(session.generateReport())
         }
     }
 }
