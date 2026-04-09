@@ -2,6 +2,7 @@
 // Copyright 2026 Vincent Gourbin
 
 import Foundation
+import IOKit
 import MLX
 import os
 
@@ -64,7 +65,7 @@ public final class ProfilingSession: @unchecked Sendable {
                 timestampUs: ts, context: "begin:\(name)",
                 mlxActiveMB: Double(snap.mlxActive) / 1_048_576, mlxCacheMB: Double(snap.mlxCache) / 1_048_576,
                 mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576,
-                cpuTimeSeconds: snap.cpuTime
+                cpuTimeSeconds: snap.cpuTime, gpuUtilization: snap.gpuUtilization
             ))
         }
         lock.unlock()
@@ -90,7 +91,7 @@ public final class ProfilingSession: @unchecked Sendable {
                 timestampUs: ts, context: "end:\(name)",
                 mlxActiveMB: Double(snap.mlxActive) / 1_048_576, mlxCacheMB: Double(snap.mlxCache) / 1_048_576,
                 mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576,
-                cpuTimeSeconds: snap.cpuTime
+                cpuTimeSeconds: snap.cpuTime, gpuUtilization: snap.gpuUtilization
             ))
         }
         lock.unlock()
@@ -125,7 +126,7 @@ public final class ProfilingSession: @unchecked Sendable {
                 timestampUs: ts, context: "step:\(index)/\(total)",
                 mlxActiveMB: Double(snap.mlxActive) / 1_048_576, mlxCacheMB: Double(snap.mlxCache) / 1_048_576,
                 mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576,
-                cpuTimeSeconds: snap.cpuTime
+                cpuTimeSeconds: snap.cpuTime, gpuUtilization: snap.gpuUtilization
             ))
         }
         lock.unlock()
@@ -143,7 +144,7 @@ public final class ProfilingSession: @unchecked Sendable {
             timestampUs: ts, context: context,
             mlxActiveMB: activeMB, mlxCacheMB: cacheMB,
             mlxPeakMB: peakMB, processFootprintMB: footprintMB,
-            cpuTimeSeconds: snap.cpuTime
+            cpuTimeSeconds: snap.cpuTime, gpuUtilization: snap.gpuUtilization
         ))
         lock.unlock()
     }
@@ -165,14 +166,15 @@ public final class ProfilingSession: @unchecked Sendable {
     // MARK: - Memory Snapshot
 
     private struct RawMemorySnapshot {
-        let mlxActive: Int; let mlxCache: Int; let mlxPeak: Int; let processFootprint: Int64; let cpuTime: Double
+        let mlxActive: Int; let mlxCache: Int; let mlxPeak: Int; let processFootprint: Int64
+        let cpuTime: Double; let gpuUtilization: Int
     }
 
     private func takeMemorySnapshot() -> RawMemorySnapshot {
         RawMemorySnapshot(
             mlxActive: Memory.activeMemory, mlxCache: Memory.cacheMemory,
             mlxPeak: Memory.peakMemory, processFootprint: Self.getProcessFootprint(),
-            cpuTime: Self.getProcessCPUTime()
+            cpuTime: Self.getProcessCPUTime(), gpuUtilization: Self.getGPUUtilization()
         )
     }
 
@@ -196,20 +198,45 @@ public final class ProfilingSession: @unchecked Sendable {
         return userSec + sysSec
     }
 
+    /// Get instantaneous GPU utilization % from IOKit (Apple Silicon)
+    private static func getGPUUtilization() -> Int {
+        var iterator: io_iterator_t = 0
+        let matching = IOServiceMatching("IOAccelerator")
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else { return 0 }
+        defer { IOObjectRelease(iterator) }
+
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            var properties: Unmanaged<CFMutableDictionary>?
+            if IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+               let dict = properties?.takeRetainedValue() as? [String: Any],
+               let perfStats = dict["PerformanceStatistics"] as? [String: Any],
+               let utilization = perfStats["Device Utilization %"] as? Int {
+                IOObjectRelease(service)
+                return utilization
+            }
+            IOObjectRelease(service)
+            service = IOIteratorNext(iterator)
+        }
+        return 0
+    }
+
     // MARK: - Report Generation
 
     public func generateReport() -> String {
         let events = getEvents()
         let timeline = getMemoryTimeline()
 
-        var phases: [(name: String, category: ProfilingCategory, durationMs: Double, cpuPct: Double)] = []
+        var phases: [(name: String, category: ProfilingCategory, durationMs: Double, cpuPct: Double, gpuPct: Int)] = []
         var stepDurations: [Double] = []
         var beginTimestamps: [String: (ts: UInt64, cat: ProfilingCategory)] = [:]
 
-        // Build CPU time map from timeline (begin/end pairs)
+        // Build CPU time and GPU util maps from timeline (begin/end pairs)
         var cpuTimeAtPoint: [String: Double] = [:]
+        var gpuUtilAtPoint: [String: Int] = [:]
         for entry in timeline {
             cpuTimeAtPoint[entry.context] = entry.cpuTimeSeconds
+            gpuUtilAtPoint[entry.context] = entry.gpuUtilization
         }
 
         for event in events {
@@ -227,7 +254,12 @@ public final class ProfilingSession: @unchecked Sendable {
                     let cpuDelta = cpuEnd - cpuBegin
                     let cpuPct = wallSec > 0 ? (cpuDelta / wallSec) * 100 : 0
 
-                    phases.append((name: event.name, category: begin.cat, durationMs: wallMs, cpuPct: cpuPct))
+                    // GPU: average of begin and end readings
+                    let gpuBegin = gpuUtilAtPoint["begin:\(event.name)"] ?? 0
+                    let gpuEnd = gpuUtilAtPoint["end:\(event.name)"] ?? 0
+                    let gpuAvg = (gpuBegin + gpuEnd) / 2
+
+                    phases.append((name: event.name, category: begin.cat, durationMs: wallMs, cpuPct: cpuPct, gpuPct: gpuAvg))
                     beginTimestamps.removeValue(forKey: event.name)
                 }
             case .complete:
@@ -253,14 +285,15 @@ public final class ProfilingSession: @unchecked Sendable {
         report += "  Resolution: \(resolution)  Frames: \(frames)  Steps: \(steps)\n"
         report += "  Device: \(deviceArchitecture)  RAM: \(systemRAMGB)GB\n\n"
 
-        report += "  PHASE TIMINGS                                        CPU%\n"
-        report += "  \(String(repeating: "\u{2500}", count: 62))\n"
+        report += "  PHASE TIMINGS                                    GPU%   CPU%\n"
+        report += "  \(String(repeating: "\u{2500}", count: 66))\n"
         for phase in phases {
             let pct = totalMs > 0 ? (phase.durationMs / totalMs) * 100 : 0
-            let bar = String(repeating: "\u{2588}", count: min(12, Int(pct / 8)))
-            let name = phase.name.padding(toLength: 24, withPad: " ", startingAt: 0)
+            let bar = String(repeating: "\u{2588}", count: min(10, Int(pct / 10)))
+            let name = phase.name.padding(toLength: 22, withPad: " ", startingAt: 0)
+            let gpuStr = String(format: "%3d%%", phase.gpuPct)
             let cpuStr = phase.cpuPct > 0 ? String(format: "%5.1f%%", phase.cpuPct) : "   -  "
-            report += "  \(name) \(formatDuration(phase.durationMs / 1000))  \(String(format: "%5.1f", pct))% \(bar)  \(cpuStr)\n"
+            report += "  \(name) \(formatDuration(phase.durationMs / 1000))  \(String(format: "%5.1f", pct))% \(bar)  \(gpuStr)  \(cpuStr)\n"
         }
         report += "  \(String(repeating: "\u{2500}", count: 58))\n"
         report += "  \("TOTAL".padding(toLength: 28, withPad: " ", startingAt: 0)) \(formatDuration(totalMs / 1000))  100.0%\n"

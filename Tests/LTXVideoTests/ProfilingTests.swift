@@ -487,10 +487,11 @@ struct MemoryTimelineEntryTests {
             timestampUs: 1000, context: "test",
             mlxActiveMB: 1024.5, mlxCacheMB: 256.0,
             mlxPeakMB: 2048.0, processFootprintMB: 4096.0,
-            cpuTimeSeconds: 12.5
+            cpuTimeSeconds: 12.5, gpuUtilization: 85
         )
         #expect(entry.mlxActiveMB == 1024.5)
         #expect(entry.processFootprintMB == 4096.0)
         #expect(entry.cpuTimeSeconds == 12.5)
+        #expect(entry.gpuUtilization == 85)
     }
 }
