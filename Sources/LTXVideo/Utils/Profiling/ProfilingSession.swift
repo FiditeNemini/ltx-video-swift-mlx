@@ -3,6 +3,7 @@
 
 import Foundation
 import MLX
+import os
 
 /// Collects profiling events during a generation run
 public final class ProfilingSession: @unchecked Sendable {
@@ -24,6 +25,10 @@ public final class ProfilingSession: @unchecked Sendable {
     private let lock = NSLock()
     private let sessionStartTime: CFAbsoluteTime
 
+    // os_signpost for Instruments integration — visible in Points of Interest lane
+    private let signposter = OSSignposter(subsystem: "com.ltxvideo.pipeline", category: .pointsOfInterest)
+    private var activeSignpostIDs: [String: (id: OSSignpostID, state: OSSignpostIntervalState)] = [:]
+
     public init(config: ProfilingConfig = .singleRun) {
         self.sessionId = UUID().uuidString
         self.startTime = Date()
@@ -42,6 +47,11 @@ public final class ProfilingSession: @unchecked Sendable {
     public func beginPhase(_ name: String, category: ProfilingCategory) {
         let ts = currentTimestampUs()
         let snapshot = config.trackMemory ? takeMemorySnapshot() : nil
+
+        // Emit os_signpost for Instruments (visible in Points of Interest)
+        let spID = signposter.makeSignpostID()
+        let state = signposter.beginInterval("Phase", id: spID, "\(name)")
+        activeSignpostIDs[name] = (id: spID, state: state)
 
         lock.lock()
         events.append(ProfilingEvent(
@@ -63,6 +73,11 @@ public final class ProfilingSession: @unchecked Sendable {
     public func endPhase(_ name: String, category: ProfilingCategory) {
         let ts = currentTimestampUs()
         let snapshot = config.trackMemory ? takeMemorySnapshot() : nil
+
+        // End os_signpost interval
+        if let entry = activeSignpostIDs.removeValue(forKey: name) {
+            signposter.endInterval("Phase", entry.state, "\(name) done")
+        }
 
         lock.lock()
         events.append(ProfilingEvent(
@@ -90,6 +105,9 @@ public final class ProfilingSession: @unchecked Sendable {
     }
 
     public func recordDenoisingStep(index: Int, total: Int, durationUs: UInt64) {
+        // Emit signpost event for this step
+        signposter.emitEvent("Step", id: signposter.makeSignpostID(), "Step \(index)/\(total) \(durationUs / 1000)ms")
+
         let ts = currentTimestampUs()
         let startTs = ts >= durationUs ? ts - durationUs : 0
         let snapshot = config.trackPerStepMemory ? takeMemorySnapshot() : nil
