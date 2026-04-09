@@ -62,12 +62,9 @@ public struct ChromeTraceExporter {
             let cpuDelta = curr.cpuTimeSeconds - prev.cpuTimeSeconds
             let cpuPct = wallDelta > 0 ? min((cpuDelta / wallDelta) * 100, 800) : 0
             traceEvents.append([
-                "name": "Utilization" as Any, "cat": "cpu" as Any, "ph": "C" as Any,
+                "name": "CPU" as Any, "cat": "cpu" as Any, "ph": "C" as Any,
                 "ts": Int(curr.timestampUs) as Any, "pid": pid as Any, "tid": 8 as Any,
-                "args": [
-                    "CPU (%)": round(cpuPct * 10) / 10,
-                    "GPU (%, estimated)": round(max(0, 100 - cpuPct) * 10) / 10,
-                ] as [String: Any],
+                "args": ["CPU (%, all threads)": round(cpuPct * 10) / 10] as [String: Any],
             ])
         }
 
