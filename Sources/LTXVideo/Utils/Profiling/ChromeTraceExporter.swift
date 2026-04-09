@@ -40,7 +40,9 @@ public struct ChromeTraceExporter {
             traceEvents.append(traceEvent)
         }
 
-        for entry in session.getMemoryTimeline() {
+        let timeline = session.getMemoryTimeline()
+        for entry in timeline {
+            // Memory counters (thread 7)
             traceEvents.append([
                 "name": "Memory" as Any, "cat": "memory" as Any, "ph": "C" as Any,
                 "ts": Int(entry.timestampUs) as Any, "pid": pid as Any, "tid": 7 as Any,
@@ -48,6 +50,23 @@ public struct ChromeTraceExporter {
                     "MLX Active (MB)": round(entry.mlxActiveMB * 10) / 10,
                     "MLX Cache (MB)": round(entry.mlxCacheMB * 10) / 10,
                     "Process (MB)": round(entry.processFootprintMB * 10) / 10,
+                ] as [String: Any],
+            ])
+        }
+
+        // CPU% counters — compute instantaneous CPU% between consecutive snapshots
+        for i in 1..<timeline.count {
+            let prev = timeline[i - 1]
+            let curr = timeline[i]
+            let wallDelta = Double(curr.timestampUs - prev.timestampUs) / 1_000_000
+            let cpuDelta = curr.cpuTimeSeconds - prev.cpuTimeSeconds
+            let cpuPct = wallDelta > 0 ? min((cpuDelta / wallDelta) * 100, 800) : 0
+            traceEvents.append([
+                "name": "Utilization" as Any, "cat": "cpu" as Any, "ph": "C" as Any,
+                "ts": Int(curr.timestampUs) as Any, "pid": pid as Any, "tid": 8 as Any,
+                "args": [
+                    "CPU (%)": round(cpuPct * 10) / 10,
+                    "GPU (%, estimated)": round(max(0, 100 - cpuPct) * 10) / 10,
                 ] as [String: Any],
             ])
         }
