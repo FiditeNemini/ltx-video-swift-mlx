@@ -67,7 +67,7 @@ struct MemoryOptimizationConfigTests {
         #expect(r64.evalFrequency == 2)  // moderate (33-64)
 
         let r96 = MemoryOptimizationConfig.recommended(forRAMGB: 96)
-        #expect(r96.evalFrequency == 8)  // disabled (96+)
+        #expect(r96.evalFrequency == 4)  // light (65-96)
 
         let r128 = MemoryOptimizationConfig.recommended(forRAMGB: 128)
         #expect(r128.evalFrequency == 8) // disabled (96+)
