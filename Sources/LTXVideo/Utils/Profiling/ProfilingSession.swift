@@ -111,6 +111,11 @@ public final class ProfilingSession: @unchecked Sendable {
 
         let ts = currentTimestampUs()
         let startTs = ts >= durationUs ? ts - durationUs : 0
+
+        // Always sample GPU% and CPU time at each step (lightweight IOKit call)
+        let gpuUtil = Self.getGPUUtilization()
+        let cpuTime = Self.getProcessCPUTime()
+
         let snapshot = config.trackPerStepMemory ? takeMemorySnapshot() : nil
 
         lock.lock()
@@ -121,13 +126,20 @@ public final class ProfilingSession: @unchecked Sendable {
             mlxPeakBytes: snapshot?.mlxPeak, processFootprintBytes: snapshot?.processFootprint,
             stepIndex: index, totalSteps: total
         ))
-        if config.trackPerStepMemory, let snap = snapshot {
-            memoryTimeline.append(MemoryTimelineEntry(
-                timestampUs: ts, context: "step:\(index)/\(total)",
-                mlxActiveMB: Double(snap.mlxActive) / 1_048_576, mlxCacheMB: Double(snap.mlxCache) / 1_048_576,
-                mlxPeakMB: Double(snap.mlxPeak) / 1_048_576, processFootprintMB: Double(snap.processFootprint) / 1_048_576,
-                cpuTimeSeconds: snap.cpuTime, gpuUtilization: snap.gpuUtilization
-            ))
+
+        // Always record GPU/CPU timeline at each step for accurate utilization tracking
+        let activeMB = Double(snapshot?.mlxActive ?? Memory.activeMemory) / 1_048_576
+        let cacheMB = Double(snapshot?.mlxCache ?? Memory.cacheMemory) / 1_048_576
+        let peakMB = Double(snapshot?.mlxPeak ?? Memory.peakMemory) / 1_048_576
+        let footprintMB = Double(snapshot?.processFootprint ?? Self.getProcessFootprint()) / 1_048_576
+        memoryTimeline.append(MemoryTimelineEntry(
+            timestampUs: ts, context: "step:\(index)/\(total)",
+            mlxActiveMB: activeMB, mlxCacheMB: cacheMB,
+            mlxPeakMB: peakMB, processFootprintMB: footprintMB,
+            cpuTimeSeconds: cpuTime, gpuUtilization: gpuUtil
+        ))
+
+        if false {  // keep old trackPerStepMemory branch dead for now
         }
         lock.unlock()
     }
@@ -231,12 +243,24 @@ public final class ProfilingSession: @unchecked Sendable {
         var stepDurations: [Double] = []
         var beginTimestamps: [String: (ts: UInt64, cat: ProfilingCategory)] = [:]
 
-        // Build CPU time and GPU util maps from timeline (begin/end pairs)
+        // Build CPU time map and GPU samples per phase from timeline
         var cpuTimeAtPoint: [String: Double] = [:]
-        var gpuUtilAtPoint: [String: Int] = [:]
+        var gpuSamplesPerPhase: [String: [Int]] = [:]
+        var currentPhase: String? = nil
         for entry in timeline {
             cpuTimeAtPoint[entry.context] = entry.cpuTimeSeconds
-            gpuUtilAtPoint[entry.context] = entry.gpuUtilization
+
+            if entry.context.hasPrefix("begin:") {
+                currentPhase = String(entry.context.dropFirst(6))
+                gpuSamplesPerPhase[currentPhase!, default: []].append(entry.gpuUtilization)
+            } else if entry.context.hasPrefix("end:") {
+                let phase = String(entry.context.dropFirst(4))
+                gpuSamplesPerPhase[phase, default: []].append(entry.gpuUtilization)
+                if currentPhase == phase { currentPhase = nil }
+            } else if entry.context.hasPrefix("step:"), let phase = currentPhase {
+                // Step samples belong to the current active phase
+                gpuSamplesPerPhase[phase, default: []].append(entry.gpuUtilization)
+            }
         }
 
         for event in events {
@@ -254,10 +278,9 @@ public final class ProfilingSession: @unchecked Sendable {
                     let cpuDelta = cpuEnd - cpuBegin
                     let cpuPct = wallSec > 0 ? (cpuDelta / wallSec) * 100 : 0
 
-                    // GPU: average of begin and end readings
-                    let gpuBegin = gpuUtilAtPoint["begin:\(event.name)"] ?? 0
-                    let gpuEnd = gpuUtilAtPoint["end:\(event.name)"] ?? 0
-                    let gpuAvg = (gpuBegin + gpuEnd) / 2
+                    // GPU: average of ALL samples during this phase (begin + steps + end)
+                    let gpuSamples = gpuSamplesPerPhase[event.name] ?? []
+                    let gpuAvg = gpuSamples.isEmpty ? 0 : gpuSamples.reduce(0, +) / gpuSamples.count
 
                     phases.append((name: event.name, category: begin.cat, durationMs: wallMs, cpuPct: cpuPct, gpuPct: gpuAvg))
                     beginTimestamps.removeValue(forKey: event.name)
