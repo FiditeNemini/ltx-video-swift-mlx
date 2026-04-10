@@ -39,14 +39,34 @@ struct TransformerQuantizationTests {
     }
 
     @Test func testAllCases() {
-        #expect(TransformerQuantization.allCases.count == 3)
+        #expect(TransformerQuantization.allCases.count == 5)
     }
 
     @Test func testRawValueInit() {
         #expect(TransformerQuantization(rawValue: "bf16") == .bf16)
         #expect(TransformerQuantization(rawValue: "qint8") == .qint8)
         #expect(TransformerQuantization(rawValue: "int4") == .int4)
+        #expect(TransformerQuantization(rawValue: "nvfp4") == .nvfp4)
+        #expect(TransformerQuantization(rawValue: "mxfp8") == .mxfp8)
         #expect(TransformerQuantization(rawValue: "fp32") == nil)
+    }
+
+    @Test func testNvfp4() {
+        let q = TransformerQuantization.nvfp4
+        #expect(q.bits == 4)
+        #expect(q.groupSize == 32)
+        #expect(q.needsQuantization)
+        #expect(q.memoryReduction == 0.25)
+        #expect(q.displayName.contains("NVFP4"))
+    }
+
+    @Test func testMxfp8() {
+        let q = TransformerQuantization.mxfp8
+        #expect(q.bits == 8)
+        #expect(q.groupSize == 32)
+        #expect(q.needsQuantization)
+        #expect(q.memoryReduction == 0.5)
+        #expect(q.displayName.contains("MXFP8"))
     }
 }
 

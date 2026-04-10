@@ -335,9 +335,10 @@ public actor LTXPipeline {
             stepStart = Date()
             let bits = quantization.transformer.bits
             let groupSize = quantization.transformer.groupSize
-            LTXDebug.log("Quantizing transformer to \(bits)-bit (groupSize=\(groupSize))...")
-            progressCallback?(DownloadProgress(progress: 0.6, message: "Quantizing transformer to \(bits)-bit..."))
-            quantize(model: transformer!, groupSize: groupSize, bits: bits)
+            let mode = quantization.transformer.quantizationMode
+            LTXDebug.log("Quantizing transformer to \(quantization.transformer.rawValue) (groupSize=\(groupSize), mode=\(mode))...")
+            progressCallback?(DownloadProgress(progress: 0.6, message: "Quantizing transformer to \(quantization.transformer.displayName)..."))
+            quantize(model: transformer!, groupSize: groupSize, bits: bits, mode: mode)
             eval(transformer!.parameters())
             Memory.clearCache()
             LTXDebug.log("[TIME] Transformer quantization: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
@@ -505,10 +506,10 @@ public actor LTXPipeline {
             applyMixedPrecisionQuantization(to: ltx2, config: mixedConfig)
             eval(ltx2.parameters())
             Memory.clearCache()
-        } else if quantization.transformer == .qint8 || quantization.transformer == .int4 {
-            let bits = quantization.transformer == .qint8 ? 8 : 4
-            LTXDebug.log("Quantizing LTX2 transformer to \(quantization.transformer)...")
-            quantize(model: ltx2, groupSize: 64, bits: bits)
+        } else if quantization.transformer.needsQuantization {
+            let q = quantization.transformer
+            LTXDebug.log("Quantizing LTX2 transformer to \(q.displayName)...")
+            quantize(model: ltx2, groupSize: q.groupSize, bits: q.bits, mode: q.quantizationMode)
             eval(ltx2.parameters())
             Memory.clearCache()
         }
@@ -1685,6 +1686,30 @@ public actor LTXPipeline {
     ///
     /// - Parameters:
     ///   - loraPath: Path to LoRA .safetensors file
+    // MARK: - Export Quantized Transformer
+
+    /// Export the current transformer weights to a safetensors file.
+    ///
+    /// Call after `loadModels()` with quantization configured. The exported file
+    /// contains the quantized `QuantizedLinear` weights (weight, scales, biases)
+    /// which can be loaded directly without re-quantization.
+    ///
+    /// - Parameter path: Output safetensors file path
+    public func exportQuantizedTransformer(to path: String) throws {
+        let model: Module
+        if let ltx2 = ltx2Transformer {
+            model = ltx2
+        } else if let t = transformer {
+            model = t
+        } else {
+            throw LTXError.modelNotLoaded("No transformer loaded")
+        }
+
+        let params = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        try MLX.save(arrays: params, url: URL(fileURLWithPath: path))
+        LTXDebug.log("Exported \(params.count) tensors to \(path)")
+    }
+
     // MARK: - Mixed Precision Quantization
 
     /// Apply per-block quantization: high-precision blocks get one bit level,
