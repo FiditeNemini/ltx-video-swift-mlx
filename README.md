@@ -282,11 +282,28 @@ flowchart TD
 | `--audio` | off | Enable audio generation |
 | `--audio-gain` | `1.0` | Audio gain (linear) |
 | `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
-| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4`, `nvfp4`, `mxfp8` |
 | `--mixed-precision` | off | Per-block quantization: first/last 6 blocks qint8, middle int4 |
 | `--bitrate` | auto | Video bitrate in kbps |
 | `--debug` | off | Debug output |
 | `--profile` | off | GPU/CPU profiling report + Chrome Trace export |
+
+### `ltx-video export-quantized`
+
+Export a quantized transformer to safetensors for reuse (skip on-the-fly quantization).
+
+```bash
+ltx-video export-quantized \
+    --input /path/to/ltx-2.3-22b-distilled.safetensors \
+    --output /path/to/ltx-2.3-22b-distilled-nvfp4.safetensors \
+    --mode nvfp4
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | required | Path to bf16 unified weights |
+| `-o, --output` | required | Output safetensors path |
+| `--mode` | `nvfp4` | Quantization mode: `nvfp4`, `mxfp8`, `qint8`, `int4` |
 
 ### `ltx-video retake`
 
@@ -303,7 +320,7 @@ flowchart TD
 | `--seed` | random | Random seed |
 | `--distilled` | off | Use distilled model (8 steps, fast). Default: dev (30 steps + CFG) |
 | `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
-| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4`, `nvfp4`, `mxfp8` |
 | `--mixed-precision` | off | Per-block quantization: first/last 6 blocks qint8, middle int4 |
 | `--regenerate-audio` | off | Regenerate audio via dual denoising (default: preserve source audio) |
 | `--profile` | off | GPU/CPU profiling report + Chrome Trace export |
@@ -323,7 +340,7 @@ flowchart TD
 | `-w, --width` | `256` | Training video width (divisible by 32) |
 | `-h, --height` | `256` | Training video height (divisible by 32) |
 | `-f, --frames` | `9` | Frame count (must be 8n+1) |
-| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+| `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4`, `nvfp4`, `mxfp8` |
 | `--lora-blocks` | `0` | Train only last N blocks (0 = all). Reduces memory for long videos |
 | `--trigger-word` | none | Trigger word to prepend to captions |
 | `--grad-accum` | `1` | Gradient accumulation steps |

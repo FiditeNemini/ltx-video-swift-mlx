@@ -11,7 +11,7 @@ struct LTXVideoCLI: AsyncParsableCommand {
         commandName: "ltx-video",
         abstract: "LTX-2.3 video generation on Mac with MLX",
         version: "0.1.0",
-        subcommands: [Generate.self, Retake.self, Profile.self, Download.self, Train.self, TrainingControl.self, Models.self, Info.self],
+        subcommands: [Generate.self, Retake.self, Profile.self, ExportQuantized.self, Download.self, Train.self, TrainingControl.self, Models.self, Info.self],
         defaultSubcommand: Info.self
     )
 }
@@ -59,7 +59,7 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "LoRA scale factor (default: 1.0)")
     var loraScale: Float = 1.0
 
-    @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
+    @Option(name: .long, help: "Transformer quantization: bf16, qint8, int4, nvfp4, mxfp8")
     var transformerQuant: String = "bf16"
 
     @Flag(name: .long, help: "Mixed precision: first/last 6 blocks qint8, middle blocks int4")
@@ -360,7 +360,7 @@ struct Retake: AsyncParsableCommand {
     @Flag(name: .long, help: "Regenerate audio (instead of preserving source audio)")
     var regenerateAudio: Bool = false
 
-    @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
+    @Option(name: .long, help: "Transformer quantization: bf16, qint8, int4, nvfp4, mxfp8")
     var transformerQuant: String = "bf16"
 
     @Flag(name: .long, help: "Mixed precision: first/last 6 blocks qint8, middle blocks int4")
@@ -591,6 +591,65 @@ struct Retake: AsyncParsableCommand {
             try traceData.write(to: URL(fileURLWithPath: tracePath))
             print("Chrome Trace: \(tracePath)  (open in https://ui.perfetto.dev/)")
         }
+    }
+}
+
+// MARK: - Export Quantized Command
+
+struct ExportQuantized: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "export-quantized",
+        abstract: "Export a quantized transformer to safetensors (nvfp4, mxfp8, qint8, int4)"
+    )
+
+    @Option(name: .long, help: "Path to input unified weights (bf16 safetensors)")
+    var input: String
+
+    @Option(name: .shortAndLong, help: "Output safetensors file path")
+    var output: String
+
+    @Option(name: .long, help: "Quantization mode: nvfp4, mxfp8, qint8, int4")
+    var mode: String = "nvfp4"
+
+    mutating func run() async throws {
+        guard let quantOption = TransformerQuantization(rawValue: mode) else {
+            throw ValidationError("Invalid mode: \(mode). Use: nvfp4, mxfp8, qint8, int4")
+        }
+        guard quantOption.needsQuantization else {
+            throw ValidationError("Mode bf16 does not need quantization — just copy the file")
+        }
+
+        print("Export Quantized Transformer")
+        print("===========================")
+        print("Input: \(input)")
+        print("Output: \(output)")
+        print("Mode: \(quantOption.displayName) (groupSize=\(quantOption.groupSize), mode=\(quantOption.quantizationMode))")
+        print()
+
+        // Use pipeline to handle weight loading (it knows the mapping)
+        let quantConfig = LTXQuantizationConfig(transformer: quantOption)
+        let pipeline = LTXPipeline(model: .distilled, quantization: quantConfig)
+
+        print("Loading and quantizing transformer...")
+        fflush(stdout)
+        let startLoad = Date()
+        try await pipeline.loadModels(
+            progressCallback: { progress in
+                print("  \(progress.message) (\(Int(progress.progress * 100))%)")
+            },
+            ltxWeightsPath: input
+        )
+        print("Loaded and quantized in \(String(format: "%.1f", Date().timeIntervalSince(startLoad)))s")
+
+        // Export quantized parameters
+        print("Exporting to \(output)...")
+        fflush(stdout)
+        try await pipeline.exportQuantizedTransformer(to: output)
+
+        let fileSize = try FileManager.default.attributesOfItem(atPath: output)[.size] as? Int64 ?? 0
+        let fileSizeGB = Double(fileSize) / (1024 * 1024 * 1024)
+        print("Exported: \(output) (\(String(format: "%.1f", fileSizeGB)) GB)")
+        print("Done!")
     }
 }
 

@@ -2,6 +2,8 @@
 // Copyright 2025
 
 import Foundation
+@preconcurrency import MLX
+import MLXNN
 
 // MARK: - Transformer Quantization
 
@@ -11,26 +13,48 @@ import Foundation
 /// after weight loading, reducing memory usage at the cost of some quality.
 ///
 /// ## Memory estimates (LTX-2 transformer only)
-/// | Option | Bits | Transformer RAM |
-/// |--------|------|-----------------|
-/// | bf16   | 16   | ~25 GB          |
-/// | qint8  | 8    | ~13 GB          |
-/// | int4   | 4    | ~7 GB           |
+/// | Option | Bits | Transformer RAM | Format |
+/// |--------|------|-----------------|--------|
+/// | bf16   | 16   | ~25 GB          | Full precision |
+/// | qint8  | 8    | ~13 GB          | Affine integer |
+/// | int4   | 4    | ~7 GB           | Affine integer |
+/// | nvfp4  | 4    | ~7 GB           | NVIDIA FP4 (logarithmic, better for transformers) |
+/// | mxfp8  | 8    | ~13 GB          | OCP Microscaling FP8 |
 public enum TransformerQuantization: String, CaseIterable, Sendable {
     /// BFloat16 — full precision (default)
     case bf16 = "bf16"
 
-    /// 8-bit quantization (qint8)
+    /// 8-bit affine quantization (qint8)
     case qint8 = "qint8"
 
-    /// 4-bit quantization (int4)
+    /// 4-bit affine quantization (int4)
     case int4 = "int4"
+
+    /// NVIDIA FP4 — 4-bit floating point (1 sign + 2 exp + 1 mantissa).
+    /// Better for transformer weights (gaussian distribution near 0).
+    /// Pre-quantized weights available: `Lightricks/LTX-2.3-nvfp4`
+    case nvfp4 = "nvfp4"
+
+    /// OCP Microscaling FP8 — 8-bit floating point.
+    /// Pre-quantized weights available: `Lightricks/LTX-2.3-fp8`
+    case mxfp8 = "mxfp8"
 
     public var displayName: String {
         switch self {
         case .bf16: return "BFloat16"
         case .qint8: return "8-bit (qint8)"
         case .int4: return "4-bit (int4)"
+        case .nvfp4: return "4-bit (NVFP4)"
+        case .mxfp8: return "8-bit (MXFP8)"
+        }
+    }
+
+    /// MLX quantization mode
+    public var quantizationMode: QuantizationMode {
+        switch self {
+        case .bf16, .qint8, .int4: return .affine
+        case .nvfp4: return .nvfp4
+        case .mxfp8: return .mxfp8
         }
     }
 
@@ -38,13 +62,19 @@ public enum TransformerQuantization: String, CaseIterable, Sendable {
     public var bits: Int {
         switch self {
         case .bf16: return 16
-        case .qint8: return 8
-        case .int4: return 4
+        case .qint8, .mxfp8: return 8
+        case .int4, .nvfp4: return 4
         }
     }
 
-    /// Group size for quantization (standard MLX value)
-    public var groupSize: Int { 64 }
+    /// Group size for quantization
+    public var groupSize: Int {
+        switch self {
+        case .nvfp4: return 32   // NVFP4 default
+        case .mxfp8: return 32   // MXFP8 default
+        default: return 64       // Affine default
+        }
+    }
 
     /// Whether on-the-fly quantization is needed
     public var needsQuantization: Bool {
@@ -55,8 +85,8 @@ public enum TransformerQuantization: String, CaseIterable, Sendable {
     public var memoryReduction: Float {
         switch self {
         case .bf16: return 1.0
-        case .qint8: return 0.5
-        case .int4: return 0.25
+        case .qint8, .mxfp8: return 0.5
+        case .int4, .nvfp4: return 0.25
         }
     }
 }
