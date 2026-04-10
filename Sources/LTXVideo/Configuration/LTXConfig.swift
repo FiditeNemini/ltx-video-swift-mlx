@@ -337,6 +337,11 @@ public struct LTXVideoGenerationConfig: Sendable {
     /// End time (seconds) for partial retake. nil = retake all frames.
     public var retakeEndTime: Float?
 
+    /// Whether to regenerate audio during retake (requires audio models loaded).
+    /// When false (default), source audio is preserved via passthrough.
+    /// When true, audio is denoised alongside video using LTX2Transformer.
+    public var regenerateAudio: Bool
+
     public init(
         width: Int = 704,
         height: Int = 480,
@@ -349,7 +354,8 @@ public struct LTXVideoGenerationConfig: Sendable {
         videoPath: String? = nil,
         retakeStrength: Float = 0.8,
         retakeStartTime: Float? = nil,
-        retakeEndTime: Float? = nil
+        retakeEndTime: Float? = nil,
+        regenerateAudio: Bool = false
     ) {
         self.width = width
         self.height = height
@@ -363,6 +369,7 @@ public struct LTXVideoGenerationConfig: Sendable {
         self.retakeStrength = retakeStrength
         self.retakeStartTime = retakeStartTime
         self.retakeEndTime = retakeEndTime
+        self.regenerateAudio = regenerateAudio
     }
 
     /// Convenience initializer that applies model-specific defaults.
@@ -379,7 +386,8 @@ public struct LTXVideoGenerationConfig: Sendable {
         videoPath: String? = nil,
         retakeStrength: Float = 0.8,
         retakeStartTime: Float? = nil,
-        retakeEndTime: Float? = nil
+        retakeEndTime: Float? = nil,
+        regenerateAudio: Bool = false
     ) {
         self.width = width
         self.height = height
@@ -393,6 +401,7 @@ public struct LTXVideoGenerationConfig: Sendable {
         self.retakeStrength = retakeStrength
         self.retakeStartTime = retakeStartTime
         self.retakeEndTime = retakeEndTime
+        self.regenerateAudio = regenerateAudio
     }
 
     /// Validate the configuration

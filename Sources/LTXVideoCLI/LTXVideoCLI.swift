@@ -357,6 +357,9 @@ struct Retake: AsyncParsableCommand {
     @Flag(name: .long, help: "Use distilled model (8 steps, fast) instead of dev (30 steps + CFG)")
     var distilled: Bool = false
 
+    @Flag(name: .long, help: "Regenerate audio (instead of preserving source audio)")
+    var regenerateAudio: Bool = false
+
     @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
     var transformerQuant: String = "bf16"
 
@@ -482,6 +485,16 @@ struct Retake: AsyncParsableCommand {
         let loadTime = Date().timeIntervalSince(startLoad)
         print("Models loaded in \(String(format: "%.1f", loadTime))s")
 
+        // Load audio models if regenerating audio
+        if regenerateAudio {
+            print("Loading audio models...")
+            fflush(stdout)
+            try await pipeline.loadAudioModels { progress in
+                print("  \(progress.message) (\(Int(progress.progress * 100))%)")
+            }
+            print("Audio models loaded")
+        }
+
         // Build config
         let config = LTXVideoGenerationConfig(
             width: width,
@@ -493,7 +506,8 @@ struct Retake: AsyncParsableCommand {
             videoPath: video,
             retakeStrength: strength,
             retakeStartTime: startTime,
-            retakeEndTime: endTime
+            retakeEndTime: endTime,
+            regenerateAudio: regenerateAudio
         )
 
         // Generate retake (single-stage, no upscaler needed)
@@ -525,19 +539,44 @@ struct Retake: AsyncParsableCommand {
             print("Using target bitrate: \(kbps) kbps")
         }
 
-        // Use source audio passthrough (copy audio track directly, no re-encode)
-        let sourceAudioURL = URL(fileURLWithPath: video)
-        let videoURL = try await VideoExporter.exportVideo(
-            frames: result.frames,
-            width: width,
-            height: height,
-            fps: 24.0,
-            sourceAudioURL: sourceAudioURL,
-            config: exportConfig,
-            to: outputURL
-        )
-        print("Video saved to: \(videoURL.path)")
-        print("Audio: source audio preserved")
+        if let audioWaveform = result.audioWaveform, let audioSampleRate = result.audioSampleRate {
+            // Regenerated audio: mux video + new audio
+            let videoURL = try await VideoExporter.exportVideo(
+                frames: result.frames,
+                width: width,
+                height: height,
+                fps: 24.0,
+                audioWaveform: audioWaveform,
+                audioSampleRate: audioSampleRate,
+                config: exportConfig,
+                to: outputURL
+            )
+            print("Video saved to: \(videoURL.path)")
+            print("Audio: regenerated")
+
+            // Also export standalone WAV
+            let wavPath = output.replacingOccurrences(of: ".mp4", with: ".wav")
+            try AudioExporter.exportToWAV(
+                waveform: audioWaveform,
+                sampleRate: audioSampleRate,
+                path: wavPath
+            )
+            print("Audio WAV saved to: \(wavPath)")
+        } else {
+            // Source audio passthrough (copy audio track directly, no re-encode)
+            let sourceAudioURL = URL(fileURLWithPath: video)
+            let videoURL = try await VideoExporter.exportVideo(
+                frames: result.frames,
+                width: width,
+                height: height,
+                fps: 24.0,
+                sourceAudioURL: sourceAudioURL,
+                config: exportConfig,
+                to: outputURL
+            )
+            print("Video saved to: \(videoURL.path)")
+            print("Audio: source audio preserved")
+        }
 
         // Print summary
         print("\n--- Summary ---")
