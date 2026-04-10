@@ -33,10 +33,16 @@ public enum TransformerQuantization: String, CaseIterable, Sendable {
     /// NVIDIA FP4 — 4-bit floating point (1 sign + 2 exp + 1 mantissa).
     /// Better for transformer weights (gaussian distribution near 0).
     /// Pre-quantized weights available: `Lightricks/LTX-2.3-nvfp4`
+    ///
+    /// - Note: On-the-fly quantization not yet supported (upstream mlx-swift #285).
+    ///   Use pre-quantized weights from HuggingFace instead.
     case nvfp4 = "nvfp4"
 
     /// OCP Microscaling FP8 — 8-bit floating point.
     /// Pre-quantized weights available: `Lightricks/LTX-2.3-fp8`
+    ///
+    /// - Note: On-the-fly quantization not yet supported (upstream mlx-swift #285).
+    ///   Use pre-quantized weights from HuggingFace instead.
     case mxfp8 = "mxfp8"
 
     public var displayName: String {
