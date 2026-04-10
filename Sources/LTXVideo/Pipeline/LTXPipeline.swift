@@ -1371,7 +1371,8 @@ public actor LTXPipeline {
         // Audio regeneration: noise the audio latents (same as video)
         var audioLatentPacked: MLXArray? = nil
         if regenerateAudio, let cleanAudio = frozenAudioLatentPacked {
-            let audioNoise = MLXRandom.normal(cleanAudio.shape).asType(cleanAudio.dtype)
+            // Noise in float32 (matching generateVideo pattern — "Float32 latents" rule)
+            let audioNoise = MLXRandom.normal(cleanAudio.shape).asType(.float32)
             audioLatentPacked = audioNoise  // Start from pure noise (full regeneration)
             frozenAudioLatentPacked = nil   // Don't freeze — will be denoised
             LTXDebug.log("Audio latents noised for regeneration: \(audioNoise.shape)")
@@ -1414,7 +1415,7 @@ public actor LTXPipeline {
             // Helper: run transformer and compute denoised x0
             func runTransformer(context: MLXArray, audioContext: MLXArray) -> MLXArray {
                 if let ltx2 = ltx2Transformer {
-                    let audioInput = audioLatentPacked ?? frozenAudioLatentPacked ?? MLXArray.zeros([videoPatchified.dim(0), 1, 128]).asType(DType.bfloat16)
+                    let audioInput = (audioLatentPacked ?? frozenAudioLatentPacked ?? MLXArray.zeros([videoPatchified.dim(0), 1, 128])).asType(DType.bfloat16)
                     let audioFrames = (audioLatentPacked != nil || frozenAudioLatentPacked != nil) ? retakeAudioNumFrames : 1
                     let audioTs = regenerateAudio ? MLXArray([sigma]) : MLXArray([Float(0)])
                     let (velPred, audioVelPred) = ltx2(
@@ -1430,10 +1431,10 @@ public actor LTXPipeline {
                         audioNumFrames: audioFrames
                     )
                     // Audio Euler step (when regenerating)
-                    if regenerateAudio, var ap = audioLatentPacked {
+                    // Keep audio latents in float32 between steps (cast to bf16 only for transformer input)
+                    if regenerateAudio, let ap = audioLatentPacked {
                         let audioVel = audioVelPred.asType(.float32)
-                        ap = ap.asType(.float32) + MLXArray(sigmaNext - sigma) * audioVel
-                        audioLatentPacked = ap.asType(DType.bfloat16)
+                        audioLatentPacked = ap.asType(.float32) + MLXArray(sigmaNext - sigma) * audioVel
                     }
                     let vel = unpatchify(velPred, shape: latentShape).asType(.float32)
                     return videoLatent - sigma5d * vel

@@ -261,6 +261,21 @@ struct LTXVideoGenerationConfigTests {
         #expect(config.retakeStrength == 0.7)
         #expect(config.retakeStartTime == 2.0)
         #expect(config.retakeEndTime == 5.0)
+        #expect(config.regenerateAudio == false)
+    }
+
+    @Test func testRegenerateAudioDefault() {
+        let config = LTXVideoGenerationConfig()
+        #expect(config.regenerateAudio == false)
+    }
+
+    @Test func testRegenerateAudioEnabled() {
+        let config = LTXVideoGenerationConfig(
+            videoPath: "/tmp/vid.mp4",
+            regenerateAudio: true
+        )
+        #expect(config.regenerateAudio == true)
+        #expect(config.videoPath == "/tmp/vid.mp4")
     }
 
     // MARK: - Retake Temporal Mask Tests

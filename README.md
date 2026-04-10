@@ -305,6 +305,7 @@ flowchart TD
 | `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
 | `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
 | `--mixed-precision` | off | Per-block quantization: first/last 6 blocks qint8, middle int4 |
+| `--regenerate-audio` | off | Regenerate audio via dual denoising (default: preserve source audio) |
 | `--profile` | off | GPU/CPU profiling report + Chrome Trace export |
 
 ### `ltx-video train`
