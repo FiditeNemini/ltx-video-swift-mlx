@@ -447,6 +447,7 @@ public actor LTXPipeline {
     /// - Important: Call `loadModels()` first, then `loadAudioModels()`. The audio
     ///   transformer weights are in the same unified file and share video weights.
     public func loadAudioModels(
+        includeEncoder: Bool = false,
         progressCallback: DownloadProgressCallback? = nil
     ) async throws {
         LTXDebug.log("Loading audio models...")
@@ -456,9 +457,9 @@ public actor LTXPipeline {
         let audioVAEPath = try await downloader.downloadAudioVAE { progress in
             progressCallback?(progress)
         }
-        let audioVAEWeights = try LTXWeightLoader.loadAudioVAEWeights(from: audioVAEPath.path)
+        let audioVAEWeights = try LTXWeightLoader.loadAudioVAEWeights(from: audioVAEPath.path, includeEncoder: includeEncoder)
 
-        audioVAE = AudioVAE()
+        audioVAE = AudioVAE(includeEncoder: includeEncoder)
         try LTXWeightLoader.applyAudioVAEWeights(audioVAEWeights, to: audioVAE!)
         LTXDebug.log("Audio VAE loaded")
 

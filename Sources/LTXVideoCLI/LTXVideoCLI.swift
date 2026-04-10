@@ -487,9 +487,9 @@ struct Retake: AsyncParsableCommand {
 
         // Load audio models if regenerating audio
         if regenerateAudio {
-            print("Loading audio models...")
+            print("Loading audio models (with encoder)...")
             fflush(stdout)
-            try await pipeline.loadAudioModels { progress in
+            try await pipeline.loadAudioModels(includeEncoder: true) { progress in
                 print("  \(progress.message) (\(Int(progress.progress * 100))%)")
             }
             print("Audio models loaded")
