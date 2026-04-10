@@ -447,6 +447,7 @@ public actor LTXPipeline {
     /// - Important: Call `loadModels()` first, then `loadAudioModels()`. The audio
     ///   transformer weights are in the same unified file and share video weights.
     public func loadAudioModels(
+        includeEncoder: Bool = false,
         progressCallback: DownloadProgressCallback? = nil
     ) async throws {
         LTXDebug.log("Loading audio models...")
@@ -456,9 +457,9 @@ public actor LTXPipeline {
         let audioVAEPath = try await downloader.downloadAudioVAE { progress in
             progressCallback?(progress)
         }
-        let audioVAEWeights = try LTXWeightLoader.loadAudioVAEWeights(from: audioVAEPath.path)
+        let audioVAEWeights = try LTXWeightLoader.loadAudioVAEWeights(from: audioVAEPath.path, includeEncoder: includeEncoder)
 
-        audioVAE = AudioVAE()
+        audioVAE = AudioVAE(includeEncoder: includeEncoder)
         try LTXWeightLoader.applyAudioVAEWeights(audioVAEWeights, to: audioVAE!)
         LTXDebug.log("Audio VAE loaded")
 
@@ -1181,8 +1182,9 @@ public actor LTXPipeline {
         }
 
         // Encode audio latents for cross-modal attention if LTX2Transformer + AudioVAE encoder are loaded
+        let regenerateAudio = config.regenerateAudio
         if ltx2Transformer != nil, let audioVAE = audioVAE, audioVAE.encoder != nil, let waveform = sourceAudioWaveform {
-            LTXDebug.log("Encoding source audio for cross-modal attention...")
+            LTXDebug.log("Encoding source audio for \(regenerateAudio ? "regeneration" : "cross-modal attention")...")
             let melSpec = audioProcessor.melSpectrogram(waveform)
             eval(melSpec)
 
@@ -1366,6 +1368,16 @@ public actor LTXPipeline {
         }
         MLX.eval(videoLatent)
 
+        // Audio regeneration: noise the audio latents (same as video)
+        var audioLatentPacked: MLXArray? = nil
+        if regenerateAudio, let cleanAudio = frozenAudioLatentPacked {
+            // Noise in float32 (matching generateVideo pattern — "Float32 latents" rule)
+            let audioNoise = MLXRandom.normal(cleanAudio.shape).asType(.float32)
+            audioLatentPacked = audioNoise  // Start from pure noise (full regeneration)
+            frozenAudioLatentPacked = nil   // Don't freeze — will be denoised
+            LTXDebug.log("Audio latents noised for regeneration: \(audioNoise.shape)")
+        }
+
         // Denoising loop (matching Lightricks euler_denoising_loop)
         let modeStr = isPartialRetake ? "partial" : "full"
         LTXDebug.log("=== Single-stage \(modeStr) retake denoising (\(numSteps) steps) ===")
@@ -1403,20 +1415,27 @@ public actor LTXPipeline {
             // Helper: run transformer and compute denoised x0
             func runTransformer(context: MLXArray, audioContext: MLXArray) -> MLXArray {
                 if let ltx2 = ltx2Transformer {
-                    let audioInput = frozenAudioLatentPacked ?? MLXArray.zeros([videoPatchified.dim(0), 1, 128]).asType(DType.bfloat16)
-                    let audioFrames = frozenAudioLatentPacked != nil ? retakeAudioNumFrames : 1
-                    let (velPred, _) = ltx2(
+                    let audioInput = (audioLatentPacked ?? frozenAudioLatentPacked ?? MLXArray.zeros([videoPatchified.dim(0), 1, 128])).asType(DType.bfloat16)
+                    let audioFrames = (audioLatentPacked != nil || frozenAudioLatentPacked != nil) ? retakeAudioNumFrames : 1
+                    let audioTs = regenerateAudio ? MLXArray([sigma]) : MLXArray([Float(0)])
+                    let (velPred, audioVelPred) = ltx2(
                         videoLatent: videoPatchified,
                         audioLatent: audioInput,
                         videoContext: context.asType(.bfloat16),
                         audioContext: audioContext.asType(.bfloat16),
                         videoTimesteps: videoTimestep,
-                        audioTimesteps: MLXArray([Float(0)]),
+                        audioTimesteps: audioTs,
                         videoContextMask: nil,
                         audioContextMask: nil,
                         videoLatentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width),
                         audioNumFrames: audioFrames
                     )
+                    // Audio Euler step (when regenerating)
+                    // Keep audio latents in float32 between steps (cast to bf16 only for transformer input)
+                    if regenerateAudio, let ap = audioLatentPacked {
+                        let audioVel = audioVelPred.asType(.float32)
+                        audioLatentPacked = ap.asType(.float32) + MLXArray(sigmaNext - sigma) * audioVel
+                    }
                     let vel = unpatchify(velPred, shape: latentShape).asType(.float32)
                     return videoLatent - sigma5d * vel
                 } else if let videoTransformer = transformer {
@@ -1521,19 +1540,46 @@ public actor LTXPipeline {
             trimmedVideo = videoTensor
         }
 
+        // Decode regenerated audio if applicable
+        var audioWaveform: MLXArray? = nil
+        var audioSampleRate: Int? = nil
+        if regenerateAudio, let ap = audioLatentPacked,
+           let audioVAE = audioVAE, let vocoder = vocoder {
+            LTXDebug.log("Decoding regenerated audio...")
+            let audioLatentUnpacked = unpackAudioLatents(ap, numFrames: retakeAudioNumFrames)
+            audioWaveform = decodeAudio(
+                latents: audioLatentUnpacked,
+                audioVAE: audioVAE,
+                vocoder: vocoder
+            )
+            MLX.eval(audioWaveform!)
+            audioSampleRate = vocoder.outputSampleRate
+            LTXDebug.log("Regenerated audio: \(audioWaveform!.shape)")
+        }
+
         LTXMemoryManager.resetCacheLimit()
 
         let generationTime = Date().timeIntervalSince(generationStart)
         LTXDebug.log("Total retake generation time: \(String(format: "%.1f", generationTime))s")
 
-        return VideoGenerationResult(
-            frames: trimmedVideo,
-            seed: config.seed ?? 0,
-            generationTime: generationTime,
-            
-            effectivePrompt: effectivePrompt,
-            sourceAudioPath: videoPath
-        )
+        if regenerateAudio {
+            return VideoGenerationResult(
+                frames: trimmedVideo,
+                seed: config.seed ?? 0,
+                generationTime: generationTime,
+                audioWaveform: audioWaveform,
+                audioSampleRate: audioSampleRate,
+                effectivePrompt: effectivePrompt
+            )
+        } else {
+            return VideoGenerationResult(
+                frames: trimmedVideo,
+                seed: config.seed ?? 0,
+                generationTime: generationTime,
+                effectivePrompt: effectivePrompt,
+                sourceAudioPath: videoPath
+            )
+        }
     }
 
     /// Encode a video into latent space using the VAE encoder
