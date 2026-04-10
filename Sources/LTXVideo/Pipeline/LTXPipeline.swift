@@ -18,7 +18,7 @@ import Hub
 
 /// Progress information emitted during the denoising phase of generation.
 ///
-/// Passed to the `onProgress` callback of ``LTXPipeline/generateVideo(prompt:config:upscalerWeightsPath:onProgress:profile:)``.
+/// Passed to the `onProgress` callback of ``LTXPipeline/generateVideo(prompt:config:upscalerWeightsPath:onProgress:)``.
 ///
 /// ## Example
 /// ```swift
@@ -585,14 +585,12 @@ public actor LTXPipeline {
     ///   - config: Video generation configuration (width/height = FINAL resolution)
     ///   - upscalerWeightsPath: Path to spatial upscaler safetensors
     ///   - onProgress: Optional progress callback
-    ///   - profile: Enable performance profiling
     /// - Returns: VideoGenerationResult with video frames and optional audio
     public func generateVideo(
         prompt: String,
         config: LTXVideoGenerationConfig,
         upscalerWeightsPath: String,
         onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false
     ) async throws -> VideoGenerationResult {
         try config.validate()
 
@@ -1134,14 +1132,12 @@ public actor LTXPipeline {
     ///     (matching Lightricks: regenerated frames always start from pure noise).
     ///   - upscalerWeightsPath: Unused (kept for API compatibility)
     ///   - onProgress: Optional progress callback
-    ///   - profile: Enable performance profiling
     /// - Returns: VideoGenerationResult with retaken video frames
     public func generateRetake(
         prompt: String,
         config: LTXVideoGenerationConfig,
         upscalerWeightsPath: String,
         onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false
     ) async throws -> VideoGenerationResult {
         try config.validate()
 
@@ -1576,121 +1572,6 @@ public actor LTXPipeline {
         LTXDebug.log("Normalized video latent: mean=\(normalizedLatent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(normalizedLatent)).item(Float.self))")
 
         return normalizedLatent
-    }
-
-    // MARK: - Denoising Loop
-
-    /// Core denoising loop — reusable for both single-stage and two-stage generation.
-    ///
-    /// Takes an initial noisy latent and iteratively denoises it following the sigma schedule.
-    /// Returns the raw denoised latent (NOT VAE-decoded).
-    ///
-    /// - Parameters:
-    ///   - latent: Initial noisy latent (B, C, F, H, W) — already scaled by sigmas[0]
-    ///   - sigmas: Sigma schedule (including terminal 0.0)
-    ///   - textEmbeddings: Text embeddings
-    ///   - latentShape: Shape descriptor for the latent
-    ///   - config: Generation configuration
-    ///   - transformer: The transformer model
-    ///   - onProgress: Optional progress callback
-    ///   - profile: Enable profiling output
-    /// - Returns: Denoised latent (B, C, F, H, W)
-    private func denoise(
-        latent: MLXArray,
-        sigmas: [Float],
-        textEmbeddings: MLXArray,
-        latentShape: VideoLatentShape,
-        config: LTXVideoGenerationConfig,
-        transformer: LTXTransformer,
-        conditioningMask: MLXArray? = nil,
-        conditionedLatent: MLXArray? = nil,
-        onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false
-    ) -> MLXArray {
-        let numSteps = sigmas.count - 1
-        var currentLatent = latent
-
-        for step in 0..<numSteps {
-            let stepStart = Date()
-            let sigma = sigmas[step]
-            let sigmaNext = sigmas[step + 1]
-
-            onProgress?(GenerationProgress(
-                currentStep: step,
-                totalSteps: numSteps,
-                sigma: sigma,
-                phase: .denoising
-            ))
-
-            // Inject noise to conditioned frame BEFORE transformer (Diffusers pattern)
-            if let condLatent = conditionedLatent, config.imageCondNoiseScale > 0, sigma > 0 {
-                let injectionNoise = MLXRandom.normal(condLatent.shape)
-                let noisedFrame0 = condLatent + MLXArray(config.imageCondNoiseScale) * injectionNoise * MLXArray(sigma * sigma)
-                currentLatent[0..., 0..., 0..<1, 0..., 0...] = noisedFrame0
-            }
-
-            let hasPerTokenTimestep = conditioningMask != nil
-            let hasConditionedFrame0 = conditionedLatent != nil
-
-            let timestep: MLXArray
-            if hasPerTokenTimestep, let mask = conditioningMask {
-                timestep = MLXArray(sigma) * (1 - mask)  // (1, T)
-            } else {
-                timestep = MLXArray([sigma])
-            }
-
-            let patchified = patchify(currentLatent).asType(.bfloat16)
-            LTXDebug.log("Step \(step): patchified \(patchified.shape), σ=\(String(format: "%.4f", sigma))")
-
-            let velocityPred = transformer(
-                latent: patchified,
-                context: textEmbeddings,
-                timesteps: timestep,
-                contextMask: nil,
-                latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
-            )
-
-            let velocity = unpatchify(velocityPred, shape: latentShape).asType(.float32)
-
-            if hasConditionedFrame0 {
-                let velocitySlice = velocity[0..., 0..., 1..., 0..., 0...]
-                let latentSlice = currentLatent[0..., 0..., 1..., 0..., 0...]
-                let steppedSlice = scheduler.step(
-                    latent: latentSlice,
-                    velocity: velocitySlice,
-                    sigma: sigma,
-                    sigmaNext: sigmaNext
-                )
-                let frame0 = currentLatent[0..., 0..., 0..<1, 0..., 0...]
-                currentLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
-            } else {
-                currentLatent = scheduler.step(
-                    latent: currentLatent,
-                    velocity: velocity,
-                    sigma: sigma,
-                    sigmaNext: sigmaNext
-                )
-            }
-
-            MLX.eval(currentLatent)
-
-            // Periodic cache clearing to reduce GPU memory fragmentation
-            if (step + 1) % 5 == 0 {
-                Memory.clearCache()
-            }
-
-
-            if profile && LTXDebug.isEnabled {
-                // Only compute stats when debug is active — each .item() forces a GPU sync
-                let vMean = velocityPred.mean().item(Float.self)
-                let vStd = MLX.sqrt(MLX.variance(velocityPred)).item(Float.self)
-                let lMean = currentLatent.mean().item(Float.self)
-                let lStd = MLX.sqrt(MLX.variance(currentLatent)).item(Float.self)
-                LTXDebug.log("  Step \(step): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), vel mean=\(String(format: "%.4f", vMean)), std=\(String(format: "%.4f", vStd)), latent mean=\(String(format: "%.4f", lMean)), std=\(String(format: "%.4f", lStd))")
-            }
-        }
-
-        return currentLatent
     }
 
     // MARK: - Image-to-Video Helpers

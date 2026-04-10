@@ -240,7 +240,6 @@ struct Generate: AsyncParsableCommand {
             onProgress: { progress in
                 print("  \(progress.status)")
             },
-            profile: profile
         )
 
         let genTime = Date().timeIntervalSince(startGen)
@@ -507,7 +506,6 @@ struct Retake: AsyncParsableCommand {
             onProgress: { progress in
                 print("  \(progress.status)")
             },
-            profile: profile
         )
 
         let genTime = Date().timeIntervalSince(startGen)

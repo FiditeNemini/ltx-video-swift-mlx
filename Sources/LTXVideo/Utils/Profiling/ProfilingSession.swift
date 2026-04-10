@@ -52,9 +52,9 @@ public final class ProfilingSession: @unchecked Sendable {
         // Emit os_signpost for Instruments (visible in Points of Interest)
         let spID = signposter.makeSignpostID()
         let state = signposter.beginInterval("Phase", id: spID, "\(name)")
-        activeSignpostIDs[name] = (id: spID, state: state)
 
         lock.lock()
+        activeSignpostIDs[name] = (id: spID, state: state)
         events.append(ProfilingEvent(
             name: name, category: category, phase: .begin, timestampUs: ts,
             mlxActiveBytes: snapshot?.mlxActive, mlxCacheBytes: snapshot?.mlxCache,
@@ -75,12 +75,12 @@ public final class ProfilingSession: @unchecked Sendable {
         let ts = currentTimestampUs()
         let snapshot = config.trackMemory ? takeMemorySnapshot() : nil
 
+        lock.lock()
+
         // End os_signpost interval
         if let entry = activeSignpostIDs.removeValue(forKey: name) {
             signposter.endInterval("Phase", entry.state, "\(name) done")
         }
-
-        lock.lock()
         events.append(ProfilingEvent(
             name: name, category: category, phase: .end, timestampUs: ts,
             mlxActiveBytes: snapshot?.mlxActive, mlxCacheBytes: snapshot?.mlxCache,
@@ -138,9 +138,6 @@ public final class ProfilingSession: @unchecked Sendable {
             mlxPeakMB: peakMB, processFootprintMB: footprintMB,
             cpuTimeSeconds: cpuTime, gpuUtilization: gpuUtil
         ))
-
-        if false {  // keep old trackPerStepMemory branch dead for now
-        }
         lock.unlock()
     }
 
