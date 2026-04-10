@@ -101,11 +101,12 @@ struct Generate: AsyncParsableCommand {
         var profilingSession: ProfilingSession? = nil
         if profile {
             let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
-            session.modelVariant = "distilled"
-            session.quantization = mixedPrecision ? "mixed" : transformerQuant
-            session.resolution = "\(width)x\(height)"
-            session.frames = frames
-            session.steps = 8
+            session.title = "LTX-2.3 PROFILING REPORT"
+            session.metadata["model"] = "distilled"
+            session.metadata["quant"] = mixedPrecision ? "mixed" : transformerQuant
+            session.metadata["resolution"] = "\(width)x\(height)"
+            session.metadata["frames"] = String(frames)
+            session.metadata["steps"] = String(8)
             profilingSession = session
             LTXVideoProfiler.shared.enable()
             LTXVideoProfiler.shared.activeSession = session
@@ -396,11 +397,12 @@ struct Retake: AsyncParsableCommand {
         var profilingSession: ProfilingSession? = nil
         if profile {
             let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
-            session.modelVariant = distilled ? "distilled" : "dev"
-            session.quantization = mixedPrecision ? "mixed" : transformerQuant
-            session.resolution = "\(width)x\(height)"
-            session.frames = frames
-            session.steps = distilled ? 8 : 30
+            session.title = "LTX-2.3 PROFILING REPORT"
+            session.metadata["model"] = distilled ? "distilled" : "dev"
+            session.metadata["quant"] = mixedPrecision ? "mixed" : transformerQuant
+            session.metadata["resolution"] = "\(width)x\(height)"
+            session.metadata["frames"] = String(frames)
+            session.metadata["steps"] = String(distilled ? 8 : 30)
             profilingSession = session
             LTXVideoProfiler.shared.enable()
             LTXVideoProfiler.shared.activeSession = session

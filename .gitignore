@@ -44,3 +44,4 @@ DerivedData/
 # Temporary files
 *.tmp
 /tmp/
+swift-mlx-profiler

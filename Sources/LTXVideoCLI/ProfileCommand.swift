@@ -106,11 +106,11 @@ struct ProfileRun: AsyncParsableCommand {
         )
 
         let session = ProfilingSession(config: config)
-        session.modelVariant = "distilled"
-        session.quantization = options.transformerQuant
-        session.resolution = "\(options.width)x\(options.height)"
-        session.frames = options.frames
-        session.steps = 8
+        session.metadata["model"] = "distilled"
+        session.metadata["quant"] = options.transformerQuant
+        session.metadata["resolution"] = "\(options.width)x\(options.height)"
+        session.metadata["frames"] = String(options.frames)
+        session.metadata["steps"] = String(8)
 
         let profiler = LTXVideoProfiler.shared
         profiler.enable()
@@ -206,11 +206,11 @@ struct ProfileBenchmark: AsyncParsableCommand {
             print("\(runLabel)...", terminator: " "); fflush(stdout)
 
             let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
-            session.modelVariant = "distilled"
-            session.quantization = options.transformerQuant
-            session.resolution = "\(options.width)x\(options.height)"
-            session.frames = options.frames
-            session.steps = 8
+            session.metadata["model"] = "distilled"
+            session.metadata["quant"] = options.transformerQuant
+            session.metadata["resolution"] = "\(options.width)x\(options.height)"
+            session.metadata["frames"] = String(options.frames)
+            session.metadata["steps"] = String(8)
 
             profiler.enable()
             profiler.activeSession = session
@@ -290,11 +290,11 @@ struct ProfileCompare: AsyncParsableCommand {
             print("Running: \(label)...")
 
             let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
-            session.modelVariant = "distilled"
-            session.quantization = quantName
-            session.resolution = "\(width)x\(height)"
-            session.frames = frames
-            session.steps = 8
+            session.metadata["model"] = "distilled"
+            session.metadata["quant"] = quantName
+            session.metadata["resolution"] = "\(width)x\(height)"
+            session.metadata["frames"] = String(frames)
+            session.metadata["steps"] = String(8)
 
             profiler.enable()
             profiler.activeSession = session
