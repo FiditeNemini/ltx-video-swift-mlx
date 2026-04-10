@@ -76,6 +76,7 @@ class LTX2TransformerBlock: Module {
     /// When true, video self-attention is skipped (STG perturbation)
     var skipVideoSelfAttention: Bool = false
 
+
     // --- Video modules ---
     @ModuleInfo(key: "norm1") var norm1: RMSNorm
     @ModuleInfo(key: "attn1") var attn1: LTXAttention
@@ -362,4 +363,5 @@ class LTX2TransformerBlock: Module {
             )
         )
     }
+
 }

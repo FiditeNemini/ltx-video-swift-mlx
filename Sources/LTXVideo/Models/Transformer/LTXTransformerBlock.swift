@@ -39,6 +39,9 @@ struct TransformerArgs {
     /// When a block's index is in this set, self-attention output is zeroed.
     var skipSelfAttentionBlocks: Set<Int>?
 
+    /// Whether to use cached K/V for cross-attention (text context is static across steps)
+    var useTextKVCache: Bool = false
+
     init(
         x: MLXArray,
         context: MLXArray,
@@ -135,6 +138,7 @@ class BasicTransformerBlock: Module {
 
     /// When true, self-attention is skipped (STG perturbation for guidance)
     var skipSelfAttention: Bool = false
+
 
     init(
         dim: Int,
@@ -251,6 +255,7 @@ class BasicTransformerBlock: Module {
                 ctx = ctx * (1 + promptScale) + promptShift
             }
 
+            // Note: KV cache NOT used here — prompt AdaLN modulates context per-step
             var crossOut = attn2(normXCA, context: ctx, mask: args.contextMask)
             if crossAttentionScale != 1.0 {
                 crossOut = crossOut * MLXArray(crossAttentionScale)
@@ -261,7 +266,8 @@ class BasicTransformerBlock: Module {
             var crossOut = attn2(
                 x,
                 context: args.context,
-                mask: args.contextMask
+                mask: args.contextMask,
+                useKVCache: args.useTextKVCache
             )
             if crossAttentionScale != 1.0 {
                 crossOut = crossOut * MLXArray(crossAttentionScale)
@@ -286,6 +292,7 @@ class BasicTransformerBlock: Module {
 
         return args.replacing(x: x)
     }
+
 }
 
 // MARK: - Transformer Blocks Stack

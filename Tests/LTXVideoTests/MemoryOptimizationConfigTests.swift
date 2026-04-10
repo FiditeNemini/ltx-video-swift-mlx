@@ -70,7 +70,7 @@ struct MemoryOptimizationConfigTests {
         #expect(r96.evalFrequency == 4)  // light (65-96)
 
         let r128 = MemoryOptimizationConfig.recommended(forRAMGB: 128)
-        #expect(r128.evalFrequency == 8) // disabled (>96)
+        #expect(r128.evalFrequency == 8) // disabled (96+)
     }
 
     @Test func testCustomInit() {

@@ -283,9 +283,10 @@ flowchart TD
 | `--audio-gain` | `1.0` | Audio gain (linear) |
 | `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
 | `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+| `--mixed-precision` | off | Per-block quantization: first/last 6 blocks qint8, middle int4 |
 | `--bitrate` | auto | Video bitrate in kbps |
 | `--debug` | off | Debug output |
-| `--profile` | off | Timing/memory breakdown |
+| `--profile` | off | GPU/CPU profiling report + Chrome Trace export |
 
 ### `ltx-video retake`
 
@@ -303,6 +304,8 @@ flowchart TD
 | `--distilled` | off | Use distilled model (8 steps, fast). Default: dev (30 steps + CFG) |
 | `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
 | `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4` |
+| `--mixed-precision` | off | Per-block quantization: first/last 6 blocks qint8, middle int4 |
+| `--profile` | off | GPU/CPU profiling report + Chrome Trace export |
 
 ### `ltx-video train`
 

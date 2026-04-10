@@ -62,6 +62,9 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
     var transformerQuant: String = "bf16"
 
+    @Flag(name: .long, help: "Mixed precision: first/last 6 blocks qint8, middle blocks int4")
+    var mixedPrecision: Bool = false
+
     @Option(name: .long, help: "Video bitrate in kbps (e.g., 1000 for 1 Mbps). Default: quality-based encoding")
     var bitrate: Int?
 
@@ -92,6 +95,26 @@ struct Generate: AsyncParsableCommand {
         // Enable debug mode if requested
         if debug {
             LTXDebug.enableDebugMode()
+        }
+
+        // Attach profiling session when --profile is enabled
+        var profilingSession: ProfilingSession? = nil
+        if profile {
+            let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
+            session.modelVariant = "distilled"
+            session.quantization = mixedPrecision ? "mixed" : transformerQuant
+            session.resolution = "\(width)x\(height)"
+            session.frames = frames
+            session.steps = 8
+            profilingSession = session
+            LTXVideoProfiler.shared.enable()
+            LTXVideoProfiler.shared.activeSession = session
+        }
+        defer {
+            if profile {
+                LTXVideoProfiler.shared.activeSession = nil
+                LTXVideoProfiler.shared.disable()
+            }
         }
 
         let isI2V = image != nil
@@ -134,10 +157,16 @@ struct Generate: AsyncParsableCommand {
         }
 
         // Parse transformer quantization
-        guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
-            throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
+        let quantConfig: LTXQuantizationConfig
+        if mixedPrecision {
+            quantConfig = .mixedDefault
+            print("Quantization: mixed precision (first/last 6 blocks qint8, middle int4)")
+        } else {
+            guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
+                throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
+            }
+            quantConfig = LTXQuantizationConfig(transformer: quantOption)
         }
-        let quantConfig = LTXQuantizationConfig(transformer: quantOption)
 
         // Create pipeline (always distilled)
         print("Creating pipeline...")
@@ -211,7 +240,6 @@ struct Generate: AsyncParsableCommand {
             onProgress: { progress in
                 print("  \(progress.status)")
             },
-            profile: profile
         )
 
         let genTime = Date().timeIntervalSince(startGen)
@@ -274,23 +302,13 @@ struct Generate: AsyncParsableCommand {
             print("Audio sample rate: \(result.audioSampleRate ?? 0) Hz")
         }
 
-        // Print detailed profiling if enabled
-        if profile, let t = result.timings {
-            let f = { (v: Double) -> String in String(format: "%.1f", v) }
-            print("\n--- Profiling ---")
-            print("Text Encoding (Gemma + FE + Connector): \(f(t.textEncoding))s")
-            print("Denoising (\(t.denoiseSteps.count) steps):                 \(f(t.totalDenoise))s")
-            for (i, stepTime) in t.denoiseSteps.enumerated() {
-                print("  Step \(i): \(f(stepTime))s")
-            }
-            print("  Average per step:                      \(f(t.avgStepTime))s")
-            print("VAE Decoding:                            \(f(t.vaeDecode))s")
-            print("Model Loading:                           \(f(loadTime))s")
-            let pipelineTotal = t.textEncoding + t.totalDenoise + t.vaeDecode
-            print("Pipeline total (excl. loading/export):   \(f(pipelineTotal))s")
-            print("\n--- Memory ---")
-            print("Peak GPU memory:                         \(t.peakMemoryMB) MB")
-            print("Mean GPU memory (denoising):              \(t.meanMemoryMB) MB")
+        // Print profiling report + export Chrome Trace
+        if let session = profilingSession {
+            print(session.generateReport())
+            let traceData = ChromeTraceExporter.export(session: session)
+            let tracePath = output.replacingOccurrences(of: ".mp4", with: "_trace.json")
+            try traceData.write(to: URL(fileURLWithPath: tracePath))
+            print("Chrome Trace: \(tracePath)  (open in https://ui.perfetto.dev/)")
         }
     }
 }
@@ -341,6 +359,9 @@ struct Retake: AsyncParsableCommand {
     @Option(name: .long, help: "Transformer quantization: bf16 (default), qint8, or int4")
     var transformerQuant: String = "bf16"
 
+    @Flag(name: .long, help: "Mixed precision: first/last 6 blocks qint8, middle blocks int4")
+    var mixedPrecision: Bool = false
+
     @Option(name: .long, help: "Video bitrate in kbps (e.g., 1000 for 1 Mbps). Default: quality-based encoding")
     var bitrate: Int?
 
@@ -369,6 +390,26 @@ struct Retake: AsyncParsableCommand {
 
         if debug {
             LTXDebug.enableDebugMode()
+        }
+
+        // Attach profiling session when --profile is enabled
+        var profilingSession: ProfilingSession? = nil
+        if profile {
+            let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
+            session.modelVariant = distilled ? "distilled" : "dev"
+            session.quantization = mixedPrecision ? "mixed" : transformerQuant
+            session.resolution = "\(width)x\(height)"
+            session.frames = frames
+            session.steps = distilled ? 8 : 30
+            profilingSession = session
+            LTXVideoProfiler.shared.enable()
+            LTXVideoProfiler.shared.activeSession = session
+        }
+        defer {
+            if profile {
+                LTXVideoProfiler.shared.activeSession = nil
+                LTXVideoProfiler.shared.disable()
+            }
         }
 
         print("LTX-2.3 Video Retake (Single-Stage)")
@@ -403,10 +444,15 @@ struct Retake: AsyncParsableCommand {
             throw ValidationError("Source video not found: \(video)")
         }
         // Parse quantization
-        guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
-            throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
+        let quantConfig: LTXQuantizationConfig
+        if mixedPrecision {
+            quantConfig = .mixedDefault
+        } else {
+            guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
+                throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
+            }
+            quantConfig = LTXQuantizationConfig(transformer: quantOption)
         }
-        let quantConfig = LTXQuantizationConfig(transformer: quantOption)
 
         // Create pipeline
         let retakeModel: LTXModel = distilled ? .distilled : .dev
@@ -460,7 +506,6 @@ struct Retake: AsyncParsableCommand {
             onProgress: { progress in
                 print("  \(progress.status)")
             },
-            profile: profile
         )
 
         let genTime = Date().timeIntervalSince(startGen)
@@ -498,22 +543,12 @@ struct Retake: AsyncParsableCommand {
         print("Strength: \(strength)")
         print("Generation time: \(String(format: "%.1f", result.generationTime))s")
 
-        if profile, let t = result.timings {
-            let f = { (v: Double) -> String in String(format: "%.1f", v) }
-            print("\n--- Profiling ---")
-            print("Text Encoding (Gemma + FE + Connector): \(f(t.textEncoding))s")
-            print("Denoising (\(t.denoiseSteps.count) steps):                 \(f(t.totalDenoise))s")
-            for (i, stepTime) in t.denoiseSteps.enumerated() {
-                print("  Step \(i): \(f(stepTime))s")
-            }
-            print("  Average per step:                      \(f(t.avgStepTime))s")
-            print("VAE Decoding:                            \(f(t.vaeDecode))s")
-            print("Model Loading:                           \(f(loadTime))s")
-            let pipelineTotal = t.textEncoding + t.totalDenoise + t.vaeDecode
-            print("Pipeline total (excl. loading/export):   \(f(pipelineTotal))s")
-            print("\n--- Memory ---")
-            print("Peak GPU memory:                         \(t.peakMemoryMB) MB")
-            print("Mean GPU memory (denoising):              \(t.meanMemoryMB) MB")
+        if let session = profilingSession {
+            print(session.generateReport())
+            let traceData = ChromeTraceExporter.export(session: session)
+            let tracePath = output.replacingOccurrences(of: ".mp4", with: "_trace.json")
+            try traceData.write(to: URL(fileURLWithPath: tracePath))
+            print("Chrome Trace: \(tracePath)  (open in https://ui.perfetto.dev/)")
         }
     }
 }

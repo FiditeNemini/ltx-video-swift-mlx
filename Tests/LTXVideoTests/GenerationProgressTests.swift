@@ -46,36 +46,6 @@ struct GenerationProgressTests {
     }
 }
 
-// MARK: - GenerationTimings Tests
-
-@Suite("GenerationTimings")
-struct GenerationTimingsTests {
-    @Test func testEmptyTimings() {
-        let t = GenerationTimings()
-        #expect(t.textEncoding == 0)
-        #expect(t.vaeDecode == 0)
-        #expect(t.totalDenoise == 0)
-        #expect(t.avgStepTime == 0)
-        #expect(t.denoiseSteps.isEmpty)
-        #expect(t.peakMemoryMB == 0)
-        #expect(t.meanMemoryMB == 0)
-    }
-
-    @Test func testDenoiseStepTimings() {
-        var t = GenerationTimings()
-        t.denoiseSteps = [1.0, 2.0, 3.0]
-        #expect(t.totalDenoise == 6.0)
-        #expect(t.avgStepTime == 2.0)
-    }
-
-    @Test func testSingleStep() {
-        var t = GenerationTimings()
-        t.denoiseSteps = [5.0]
-        #expect(t.totalDenoise == 5.0)
-        #expect(t.avgStepTime == 5.0)
-    }
-}
-
 // MARK: - VideoGenerationResult Tests
 
 @Suite("VideoGenerationResult")
@@ -92,7 +62,6 @@ struct VideoGenerationResultTests {
         #expect(result.width == 768)
         #expect(result.seed == 42)
         #expect(result.generationTime == 100.0)
-        #expect(result.timings == nil)
         #expect(result.audioWaveform == nil)
         #expect(result.audioSampleRate == nil)
     }

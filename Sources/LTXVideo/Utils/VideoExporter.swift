@@ -553,10 +553,8 @@ extension VideoExporter {
         // Handle batch dimension if present
         let videoTensor: MLXArray
         if tensor.ndim == 5 {
-            // (B, F, H, W, C) -> take first batch
             videoTensor = tensor[0]
         } else if tensor.ndim == 4 {
-            // (F, H, W, C)
             videoTensor = tensor
         } else {
             LTXDebug.log("Invalid tensor shape for video: \(tensor.shape)")
@@ -567,61 +565,41 @@ extension VideoExporter {
         let height = videoTensor.dim(1)
         let width = videoTensor.dim(2)
 
-        // Batch convert entire tensor to uint8 in a single GPU operation
-        let allScaled = MLX.clip(videoTensor, min: 0, max: 1) * 255
-        let allUint8 = allScaled.asType(.uint8)
-        MLX.eval(allUint8)  // Single eval for all frames
+        // Convert RGB → ARGB on GPU (add alpha=255 channel) and scale to uint8
+        // This matches kCVPixelFormatType_32ARGB expected by AVAssetWriter,
+        // eliminating the CPU-side CGContext.draw() format conversion.
+        let scaled = MLX.clip(videoTensor, min: 0, max: 1) * 255  // (F, H, W, 3)
+        // Add alpha=255 channel to match ARGB pixel format (all on GPU)
+        let alpha = MLX.full([numFrames, height, width, 1], values: MLXArray(Float(255.0)))
+        let argb = MLX.concatenated([alpha, scaled], axis: -1)  // (F, H, W, 4) = A,R,G,B
+        let allUint8 = argb.asType(DType.uint8)
+        MLX.eval(allUint8)
 
-        // CPU loop just extracts already-evaluated frames
+        // Single bulk GPU→CPU transfer
+        let bulkData = allUint8.asData(access: MLXArray.AccessMethod.copy)
+        let rawBytes = bulkData.data
+        let frameSize = height * width * 4  // 4 bytes per pixel (ARGB)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
+
         for f in 0..<numFrames {
-            let frame = allUint8[f]
-            if let image = createCGImage(from: frame, width: width, height: height) {
-                frames.append(image)
-            }
+            let offset = f * frameSize
+            let frameData = rawBytes.subdata(in: offset..<(offset + frameSize))
+
+            guard let provider = CGDataProvider(data: frameData as CFData) else { continue }
+            guard let image = CGImage(
+                width: width, height: height,
+                bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                space: colorSpace, bitmapInfo: bitmapInfo,
+                provider: provider, decode: nil,
+                shouldInterpolate: false, intent: .defaultIntent
+            ) else { continue }
+
+            frames.append(image)
         }
 
         return frames
-    }
-
-    /// Create CGImage from MLXArray frame
-    private static func createCGImage(
-        from frame: MLXArray,
-        width: Int,
-        height: Int
-    ) -> CGImage? {
-        // Frame should be (H, W, C) with C = 3 (RGB)
-        guard frame.ndim == 3, frame.dim(2) == 3 else {
-            LTXDebug.log("Invalid frame shape: \(frame.shape)")
-            return nil
-        }
-
-        // Get raw bytes - need to copy since MLXArray data may not persist
-        let mlxData = frame.asData(access: .copy)
-
-        // Extract Foundation Data from MLXArrayData
-        let nsData = mlxData.data
-
-        // Create data provider
-        guard
-            let provider = CGDataProvider(data: nsData as CFData)
-        else {
-            return nil
-        }
-
-        // Create CGImage
-        return CGImage(
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 24,
-            bytesPerRow: width * 3,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
     }
 }
 
@@ -661,8 +639,11 @@ extension VideoExporter {
         config: VideoExportConfig = .default,
         to outputURL: URL
     ) async throws -> URL {
+        let profiler = LTXVideoProfiler.shared
+        profiler.start("Frame Conversion")
         LTXDebug.log("exportVideo: converting tensor \(tensor.shape) to images...")
         let images = tensorToImages(tensor)
+        profiler.end("Frame Conversion")
         LTXDebug.log("exportVideo: converted \(images.count) images")
 
         guard !images.isEmpty else {
@@ -705,8 +686,9 @@ extension VideoExporter {
             audioChannels = 2
         }
 
+        profiler.start("Video Write")
         let exporter = VideoExporter(config: config)
-        return try await exporter.export(
+        let result = try await exporter.export(
             frames: images,
             width: width,
             height: height,
@@ -716,6 +698,8 @@ extension VideoExporter {
             audioChannels: audioChannels,
             to: outputURL
         )
+        profiler.end("Video Write")
+        return result
     }
 
     /// Convert an MLXArray waveform to interleaved Int16 PCM data
@@ -733,22 +717,21 @@ extension VideoExporter {
         }
 
         let numChannels = audio.dim(0)
-        let numSamples = audio.dim(1)
 
-        // Clamp and convert to float32 for sample extraction
-        let clamped = MLX.clip(audio, min: -1.0, max: 1.0).asType(.float32)
-        MLX.eval(clamped)
+        // Clamp, scale to int16 range, and interleave channels on GPU
+        let clamped = MLX.clip(audio, min: -1.0, max: 1.0)
+        let scaled = (clamped * 32767.0).asType(.int16)  // (numChannels, numSamples)
 
-        // Build interleaved PCM: [L0, R0, L1, R1, ...]
-        // Use explicit per-sample interleaving (matches AudioExporter.exportToWAV)
-        var pcmData = Data(capacity: numSamples * numChannels * 2)
-        for i in 0..<numSamples {
-            for ch in 0..<numChannels {
-                let sample = clamped[ch, i].item(Float.self)
-                let int16Val = Int16(max(-32768, min(32767, sample * 32767.0)))
-                var le = int16Val.littleEndian
-                pcmData.append(Data(bytes: &le, count: 2))
-            }
+        // Interleave: (2, N) → transpose to (N, 2) → flatten to (N*2,)
+        let interleaved = scaled.transposed(1, 0).reshaped([-1])
+        MLX.eval(interleaved)
+
+        // Single bulk GPU→CPU transfer instead of per-sample .item() calls
+        let int16Array = interleaved.asArray(Int16.self)
+        var pcmData = Data(capacity: int16Array.count * 2)
+        for sample in int16Array {
+            var le = sample.littleEndian
+            pcmData.append(Data(bytes: &le, count: 2))
         }
 
         return (pcmData, numChannels)

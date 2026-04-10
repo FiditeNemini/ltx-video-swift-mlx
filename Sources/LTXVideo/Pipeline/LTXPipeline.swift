@@ -18,7 +18,7 @@ import Hub
 
 /// Progress information emitted during the denoising phase of generation.
 ///
-/// Passed to the `onProgress` callback of ``LTXPipeline/generateVideo(prompt:config:upscalerWeightsPath:onProgress:profile:)``.
+/// Passed to the `onProgress` callback of ``LTXPipeline/generateVideo(prompt:config:upscalerWeightsPath:onProgress:)``.
 ///
 /// ## Example
 /// ```swift
@@ -323,7 +323,15 @@ public actor LTXPipeline {
         LTXDebug.log("[TIME] Eval transformer weights: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
         // Step 3b: Apply on-the-fly quantization if configured
-        if quantization.transformer.needsQuantization {
+        if let mixedConfig = quantization.mixedPrecision {
+            stepStart = Date()
+            LTXDebug.log("Applying mixed precision: \(mixedConfig.highPrecisionBlocks.count) blocks at \(mixedConfig.highPrecisionBits)-bit, rest at \(mixedConfig.lowPrecisionBits)-bit...")
+            progressCallback?(DownloadProgress(progress: 0.6, message: "Applying mixed precision quantization..."))
+            applyMixedPrecisionQuantization(to: transformer!, config: mixedConfig)
+            eval(transformer!.parameters())
+            Memory.clearCache()
+            LTXDebug.log("[TIME] Mixed precision quantization: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
+        } else if quantization.transformer.needsQuantization {
             stepStart = Date()
             let bits = quantization.transformer.bits
             let groupSize = quantization.transformer.groupSize
@@ -491,7 +499,12 @@ public actor LTXPipeline {
         try LTXWeightLoader.applyTransformerWeights(transformerWeights, to: ltx2, includeAudio: true)
 
         // Apply quantization if configured
-        if quantization.transformer == .qint8 || quantization.transformer == .int4 {
+        if let mixedConfig = quantization.mixedPrecision {
+            LTXDebug.log("Applying mixed precision to LTX2 transformer...")
+            applyMixedPrecisionQuantization(to: ltx2, config: mixedConfig)
+            eval(ltx2.parameters())
+            Memory.clearCache()
+        } else if quantization.transformer == .qint8 || quantization.transformer == .int4 {
             let bits = quantization.transformer == .qint8 ? 8 : 4
             LTXDebug.log("Quantizing LTX2 transformer to \(quantization.transformer)...")
             quantize(model: ltx2, groupSize: 64, bits: bits)
@@ -572,17 +585,14 @@ public actor LTXPipeline {
     ///   - config: Video generation configuration (width/height = FINAL resolution)
     ///   - upscalerWeightsPath: Path to spatial upscaler safetensors
     ///   - onProgress: Optional progress callback
-    ///   - profile: Enable performance profiling
     /// - Returns: VideoGenerationResult with video frames and optional audio
     public func generateVideo(
         prompt: String,
         config: LTXVideoGenerationConfig,
         upscalerWeightsPath: String,
         onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false
     ) async throws -> VideoGenerationResult {
         try config.validate()
-        var timings = GenerationTimings()
 
         let hasAudio = isAudioLoaded
 
@@ -630,18 +640,25 @@ public actor LTXPipeline {
         // 1. Text encoding
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
-        let textEncodingStart = Date()
+
+        profiler.start("Tokenization")
         let (inputIds, attentionMask) = tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
+        MLX.eval(inputIds, attentionMask)
+        profiler.end("Tokenization")
 
         guard let gemma = gemmaModel else {
             throw LTXError.modelNotLoaded("Gemma model not loaded")
         }
 
+        profiler.start("Gemma Forward")
         let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
         guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
             throw LTXError.generationFailed("Failed to extract Gemma hidden states")
         }
+        MLX.eval(states[states.count - 1])
+        profiler.end("Gemma Forward")
 
+        profiler.start("Feature Extractor + Connector")
         let encoderOutput = textEncoder.encodeFromHiddenStates(
             hiddenStates: states,
             attentionMask: attentionMask,
@@ -651,9 +668,9 @@ public actor LTXPipeline {
         let audioTextEmbeddings = encoderOutput.audioEncoding ?? videoTextEmbeddings
         let textMask = encoderOutput.attentionMask
         MLX.eval(videoTextEmbeddings, audioTextEmbeddings, textMask)
+        profiler.end("Feature Extractor + Connector")
 
         LTXDebug.log("Video text: \(videoTextEmbeddings.shape), Audio text: \(audioTextEmbeddings.shape)")
-        timings.textEncoding = Date().timeIntervalSince(textEncodingStart)
         profiler.end("Text Encoding")
 
         // Unload Gemma
@@ -824,8 +841,6 @@ public actor LTXPipeline {
 
             if (step + 1) % 5 == 0 { Memory.clearCache() }
             let stepDur = Date().timeIntervalSince(stepStart)
-            timings.denoiseSteps.append(stepDur)
-            timings.sampleMemory()
             profiler.recordStep(duration: stepDur)
 
             LTXDebug.log("Stage 1 step \(step)/\(stage1NumSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", stepDur))s")
@@ -1016,8 +1031,6 @@ public actor LTXPipeline {
             }
 
             let stepDur2 = Date().timeIntervalSince(stepStart)
-            timings.denoiseSteps.append(stepDur2)
-            timings.sampleMemory()
             profiler.recordStep(duration: stepDur2)
 
             LTXDebug.log("Stage 2 step \(step)/\(stage2NumSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", stepDur2))s")
@@ -1049,14 +1062,16 @@ public actor LTXPipeline {
         ))
         LTXMemoryManager.setPhase(.vaeDecode)
         profiler.start("VAE Decode")
-        let vaeStart = Date()
+
+        profiler.start("VAE Forward Pass")
         let videoTensor = decodeVideo(
             latent: videoLatent, decoder: vaeDecoder, timestep: nil,
             temporalTileSize: memoryOptimization.vaeTemporalTileSize,
             temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
         )
         MLX.eval(videoTensor)
-        timings.vaeDecode = Date().timeIntervalSince(vaeStart)
+        profiler.end("VAE Forward Pass")
+
         profiler.end("VAE Decode")
 
         let trimmedVideo: MLXArray
@@ -1088,7 +1103,6 @@ public actor LTXPipeline {
         ))
 
         LTXMemoryManager.resetCacheLimit()
-        timings.capturePeakMemory()
 
         let generationTime = Date().timeIntervalSince(generationStart)
         LTXDebug.log("Total two-stage generation time: \(String(format: "%.1f", generationTime))s")
@@ -1097,7 +1111,7 @@ public actor LTXPipeline {
             frames: trimmedVideo,
             seed: config.seed ?? 0,
             generationTime: generationTime,
-            timings: profile ? timings : nil,
+            
             audioWaveform: audioWaveform,
             audioSampleRate: audioSampleRate,
             effectivePrompt: effectivePrompt
@@ -1118,17 +1132,14 @@ public actor LTXPipeline {
     ///     (matching Lightricks: regenerated frames always start from pure noise).
     ///   - upscalerWeightsPath: Unused (kept for API compatibility)
     ///   - onProgress: Optional progress callback
-    ///   - profile: Enable performance profiling
     /// - Returns: VideoGenerationResult with retaken video frames
     public func generateRetake(
         prompt: String,
         config: LTXVideoGenerationConfig,
         upscalerWeightsPath: String,
         onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false
     ) async throws -> VideoGenerationResult {
         try config.validate()
-        var timings = GenerationTimings()
 
         guard let videoPath = config.videoPath else {
             throw LTXError.invalidConfiguration("videoPath must be set for retake mode")
@@ -1196,7 +1207,6 @@ public actor LTXPipeline {
         // Phase 1: Text encoding
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
-        let textEncodingStart = Date()
         let (inputIds, attentionMask) = tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
 
         guard let gemma = gemmaModel else {
@@ -1219,7 +1229,6 @@ public actor LTXPipeline {
         if let ae = audioTextEmbeddings { MLX.eval(ae) }
 
         LTXDebug.log("Text encoding: video=\(videoTextEmbeddings.shape), audio=\(audioTextEmbeddings?.shape.description ?? "nil")")
-        timings.textEncoding = Date().timeIntervalSince(textEncodingStart)
         profiler.end("Text Encoding")
 
         // Unload Gemma
@@ -1476,8 +1485,6 @@ public actor LTXPipeline {
 
             if (step + 1) % 5 == 0 { Memory.clearCache() }
             let stepDurR = Date().timeIntervalSince(stepStart)
-            timings.denoiseSteps.append(stepDurR)
-            timings.sampleMemory()
             profiler.recordStep(duration: stepDurR)
 
             LTXDebug.log("Step \(step)/\(numSteps): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), time=\(String(format: "%.1f", stepDurR))s")
@@ -1499,14 +1506,12 @@ public actor LTXPipeline {
         ))
         LTXMemoryManager.setPhase(.vaeDecode)
         profiler.start("VAE Decode")
-        let vaeStart = Date()
         let videoTensor = decodeVideo(
             latent: videoLatent, decoder: vaeDecoder, timestep: nil,
             temporalTileSize: memoryOptimization.vaeTemporalTileSize,
             temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
         )
         MLX.eval(videoTensor)
-        timings.vaeDecode = Date().timeIntervalSince(vaeStart)
         profiler.end("VAE Decode")
 
         let trimmedVideo: MLXArray
@@ -1517,7 +1522,6 @@ public actor LTXPipeline {
         }
 
         LTXMemoryManager.resetCacheLimit()
-        timings.capturePeakMemory()
 
         let generationTime = Date().timeIntervalSince(generationStart)
         LTXDebug.log("Total retake generation time: \(String(format: "%.1f", generationTime))s")
@@ -1526,7 +1530,7 @@ public actor LTXPipeline {
             frames: trimmedVideo,
             seed: config.seed ?? 0,
             generationTime: generationTime,
-            timings: profile ? timings : nil,
+            
             effectivePrompt: effectivePrompt,
             sourceAudioPath: videoPath
         )
@@ -1568,125 +1572,6 @@ public actor LTXPipeline {
         LTXDebug.log("Normalized video latent: mean=\(normalizedLatent.mean().item(Float.self)), std=\(MLX.sqrt(MLX.variance(normalizedLatent)).item(Float.self))")
 
         return normalizedLatent
-    }
-
-    // MARK: - Denoising Loop
-
-    /// Core denoising loop — reusable for both single-stage and two-stage generation.
-    ///
-    /// Takes an initial noisy latent and iteratively denoises it following the sigma schedule.
-    /// Returns the raw denoised latent (NOT VAE-decoded).
-    ///
-    /// - Parameters:
-    ///   - latent: Initial noisy latent (B, C, F, H, W) — already scaled by sigmas[0]
-    ///   - sigmas: Sigma schedule (including terminal 0.0)
-    ///   - textEmbeddings: Text embeddings
-    ///   - latentShape: Shape descriptor for the latent
-    ///   - config: Generation configuration
-    ///   - transformer: The transformer model
-    ///   - onProgress: Optional progress callback
-    ///   - profile: Enable profiling output
-    /// - Returns: Denoised latent (B, C, F, H, W)
-    private func denoise(
-        latent: MLXArray,
-        sigmas: [Float],
-        textEmbeddings: MLXArray,
-        latentShape: VideoLatentShape,
-        config: LTXVideoGenerationConfig,
-        transformer: LTXTransformer,
-        conditioningMask: MLXArray? = nil,
-        conditionedLatent: MLXArray? = nil,
-        onProgress: GenerationProgressCallback? = nil,
-        profile: Bool = false,
-        timings: inout GenerationTimings
-    ) -> MLXArray {
-        let numSteps = sigmas.count - 1
-        var currentLatent = latent
-
-        for step in 0..<numSteps {
-            let stepStart = Date()
-            let sigma = sigmas[step]
-            let sigmaNext = sigmas[step + 1]
-
-            onProgress?(GenerationProgress(
-                currentStep: step,
-                totalSteps: numSteps,
-                sigma: sigma,
-                phase: .denoising
-            ))
-
-            // Inject noise to conditioned frame BEFORE transformer (Diffusers pattern)
-            if let condLatent = conditionedLatent, config.imageCondNoiseScale > 0, sigma > 0 {
-                let injectionNoise = MLXRandom.normal(condLatent.shape)
-                let noisedFrame0 = condLatent + MLXArray(config.imageCondNoiseScale) * injectionNoise * MLXArray(sigma * sigma)
-                currentLatent[0..., 0..., 0..<1, 0..., 0...] = noisedFrame0
-            }
-
-            let hasPerTokenTimestep = conditioningMask != nil
-            let hasConditionedFrame0 = conditionedLatent != nil
-
-            let timestep: MLXArray
-            if hasPerTokenTimestep, let mask = conditioningMask {
-                timestep = MLXArray(sigma) * (1 - mask)  // (1, T)
-            } else {
-                timestep = MLXArray([sigma])
-            }
-
-            let patchified = patchify(currentLatent).asType(.bfloat16)
-            LTXDebug.log("Step \(step): patchified \(patchified.shape), σ=\(String(format: "%.4f", sigma))")
-
-            let velocityPred = transformer(
-                latent: patchified,
-                context: textEmbeddings,
-                timesteps: timestep,
-                contextMask: nil,
-                latentShape: (frames: latentShape.frames, height: latentShape.height, width: latentShape.width)
-            )
-
-            let velocity = unpatchify(velocityPred, shape: latentShape).asType(.float32)
-
-            if hasConditionedFrame0 {
-                let velocitySlice = velocity[0..., 0..., 1..., 0..., 0...]
-                let latentSlice = currentLatent[0..., 0..., 1..., 0..., 0...]
-                let steppedSlice = scheduler.step(
-                    latent: latentSlice,
-                    velocity: velocitySlice,
-                    sigma: sigma,
-                    sigmaNext: sigmaNext
-                )
-                let frame0 = currentLatent[0..., 0..., 0..<1, 0..., 0...]
-                currentLatent = MLX.concatenated([frame0, steppedSlice], axis: 2)
-            } else {
-                currentLatent = scheduler.step(
-                    latent: currentLatent,
-                    velocity: velocity,
-                    sigma: sigma,
-                    sigmaNext: sigmaNext
-                )
-            }
-
-            MLX.eval(currentLatent)
-
-            // Periodic cache clearing to reduce GPU memory fragmentation
-            if (step + 1) % 5 == 0 {
-                Memory.clearCache()
-            }
-
-            let stepDuration = Date().timeIntervalSince(stepStart)
-            timings.denoiseSteps.append(stepDuration)
-            timings.sampleMemory()
-
-            if profile {
-                let vMean = velocityPred.mean().item(Float.self)
-                let vStd = MLX.sqrt(MLX.variance(velocityPred)).item(Float.self)
-                let lMean = currentLatent.mean().item(Float.self)
-                let lStd = MLX.sqrt(MLX.variance(currentLatent)).item(Float.self)
-                LTXDebug.log("  Step \(step): σ=\(String(format: "%.4f", sigma))→\(String(format: "%.4f", sigmaNext)), vel mean=\(String(format: "%.4f", vMean)), std=\(String(format: "%.4f", vStd)), latent mean=\(String(format: "%.4f", lMean)), std=\(String(format: "%.4f", lStd))")
-                LTXDebug.log("  Step \(step) time: \(String(format: "%.2f", stepDuration))s")
-            }
-        }
-
-        return currentLatent
     }
 
     // MARK: - Image-to-Video Helpers
@@ -1754,6 +1639,39 @@ public actor LTXPipeline {
     ///
     /// - Parameters:
     ///   - loraPath: Path to LoRA .safetensors file
+    // MARK: - Mixed Precision Quantization
+
+    /// Apply per-block quantization: high-precision blocks get one bit level,
+    /// remaining blocks get another (typically lower) level.
+    private func applyMixedPrecisionQuantization(to model: Module, config: MixedPrecisionConfig) {
+        // Find transformer blocks via the module hierarchy
+        let blocks: [Module]
+        if let t = model as? LTXTransformer {
+            blocks = t.transformerBlocks
+        } else if let t = model as? LTX2Transformer {
+            blocks = t.transformerBlocks
+        } else {
+            // Fallback: uniform quantization at low precision
+            quantize(model: model, groupSize: config.groupSize, bits: config.lowPrecisionBits)
+            return
+        }
+
+        for (i, block) in blocks.enumerated() {
+            let bits = config.highPrecisionBlocks.contains(i) ? config.highPrecisionBits : config.lowPrecisionBits
+            if bits < 16 {
+                quantize(model: block, groupSize: config.groupSize, bits: bits)
+            }
+        }
+
+        // Quantize non-block components (projections, embeddings) at the high precision level
+        // by quantizing the full model then re-quantizing blocks — but that's wasteful.
+        // Instead, leave non-block params in bf16 (they're small relative to blocks).
+
+        let highCount = config.highPrecisionBlocks.filter { $0 < blocks.count }.count
+        let lowCount = blocks.count - highCount
+        LTXDebug.log("Mixed precision: \(highCount) blocks at \(config.highPrecisionBits)-bit, \(lowCount) blocks at \(config.lowPrecisionBits)-bit")
+    }
+
     ///   - scale: LoRA scale factor
     /// - Returns: Application result
     @discardableResult

@@ -136,7 +136,6 @@ struct ProfileRun: AsyncParsableCommand {
         let result = try await pipeline.generateVideo(
             prompt: options.prompt, config: genConfig, upscalerWeightsPath: upscalerPath,
             onProgress: { progress in print("\r  \(progress.status)", terminator: ""); fflush(stdout) },
-            profile: true
         )
         print()
 
@@ -224,7 +223,7 @@ struct ProfileBenchmark: AsyncParsableCommand {
 
             let startTime = CFAbsoluteTimeGetCurrent()
             let _ = try await pipeline.generateVideo(
-                prompt: options.prompt, config: genConfig, upscalerWeightsPath: upscalerPath, profile: true
+                prompt: options.prompt, config: genConfig, upscalerWeightsPath: upscalerPath
             )
             print(String(format: "%.2fs", CFAbsoluteTimeGetCurrent() - startTime))
 
@@ -313,7 +312,7 @@ struct ProfileCompare: AsyncParsableCommand {
 
             let startTime = CFAbsoluteTimeGetCurrent()
             let _ = try await pipeline.generateVideo(
-                prompt: prompt, config: genConfig, upscalerWeightsPath: upscalerPath, profile: true
+                prompt: prompt, config: genConfig, upscalerWeightsPath: upscalerPath
             )
             print("  \(label): \(String(format: "%.2fs", CFAbsoluteTimeGetCurrent() - startTime))")
             labeledSessions.append((label: label, session: session))
