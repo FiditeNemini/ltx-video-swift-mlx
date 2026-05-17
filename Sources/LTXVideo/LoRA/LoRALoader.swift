@@ -59,6 +59,31 @@ class LoRALoader {
         return try MLX.loadArrays(url: url)
     }
 
+    /// Read the safetensors header `metadata` dict from a LoRA file.
+    /// Returns an empty dict if the file has no metadata.
+    static func loadMetadata(from path: String) throws -> [String: String] {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw LTXError.fileNotFound(path)
+        }
+        let (_, metadata) = try MLX.loadArraysAndMetadata(url: url)
+        return metadata
+    }
+
+    /// Read `reference_downscale_factor` from a LoRA's safetensors metadata.
+    /// Defaults to `1` if the key is missing or unparseable. Used by IC-LoRAs
+    /// (e.g. LipDub) trained with a downscaled reference video.
+    static func referenceDownscaleFactor(from path: String) -> Int {
+        do {
+            let metadata = try loadMetadata(from: path)
+            guard let raw = metadata["reference_downscale_factor"] else { return 1 }
+            return Int(raw) ?? 1
+        } catch {
+            // Treat any IO error as "no metadata" — match Python iclora_utils.read_lora_reference_downscale_factor.
+            return 1
+        }
+    }
+
     /// Parse LoRA layer structure from weight keys
     private static func parseLoRALayers(from weights: [String: MLXArray]) -> [LoRALayerInfo] {
         var layers: [LoRALayerInfo] = []
@@ -228,12 +253,15 @@ struct LoRAKeyMapper {
         //    Python: FeedForward contains nn.Sequential("net") with [GEGLU(.proj), ..., Linear]
         //    Swift: LTXFeedForward uses @ModuleInfo(key: "project_in") var projectIn: GELUApprox
         //           and GELUApprox uses @ModuleInfo var proj: Linear  (default key "proj")
-        key = key.replacingOccurrences(of: ".ff.net.0.proj", with: ".ff.project_in.proj")
+        //    No leading "." so this matches BOTH the video FFN (`.ff.`) and the audio
+        //    FFN (`_ff.`) used by the dual-stream LTX2TransformerBlock.
+        key = key.replacingOccurrences(of: "ff.net.0.proj", with: "ff.project_in.proj")
 
         // 5. ff.net.2 -> ff.project_out
         //    Python: FeedForward's net[2] is the output Linear
         //    Swift: LTXFeedForward uses @ModuleInfo(key: "project_out") var projectOut: Linear
-        key = key.replacingOccurrences(of: ".ff.net.2", with: ".ff.project_out")
+        //    Same reason as #4 — drop the leading "." so audio_ff is also matched.
+        key = key.replacingOccurrences(of: "ff.net.2", with: "ff.project_out")
 
         // 6. Append .weight — all targeted layers are Linear modules whose weight
         //    parameter is named "weight"
