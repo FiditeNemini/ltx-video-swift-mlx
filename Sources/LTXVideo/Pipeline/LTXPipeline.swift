@@ -1674,17 +1674,27 @@ public actor LTXPipeline {
     /// - Parameters:
     ///   - prompt: Text description of the desired output (typically describing what is being said).
     ///   - referenceVideoPath: Path to the source video file (.mp4) — both video frames and
-    ///     audio track are extracted from this file.
+    ///     (by default) audio track are extracted from this file. Provide either this OR
+    ///     `referenceImagePath`, not both.
+    ///   - referenceImagePath: Path to a still image (.png/.jpg) used as the identity
+    ///     anchor. Internally encoded as a single-frame I2V keyframe at pixel index 0
+    ///     (same code path as `generate --image`), NOT as a multi-frame IC-LoRA video
+    ///     reference. This frees the rest of the timeline to respond to the prompt while
+    ///     the LipDub LoRA + audio reference still drive lip-sync. When set,
+    ///     `targetAudioPath` is REQUIRED (the image has no audio) and the speech-window
+    ///     alignment step is skipped — the target audio is used directly.
     ///   - lipdubLoraPath: Path to the LipDub IC-LoRA safetensors file.
-    ///   - config: Width / height / seed / etc. `numFrames` is overridden by the snap
-    ///     applied to the reference video's actual frame count (rounded down to `8k+1`).
+    ///   - config: Width / height / seed / etc. `numFrames` **must** be `8n+1`
+    ///     already (no automatic snap is performed here — the CLI enforces the
+    ///     constraint up front, and library callers are expected to do the same).
     ///   - upscalerWeightsPath: Path to spatial upscaler safetensors (used between stages).
     ///   - targetAudioPath: Optional path to a separate audio file (e.g. TTS in a
-    ///     different language) to lip-sync to. When set, the audio is loaded as mono,
-    ///     its speech-active window is detected, and it is time-stretched (pitch
-    ///     preserved) so the speech occupies the same window as the source video's
-    ///     speech. The aligned waveform replaces the source video's audio as the
-    ///     LipDub reference. When nil, the source video's audio is used as-is.
+    ///     different language) to lip-sync to. When set (and `referenceVideoPath` is
+    ///     used), the audio is loaded as mono, its speech-active window is detected, and
+    ///     it is time-stretched (pitch preserved) so the speech occupies the same window
+    ///     as the source video's speech. The aligned waveform replaces the source video's
+    ///     audio as the LipDub reference. When nil and using a video reference, the
+    ///     source video's audio is used as-is. REQUIRED when using `referenceImagePath`.
     ///   - onProgress: Optional progress callback.
     /// - Returns: `VideoGenerationResult` with the generated video frames and the decoded
     ///   audio waveform.
@@ -1695,11 +1705,13 @@ public actor LTXPipeline {
     /// > adding per-token denoise-mask blending in `runDenoiseStep`; not implemented.
     public func generateLipDub(
         prompt: String,
-        referenceVideoPath: String,
+        referenceVideoPath: String? = nil,
+        referenceImagePath: String? = nil,
         lipdubLoraPath: String,
         config: LTXVideoGenerationConfig,
         upscalerWeightsPath: String,
         targetAudioPath: String? = nil,
+        enhancePrompt: Bool = false,
         onProgress: GenerationProgressCallback? = nil
     ) async throws -> VideoGenerationResult {
         try config.validate()
@@ -1716,8 +1728,36 @@ public actor LTXPipeline {
         guard let ltx2 = ltx2Transformer else {
             throw LTXError.modelNotLoaded("LipDub requires the dual-stream LTX2Transformer (audio enabled). Call loadAudioModels().")
         }
-        guard FileManager.default.fileExists(atPath: referenceVideoPath) else {
-            throw LTXError.fileNotFound("Reference video not found: \(referenceVideoPath)")
+        // Exactly one of referenceVideoPath / referenceImagePath must be set.
+        // After this block:
+        //   - `isImageMode == true`  iff `referenceImagePath != nil`
+        //   - `videoRefPath`         is the non-nil video path in video mode, or
+        //                            an empty sentinel in image mode (never read).
+        // The trailing helpers below assume these two invariants — use
+        // `videoRefPath` directly inside `!isImageMode` branches instead of
+        // re-unwrapping `referenceVideoPath`.
+        let isImageMode: Bool
+        let videoRefPath: String
+        switch (referenceVideoPath, referenceImagePath) {
+        case (nil, nil):
+            throw LTXError.invalidConfiguration("LipDub requires either referenceVideoPath or referenceImagePath.")
+        case (.some, .some):
+            throw LTXError.invalidConfiguration("LipDub: pass referenceVideoPath OR referenceImagePath, not both.")
+        case (.some(let vp), nil):
+            guard FileManager.default.fileExists(atPath: vp) else {
+                throw LTXError.fileNotFound("Reference video not found: \(vp)")
+            }
+            videoRefPath = vp
+            isImageMode = false
+        case (nil, .some(let ip)):
+            guard FileManager.default.fileExists(atPath: ip) else {
+                throw LTXError.fileNotFound("Reference image not found: \(ip)")
+            }
+            guard targetAudioPath != nil else {
+                throw LTXError.invalidConfiguration("LipDub image mode requires targetAudioPath (the image has no audio track).")
+            }
+            videoRefPath = ""  // sentinel — image mode never reads videoRefPath
+            isImageMode = true
         }
         guard FileManager.default.fileExists(atPath: lipdubLoraPath) else {
             throw LTXError.fileNotFound("LipDub LoRA not found: \(lipdubLoraPath)")
@@ -1732,13 +1772,41 @@ public actor LTXPipeline {
         let halfWidth = config.width / 2
         let halfHeight = config.height / 2
 
+        // 0. Optional VLM-based prompt enhancement (image mode only — VLM needs an image).
+        // Done BEFORE LoRA fusion so the ~7.5 GB VLM container doesn't stack on top of
+        // the LoRA-fused dual-stream transformer in resident memory. The VLM is unloaded
+        // inside `enhancePromptWithVLM` via Memory.clearCache before this returns.
+        // The I2V system prompt instructs the VLM to preserve the user's quoted dialogue
+        // verbatim; if the speaking-verb wrapper is nonetheless dropped from the output,
+        // `applyLipDubSignatureFallback` re-appends the original tail so the LipDub LoRA
+        // still sees its trained trigger.
+        let effectivePrompt: String
+        if enhancePrompt, let imagePath = referenceImagePath {
+            print("[lipdub] enhancing prompt via VLM (analyzing reference image)...")
+            let enhanced = try await enhancePromptWithVLM(prompt, imagePath: imagePath)
+            let (final, reappended) = Self.applyLipDubSignatureFallback(
+                enhanced: enhanced, original: prompt
+            )
+            if let reappended = reappended {
+                print("[lipdub] VLM dropped speaking/dialogue hint — re-appended: \(reappended)")
+            }
+            effectivePrompt = final
+            print("[lipdub] enhanced prompt: \(effectivePrompt)")
+        } else {
+            effectivePrompt = prompt
+        }
+
         // 1. Read LoRA metadata and fuse into the dual-stream transformer.
         let downscaleFactor = LoRALoader.referenceDownscaleFactor(from: lipdubLoraPath)
         LTXDebug.log("[lipdub] reference_downscale_factor=\(downscaleFactor) from LoRA metadata")
-        guard halfWidth % downscaleFactor == 0 && halfHeight % downscaleFactor == 0 else {
-            throw LTXError.invalidConfiguration(
-                "Half-resolution \(halfWidth)x\(halfHeight) must be divisible by downscale_factor=\(downscaleFactor)"
-            )
+        // Downscale factor only matters for the video-reference path; in image mode
+        // we use the I2V keyframe-append pattern at the full target resolution.
+        if !isImageMode {
+            guard halfWidth % downscaleFactor == 0 && halfHeight % downscaleFactor == 0 else {
+                throw LTXError.invalidConfiguration(
+                    "Half-resolution \(halfWidth)x\(halfHeight) must be divisible by downscale_factor=\(downscaleFactor)"
+                )
+            }
         }
         // [DIAGNOSTIC] LTX_LIPDUB_SKIP_LORA=1 bypasses LoRA fusion to isolate IC-LoRA contribution.
         let skipLoRA = ProcessInfo.processInfo.environment["LTX_LIPDUB_SKIP_LORA"] == "1"
@@ -1779,7 +1847,7 @@ public actor LTXPipeline {
         LTXDebug.log("[lipdub] target frames=\(numFrames), Stage1 latent=\(stage1Shape.frames)x\(stage1Shape.height)x\(stage1Shape.width), audio frames=\(audioNumFrames)")
 
         // 3. Text encode the prompt.
-        let (inputIds, attentionMask) = try tokenizePrompt(prompt, maxLength: textMaxLength)
+        let (inputIds, attentionMask) = try tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
         MLX.eval(inputIds, attentionMask)
         guard let gemma = gemmaModel else {
             throw LTXError.modelNotLoaded("Gemma model not loaded")
@@ -1802,35 +1870,61 @@ public actor LTXPipeline {
         self.tokenizer = nil
         Memory.clearCache()
 
-        // 4. Encode reference video at Stage 1 downscaled resolution.
+        // 4. Stage 1 reference: VIDEO MODE uses the IC-LoRA multi-frame reference
+        // at downscaled resolution; IMAGE MODE uses the I2V keyframe-append pattern
+        // (single VAE-encoded frame at index 0, full target resolution). The
+        // keyframe pattern doesn't pin every output frame to the reference, so the
+        // model is free to animate motion from the prompt while the LipDub LoRA +
+        // audio reference still drive lip-sync.
         let refS1Width = halfWidth / downscaleFactor
         let refS1Height = halfHeight / downscaleFactor
-        LTXDebug.log("[lipdub] encoding reference video at Stage 1 res \(refS1Width)x\(refS1Height)")
-        let refLatentS1 = try await encodeVideo(
-            path: referenceVideoPath, width: refS1Width, height: refS1Height, numFrames: numFrames
-        )
-        if ProcessInfo.processInfo.environment["LTX_LIPDUB_DUMP_VIDEO_REF"] == "1" {
-            let f32 = refLatentS1.asType(.float32)
+        var refLatentS1: MLXArray? = nil
+        var s1ImageKeyframes: [EncodedKeyframe] = []
+        if let imagePath = referenceImagePath {
+            LTXDebug.log("[lipdub] image mode — encoding I2V keyframe at Stage 1 res \(halfWidth)x\(halfHeight)")
+            s1ImageKeyframes = try await encodeKeyframes(
+                [KeyframeInput(path: imagePath, pixelFrameIndex: 0)],
+                width: halfWidth, height: halfHeight
+            )
+        } else {
+            LTXDebug.log("[lipdub] encoding reference video at Stage 1 res \(refS1Width)x\(refS1Height)")
+            refLatentS1 = try await encodeVideo(
+                path: videoRefPath, width: refS1Width, height: refS1Height, numFrames: numFrames
+            )
+        }
+        if isImageMode && ProcessInfo.processInfo.environment["LTX_LIPDUB_DUMP_VIDEO_REF"] == "1" {
+            print("[lipdub][DIAG] LTX_LIPDUB_DUMP_VIDEO_REF=1 ignored in image mode — the I2V keyframe path produces no multi-frame reference latent to dump")
+        }
+        if !isImageMode, let f = refLatentS1, ProcessInfo.processInfo.environment["LTX_LIPDUB_DUMP_VIDEO_REF"] == "1" {
+            let f32 = f.asType(.float32)
             MLX.eval(f32)
             try? MLX.save(arrays: ["data": f32], url: URL(fileURLWithPath: "/tmp/swift_video_ref_latent_s1.safetensors"))
             print("[lipdub][DIAG] dumped video ref latent S1 \(f32.shape) to /tmp/swift_video_ref_latent_s1.safetensors")
             let m = f32.mean().item(Float.self)
             let v = MLX.mean(MLX.square(f32 - m)).item(Float.self)
             print("[lipdub][DIAG]   stats: mean=\(m), std=\(sqrt(v)), min=\(f32.min().item(Float.self)), max=\(f32.max().item(Float.self))")
-            return VideoGenerationResult(frames: MLXArray.zeros([1,3,1,64,64]), seed: 0, generationTime: 0, audioWaveform: nil, audioSampleRate: nil, effectivePrompt: prompt)
+            return VideoGenerationResult(frames: MLXArray.zeros([1,3,1,64,64]), seed: 0, generationTime: 0, audioWaveform: nil, audioSampleRate: nil, effectivePrompt: effectivePrompt)
         }
         unloadVAEEncoder()  // free encoder; we'll reload it for Stage 2
 
         // 5. Extract reference audio + encode via AudioVAE.
         //
-        // When `targetAudioPath` is set, swap the audio reference for the
-        // (silence-aware, pitch-preserving) time-stretched target audio so the
-        // model lip-syncs to it. Otherwise, use the source video's audio.
+        // Three sources, in priority order:
+        //   - Image mode: target audio is the ONLY audio source — load it directly,
+        //     no speech-window alignment (the static reference has no speech timing).
+        //   - Video mode + targetAudio: align target to source's speech window
+        //     (silence-aware, pitch-preserving time-stretch).
+        //   - Video mode without targetAudio: use the source video's own audio.
         let audioProcessor = AudioProcessor()
         let refWaveform: MLXArray
-        if let targetAudioPath = targetAudioPath {
+        if isImageMode {
+            // `targetAudioPath` is non-nil here (validated above).
+            let audioPath = targetAudioPath!
+            print("[lipdub] image mode — using target audio \(audioPath) directly (no alignment)")
+            refWaveform = try await audioProcessor.loadAudio(from: audioPath)
+        } else if let targetAudioPath = targetAudioPath {
             print("[lipdub] aligning target audio \(targetAudioPath) to source video speech window")
-            let sourceMonoMLX = try await audioProcessor.loadAudio(from: referenceVideoPath)
+            let sourceMonoMLX = try await audioProcessor.loadAudio(from: videoRefPath)
             let targetMonoMLX = try await audioProcessor.loadAudio(from: targetAudioPath)
             let sourceMono = AudioPreprocessor.mlxToMonoFloats(sourceMonoMLX)
             let targetMono = AudioPreprocessor.mlxToMonoFloats(targetMonoMLX)
@@ -1850,7 +1944,7 @@ public actor LTXPipeline {
             print(String(format: "[lipdub] time-stretch rate=%.3f (pitch preserved)", rate))
             refWaveform = MLXArray(aligned)  // mono (samples,)
         } else {
-            refWaveform = try await audioProcessor.loadAudio(from: referenceVideoPath)
+            refWaveform = try await audioProcessor.loadAudio(from: videoRefPath)
         }
         let refChannels = refWaveform.ndim == 1 ? 1 : refWaveform.dim(0)
         let refSamples = refWaveform.dim(refWaveform.ndim - 1)
@@ -1865,18 +1959,29 @@ public actor LTXPipeline {
             try? MLX.save(arrays: ["data": melF32], url: URL(fileURLWithPath: "/tmp/swift_audio_mel.safetensors"))
             try? MLX.save(arrays: ["data": latF32], url: URL(fileURLWithPath: "/tmp/swift_audio_latent.safetensors"))
             print("[lipdub][DIAG] dumped mel \(melF32.shape) and latent \(latF32.shape) to /tmp/swift_audio_*.safetensors — exiting")
-            return VideoGenerationResult(frames: MLXArray.zeros([1,3,1,64,64]), seed: 0, generationTime: 0, audioWaveform: nil, audioSampleRate: nil, effectivePrompt: prompt)
+            return VideoGenerationResult(frames: MLXArray.zeros([1,3,1,64,64]), seed: 0, generationTime: 0, audioWaveform: nil, audioSampleRate: nil, effectivePrompt: effectivePrompt)
         }
         MLX.eval(refAudioLatent)
 
         // 6. Build Stage 1 reference contexts.
-        let s1VideoRefCtx = buildVideoReference(
-            referenceLatent: refLatentS1,
-            targetShape: stage1Shape,
-            downscaleFactor: downscaleFactor,
-            hasAudio: true,
-            refConfig: ltx2.config
-        )
+        let s1VideoRefCtx: AppendKeyframeContext?
+        if isImageMode {
+            s1VideoRefCtx = prepareKeyframeAppend(
+                encoded: s1ImageKeyframes,
+                shape: stage1Shape,
+                hasAudio: true,
+                refConfig: ltx2.config,
+                stageLabel: "LipDub Stage 1 (image keyframe)"
+            )
+        } else {
+            s1VideoRefCtx = buildVideoReference(
+                referenceLatent: refLatentS1!,
+                targetShape: stage1Shape,
+                downscaleFactor: downscaleFactor,
+                hasAudio: true,
+                refConfig: ltx2.config
+            )
+        }
         // [DIAGNOSTIC] LTX_LIPDUB_SKIP_AUDIO_REF=1 disables the audio reference (audio is still
         // denoised but with no negative-position reference tokens) to isolate audio-ref contribution.
         let skipAudioRef = ProcessInfo.processInfo.environment["LTX_LIPDUB_SKIP_AUDIO_REF"] == "1"
@@ -1966,23 +2071,44 @@ public actor LTXPipeline {
         videoLatent = (upscaled - mean5d) / std5d
         MLX.eval(videoLatent)
 
-        // 10. Re-encode reference video at Stage 2 downscaled resolution.
+        // 10. Stage 2 reference: same dual-path as Stage 1, at full resolution.
         let refS2Width = config.width / downscaleFactor
         let refS2Height = config.height / downscaleFactor
-        LTXDebug.log("[lipdub] re-encoding reference video at Stage 2 res \(refS2Width)x\(refS2Height)")
-        let refLatentS2 = try await encodeVideo(
-            path: referenceVideoPath, width: refS2Width, height: refS2Height, numFrames: numFrames
-        )
+        var refLatentS2: MLXArray? = nil
+        var s2ImageKeyframes: [EncodedKeyframe] = []
+        if let imagePath = referenceImagePath {
+            LTXDebug.log("[lipdub] image mode — encoding I2V keyframe at Stage 2 res \(config.width)x\(config.height)")
+            s2ImageKeyframes = try await encodeKeyframes(
+                [KeyframeInput(path: imagePath, pixelFrameIndex: 0)],
+                width: config.width, height: config.height
+            )
+        } else {
+            LTXDebug.log("[lipdub] re-encoding reference video at Stage 2 res \(refS2Width)x\(refS2Height)")
+            refLatentS2 = try await encodeVideo(
+                path: videoRefPath, width: refS2Width, height: refS2Height, numFrames: numFrames
+            )
+        }
         unloadVAEEncoder()
 
         // 11. Build Stage 2 reference contexts.
-        let s2VideoRefCtx = buildVideoReference(
-            referenceLatent: refLatentS2,
-            targetShape: stage2Shape,
-            downscaleFactor: downscaleFactor,
-            hasAudio: true,
-            refConfig: ltx2.config
-        )
+        let s2VideoRefCtx: AppendKeyframeContext?
+        if isImageMode {
+            s2VideoRefCtx = prepareKeyframeAppend(
+                encoded: s2ImageKeyframes,
+                shape: stage2Shape,
+                hasAudio: true,
+                refConfig: ltx2.config,
+                stageLabel: "LipDub Stage 2 (image keyframe)"
+            )
+        } else {
+            s2VideoRefCtx = buildVideoReference(
+                referenceLatent: refLatentS2!,
+                targetShape: stage2Shape,
+                downscaleFactor: downscaleFactor,
+                hasAudio: true,
+                refConfig: ltx2.config
+            )
+        }
         // Stage 2 audio reference = Stage 1 denoised audio (already packed).
         let s2AudioRefCtx = buildAudioReferenceFromPacked(
             packed: s1AudioLatentPacked,
@@ -2068,8 +2194,113 @@ public actor LTXPipeline {
             generationTime: generationTime,
             audioWaveform: audioWaveform,
             audioSampleRate: vocoder.outputSampleRate,
-            effectivePrompt: prompt
+            effectivePrompt: effectivePrompt
         )
+    }
+
+    /// Repair a VLM-enhanced LipDub prompt when the speaking-verb hint is missing.
+    ///
+    /// The LipDub IC-LoRA was trained on **English-wrapped** prompts of the form
+    /// `<scene>, speaking in <LANGUAGE> saying: "<DIALOGUE>"` — the wrapper is
+    /// always English even when the dialogue is in another language. The I2V
+    /// system prompt the VLM runs under is instructed to preserve the user's
+    /// quoted dialogue verbatim, but the wrapper itself may be rephrased
+    /// (`"speaks in Spanish"`) or, rarely, dropped.
+    ///
+    /// We treat the enhanced output as still valid when it contains any common
+    /// English speaking-verb variant (`speaking|speaks|saying|says` followed by
+    /// `in` as a whole word — substrings inside `speaking individually` /
+    /// `says intermittently` are NOT matches). If none survive AND the original
+    /// prompt did contain a `speaking in` wrapper, that wrapper's tail is glued
+    /// to the enhanced text so the LoRA stays engaged. Joiner picks `" "` after
+    /// any terminal punctuation (`.,;?!"')]…—`) and `", "` otherwise.
+    ///
+    /// > **Cross-language caveat.** Authors using non-English wrappers
+    /// > (`parlant en …`, `hablando en …`, `sprechend in …`) get no fallback —
+    /// > but those wrappers also don't match the LoRA's trained distribution,
+    /// > so the right fix is the prompt, not this helper.
+    ///
+    /// - Parameters:
+    ///   - enhanced: VLM-enhanced prompt.
+    ///   - original: User's input prompt (the one passed to the VLM).
+    /// - Returns: A tuple `(final, reappended)` — `final` is the prompt to send onward;
+    ///   `reappended` is non-nil only when the fallback fired, set to the signature
+    ///   string that was glued onto the end (useful for logging / tests).
+    static func applyLipDubSignatureFallback(
+        enhanced: String, original: String
+    ) -> (final: String, reappended: String?) {
+        if Self.containsSpeakingVerbWrapper(enhanced) {
+            return (enhanced, nil)
+        }
+        // Search the original directly with case-insensitive match — avoids the
+        // Swift String-index portability hazard of indexing `original` with an
+        // index obtained from `original.lowercased()` (lowercasing can change
+        // unit length: Turkish `İ` → `i\u{0307}`, German `ẞ` → `ss`, etc.).
+        guard let sigRange = Self.firstSpeakingInRange(in: original) else {
+            return (enhanced, nil)
+        }
+        let signature = String(original[sigRange.lowerBound...])
+        let trimmed = enhanced.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return (signature, signature)
+        }
+        let terminalChars: Set<Character> =
+            [".", ",", ";", ":", "?", "!", "\"", "'", ")", "]", "}", "…", "—", "–"]
+        let endsTerminally = trimmed.last.map { terminalChars.contains($0) } ?? false
+        let joiner = endsTerminally ? " " : ", "
+        return (trimmed + joiner + signature, signature)
+    }
+
+    /// Whether `text` contains any common English speaking-verb wrapper —
+    /// `(speaking|speaks|saying|says)` followed by `in` as a WHOLE WORD.
+    /// `"speaking individually"` / `"says intermittently"` do NOT match.
+    private static func containsSpeakingVerbWrapper(_ text: String) -> Bool {
+        let verbs = ["speaking", "speaks", "saying", "says"]
+        for verb in verbs {
+            var searchStart = text.startIndex
+            while let r = text.range(
+                of: verb, options: .caseInsensitive, range: searchStart..<text.endIndex
+            ) {
+                // After the verb we want: 1+ whitespace, then literal "in",
+                // then a word-boundary char (whitespace, punctuation, EOS).
+                var i = r.upperBound
+                // Skip whitespace.
+                while i < text.endIndex, text[i].isWhitespace { i = text.index(after: i) }
+                let afterWs = i
+                let inEnd = text.index(afterWs, offsetBy: 2, limitedBy: text.endIndex)
+                if let inEnd = inEnd, afterWs < text.endIndex {
+                    let twoChars = text[afterWs..<inEnd]
+                    if twoChars.lowercased() == "in" {
+                        // Boundary: end-of-string OR next char is non-letter.
+                        if inEnd == text.endIndex || !text[inEnd].isLetter {
+                            return true
+                        }
+                    }
+                }
+                searchStart = r.upperBound
+            }
+        }
+        return false
+    }
+
+    /// Find the first `speaking in` (as whole-word wrapper) in `original`.
+    private static func firstSpeakingInRange(in original: String) -> Range<String.Index>? {
+        var searchStart = original.startIndex
+        while let r = original.range(
+            of: "speaking", options: .caseInsensitive, range: searchStart..<original.endIndex
+        ) {
+            var i = r.upperBound
+            while i < original.endIndex, original[i].isWhitespace { i = original.index(after: i) }
+            let afterWs = i
+            if let inEnd = original.index(afterWs, offsetBy: 2, limitedBy: original.endIndex),
+               afterWs < original.endIndex,
+               original[afterWs..<inEnd].lowercased() == "in",
+               inEnd == original.endIndex || !original[inEnd].isLetter {
+                return r.lowerBound..<inEnd
+            }
+            searchStart = r.upperBound
+        }
+        return nil
     }
 
     /// Encode a video into latent space using the VAE encoder
