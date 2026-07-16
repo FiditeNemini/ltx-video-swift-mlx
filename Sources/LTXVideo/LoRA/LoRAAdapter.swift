@@ -59,9 +59,12 @@ class LoRAAdapter {
     ///
     /// - Parameters:
     ///   - model: The transformer to fuse into
-    /// - Returns: Dictionary of original weights (for unfusing later)
+    /// - Returns: Dictionary of original weights (for unfusing later) and the number
+    ///   of LoRA layer-pairs fused. The dictionary can hold up to 3 tensors per
+    ///   fused quantized layer (weight + scales + biases), so `originals.count` is
+    ///   NOT a layer count — use `fusedLayerCount` for reporting.
     @discardableResult
-    func fuseWeights(into model: Module) -> [String: MLXArray] {
+    func fuseWeights(into model: Module) -> (originalWeights: [String: MLXArray], fusedLayerCount: Int) {
         var originalWeights: [String: MLXArray] = [:]
         var fusedCount = 0
 
@@ -161,8 +164,8 @@ class LoRAAdapter {
         // Clear GPU cache after all batches (matching flux-2 pattern)
         Memory.clearCache()
 
-        LTXDebug.log("LoRA fused \(fusedCount) layers (saved \(originalWeights.count) originals)")
-        return originalWeights
+        LTXDebug.log("LoRA fused \(fusedCount) layers (saved \(originalWeights.count) original tensors)")
+        return (originalWeights, fusedCount)
     }
 
     /// Group LoRA layers by transformer block prefix for batched processing
@@ -281,8 +284,13 @@ class LoRAAdapter {
 
 /// Result of applying LoRA to a model
 public struct LoRAApplicationResult: Sendable {
-    /// Number of layers modified
+    /// Number of LoRA layer-pairs actually fused into the model
     public let modifiedLayerCount: Int
+
+    /// Number of layer-pairs (lora_A+lora_B) present in the LoRA file —
+    /// the denominator for coverage reporting, so callers don't need a
+    /// second LoRALoader.load just to count.
+    public let totalLayerCount: Int
 
     /// Name of the applied LoRA
     public let loraName: String
@@ -331,6 +339,7 @@ class MultiLoRAAdapter {
             let count = adapter.applyFused(to: model)
             results.append(LoRAApplicationResult(
                 modifiedLayerCount: count,
+                totalLayerCount: adapter.loraWeights.layers.count,
                 loraName: adapter.loraWeights.info.name,
                 scale: adapter.loraWeights.scale,
                 fused: adapter.fused,
@@ -374,6 +383,7 @@ extension LTXTransformer {
 
         return LoRAApplicationResult(
             modifiedLayerCount: count,
+            totalLayerCount: weights.layers.count,
             loraName: weights.info.name,
             scale: scale,
             fused: true,
@@ -400,10 +410,11 @@ extension Module {
         let weights = try LoRALoader.load(from: loraPath, config: config)
         let adapter = LoRAAdapter(loraWeights: weights, fused: true)
 
-        let originals = adapter.fuseWeights(into: self)
+        let (originals, fusedLayerCount) = adapter.fuseWeights(into: self)
 
         let result = LoRAApplicationResult(
-            modifiedLayerCount: originals.count,
+            modifiedLayerCount: fusedLayerCount,
+            totalLayerCount: weights.layers.count,
             loraName: weights.info.name,
             scale: scale,
             fused: true,

@@ -27,7 +27,7 @@ DerivedData/
 .serena/
 
 # Xcode build output
-.xcodebuild/
+.xcodebuild*/
 
 # Model weights (large files)
 *.safetensors

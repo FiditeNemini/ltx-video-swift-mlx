@@ -50,6 +50,70 @@ struct AudioPreprocessorTests {
         #expect(end == wave.count)
     }
 
+    // Regression for the enrolled-voice case (Fluxforge asks, B2): the voice's
+    // "silences" carry a learned noise floor of -32.5 dB — ABOVE the -35 dB
+    // absolute threshold, so every frame counted as speech and no window was
+    // found. The floor-relative term (noise floor + 10 dB) must recover the window.
+    @Test("detectSpeechWindow finds the window despite a -32.5 dB noise floor")
+    func testDetectSpeechWindowEnrolledVoiceNoiseFloor() {
+        let sr = 16000
+        let leadSamples = sr / 4
+        let speechSamples = sr / 2
+        let trailSamples = sr / 4
+        let noiseFloor: Float = 0.0237  // ≈ -32.5 dBFS RMS (measured on enrolled voice)
+        var wave = [Float](repeating: 0, count: leadSamples + speechSamples + trailSamples)
+        for i in 0..<wave.count {
+            // Deterministic pseudo-noise at the measured floor
+            wave[i] = noiseFloor * 1.414 * sin(2 * .pi * 1731 * Float(i) / Float(sr))
+        }
+        for i in 0..<speechSamples {
+            wave[leadSamples + i] = 0.3 * sin(2 * .pi * 440 * Float(i) / Float(sr))
+        }
+        let (start, end) = AudioPreprocessor.detectSpeechWindow(waveform: wave, sampleRate: sr)
+        #expect(abs(start - leadSamples) <= 160)
+        #expect(abs(end - (leadSamples + speechSamples)) <= 160)
+    }
+
+    // Review finding (PR #36): on tightly-trimmed clips (<10% silence) the
+    // 10th-percentile "floor" lands on quiet SPEECH; a threshold derived from it
+    // must NOT be trusted, or clean recordings regress to the full-clip fallback.
+    // The dynamic-range gate (floor ≥ 15 dB below peak) must fall back to the
+    // absolute threshold and find the same window the old code found.
+    @Test("detectSpeechWindow keeps working on tightly-trimmed clips (<10% silence)")
+    func testDetectSpeechWindowTightlyTrimmedClip() {
+        let sr = 16000
+        let silence = Int(0.2 * Double(sr))      // 0.2 s head + 0.2 s tail
+        let speechSamples = 9 * sr               // 9 s of speech → ~4% silence frames
+        var wave = [Float](repeating: 0, count: silence + speechSamples + silence)
+        // Silence at -45 dBFS (below the -35 absolute threshold), speech with
+        // moderate dynamics (quiet-to-loud < 15 dB) — the percentile "floor" is
+        // quiet speech here.
+        for i in 0..<wave.count {
+            wave[i] = 0.0056 * sin(2 * .pi * 823 * Float(i) / Float(sr))
+        }
+        for i in 0..<speechSamples {
+            let envelope: Float = 0.15 + 0.15 * (1 + sin(2 * .pi * 0.5 * Float(i) / Float(sr))) / 2
+            wave[silence + i] = envelope * sin(2 * .pi * 440 * Float(i) / Float(sr))
+        }
+        let (start, end) = AudioPreprocessor.detectSpeechWindow(waveform: wave, sampleRate: sr)
+        #expect(abs(start - silence) <= 160)
+        #expect(abs(end - (silence + speechSamples)) <= 160)
+    }
+
+    // The absolute floor must keep quiet noise-only clips out of "speech": their
+    // peak − 25 dB lands below -35 dBFS, so no window is promoted (old behavior).
+    @Test("detectSpeechWindow still returns (0, count) for quiet noise-only audio")
+    func testDetectSpeechWindowQuietNoiseOnly() {
+        let sr = 16000
+        var wave = [Float](repeating: 0, count: sr)
+        for i in 0..<wave.count {
+            wave[i] = 0.005 * sin(2 * .pi * 997 * Float(i) / Float(sr))  // ≈ -49 dBFS RMS
+        }
+        let (start, end) = AudioPreprocessor.detectSpeechWindow(waveform: wave, sampleRate: sr)
+        #expect(start == 0)
+        #expect(end == wave.count)
+    }
+
     // MARK: - Time stretching
 
     @Test("timeStretch with rate=1.0 returns input unchanged")
