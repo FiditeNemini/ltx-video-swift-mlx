@@ -71,27 +71,39 @@ struct LipDubLoRAScaleTests {
         #expect(layer.effectiveScale == 1.0)
     }
 
-    /// A non-positive scale is refused before any model work happens.
-    @Test func nonPositiveScaleThrows() async throws {
-        let pipeline = LTXPipeline(model: .distilled)
-        let path = try writeSyntheticLoRA()
-        defer { try? FileManager.default.removeItem(atPath: path) }
+    /// A non-positive scale is refused. Exercised through the validator itself:
+    /// inside `generateLipDub` this check necessarily sits after the
+    /// models-loaded guard, so calling it on an unloaded pipeline would throw
+    /// `modelNotLoaded` and pass without touching this rule at all.
+    @Test func nonPositiveScaleThrows() throws {
+        for bad in [Float(0), -0.5, -1] {
+            #expect(throws: LTXError.self) {
+                _ = try LTXPipeline.validateLipDubLoRAScale(bad)
+            }
+        }
+        // And the thrown error is the configuration one, with the actionable text.
+        do {
+            _ = try LTXPipeline.validateLipDubLoRAScale(0)
+            Issue.record("scale 0 did not throw")
+        } catch let error as LTXError {
+            guard case .invalidConfiguration(let message) = error else {
+                Issue.record("wrong LTXError case: \(error)")
+                return
+            }
+            #expect(message.contains("lipdubLoRAScale must be > 0"))
+        }
+    }
 
-        var config = LTXVideoGenerationConfig()
-        config.width = 704
-        config.height = 512
-        config.numFrames = 121
-
-        await #expect(throws: LTXError.self) {
-            _ = try await pipeline.generateLipDub(
-                prompt: "A person speaking on camera, speaking in French saying: \"bonjour\"",
-                referenceImagePath: path,   // existence-checked before the scale guard
-                lipdubLoraPath: path,
-                lipdubLoRAScale: 0,
-                config: config,
-                upscalerWeightsPath: path,
-                targetAudioPath: path
-            )
+    /// In-range scales are accepted silently; out-of-range ones are accepted but
+    /// warn, because this LoRA carries the conditioning rather than a style.
+    @Test func warnsOnlyOutsideTheSaneRange() throws {
+        for ok in [Float(0.5), 0.8, 1.0, 1.2, 1.5] {
+            #expect(try LTXPipeline.validateLipDubLoRAScale(ok) == nil, "\(ok) should not warn")
+        }
+        for far in [Float(0.1), 0.49, 1.51, 3.0] {
+            let warning = try LTXPipeline.validateLipDubLoRAScale(far)
+            #expect(warning != nil, "\(far) should warn")
+            #expect(warning?.contains("far from the published 1.0") == true)
         }
     }
 }

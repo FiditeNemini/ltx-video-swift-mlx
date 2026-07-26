@@ -233,6 +233,28 @@ public actor LTXPipeline {
     /// must pass this same scale — see `fusedLipDubLoRAPath`.
     public var fusedLipDubLoRAScale: Float? { lipdubFusion?.scale }
 
+    /// Validate a LipDub IC-LoRA scale, returning the warning to print when the
+    /// value is usable but far from the published 1.0 (nil when it is in range).
+    ///
+    /// Static and separate from `generateLipDub` so it can be unit-tested on its
+    /// own: inside the pipeline this check necessarily runs *after* the
+    /// models-loaded guard, which a fast test cannot satisfy — a test calling
+    /// `generateLipDub` on an unloaded pipeline would pass on `modelNotLoaded`
+    /// and prove nothing about this rule.
+    static func validateLipDubLoRAScale(_ scale: Float) throws -> String? {
+        guard scale > 0 else {
+            throw LTXError.invalidConfiguration(
+                "lipdubLoRAScale must be > 0 (got \(scale)); 0 would run the base weights, "
+                + "which have never seen the appended reference tokens.")
+        }
+        guard scale < 0.5 || scale > 1.5 else { return nil }
+        return String(
+            format: "[lipdub] WARNING: LoRA scale %.2f is far from the published 1.0. "
+                + "This IC-LoRA carries the reference-token conditioning itself, not a "
+                + "style — expect degraded lip-sync rather than a softer effect.",
+            scale)
+    }
+
     private static func canonicalLoRAPath(_ path: String) -> String {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
@@ -1968,18 +1990,7 @@ public actor LTXPipeline {
         guard FileManager.default.fileExists(atPath: lipdubLoraPath) else {
             throw LTXError.fileNotFound("LipDub LoRA not found: \(lipdubLoraPath)")
         }
-        guard lipdubLoRAScale > 0 else {
-            throw LTXError.invalidConfiguration(
-                "lipdubLoRAScale must be > 0 (got \(lipdubLoRAScale)); 0 would run the "
-                + "base weights, which have never seen the appended reference tokens.")
-        }
-        if lipdubLoRAScale < 0.5 || lipdubLoRAScale > 1.5 {
-            print(String(
-                format: "[lipdub] WARNING: LoRA scale %.2f is far from the published 1.0. "
-                    + "This IC-LoRA carries the reference-token conditioning itself, not a "
-                    + "style — expect degraded lip-sync rather than a softer effect.",
-                lipdubLoRAScale))
-        }
+        if let warning = try Self.validateLipDubLoRAScale(lipdubLoRAScale) { print(warning) }
         if let targetAudioPath = targetAudioPath {
             guard FileManager.default.fileExists(atPath: targetAudioPath) else {
                 throw LTXError.fileNotFound("Target audio not found: \(targetAudioPath)")
