@@ -203,9 +203,10 @@ public actor LTXPipeline {
     /// Identity of the LipDub IC-LoRA currently fused into `ltx2Transformer`
     /// (nil = pristine weights). Unlike `loraFusedPath`, no original weights are
     /// kept (too large for the 22B transformer): consecutive `generateLipDub`
-    /// runs with the SAME LoRA file reuse the fused transformer as-is; switching
-    /// LoRA — or the file changing under the same path — requires reloading the
-    /// models. Cleared wherever the transformer is unloaded or recreated.
+    /// runs with the SAME LoRA file AND the same scale reuse the fused
+    /// transformer as-is; switching LoRA, changing the scale — or the file
+    /// changing under the same path — requires reloading the models. Cleared
+    /// wherever the transformer is unloaded or recreated.
     private struct LipDubFusionRecord {
         /// Canonical path (symlinks resolved, standardized) so path spelling
         /// differences between segments don't force a needless 22B reload.
@@ -213,6 +214,11 @@ public actor LTXPipeline {
         /// File mtime at fusion time — detects the file being overwritten in
         /// place between segments (same path, different weights).
         let modificationDate: Date?
+        /// Scale the delta was fused at. Part of the identity: the same file
+        /// fused at a different scale is a different set of weights, and the
+        /// fusion is destructive (no originals kept), so it cannot be adjusted
+        /// in place.
+        let scale: Float
     }
     private var lipdubFusion: LipDubFusionRecord? = nil
 
@@ -221,6 +227,33 @@ public actor LTXPipeline {
     /// can decide whether the next LipDub segment can reuse the loaded pipeline
     /// (same LoRA → no reload needed) or must call `loadModels()` again.
     public var fusedLipDubLoRAPath: String? { lipdubFusion?.path }
+
+    /// Scale the currently-fused LipDub IC-LoRA was applied at, or nil when the
+    /// weights are pristine. A host app reusing the pipeline across segments
+    /// must pass this same scale — see `fusedLipDubLoRAPath`.
+    public var fusedLipDubLoRAScale: Float? { lipdubFusion?.scale }
+
+    /// Validate a LipDub IC-LoRA scale, returning the warning to print when the
+    /// value is usable but far from the published 1.0 (nil when it is in range).
+    ///
+    /// Static and separate from `generateLipDub` so it can be unit-tested on its
+    /// own: inside the pipeline this check necessarily runs *after* the
+    /// models-loaded guard, which a fast test cannot satisfy — a test calling
+    /// `generateLipDub` on an unloaded pipeline would pass on `modelNotLoaded`
+    /// and prove nothing about this rule.
+    static func validateLipDubLoRAScale(_ scale: Float) throws -> String? {
+        guard scale > 0 else {
+            throw LTXError.invalidConfiguration(
+                "lipdubLoRAScale must be > 0 (got \(scale)); 0 would run the base weights, "
+                + "which have never seen the appended reference tokens.")
+        }
+        guard scale < 0.5 || scale > 1.5 else { return nil }
+        return String(
+            format: "[lipdub] WARNING: LoRA scale %.2f is far from the published 1.0. "
+                + "This IC-LoRA carries the reference-token conditioning itself, not a "
+                + "style — expect degraded lip-sync rather than a softer effect.",
+            scale)
+    }
 
     private static func canonicalLoRAPath(_ path: String) -> String {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
@@ -1835,19 +1868,29 @@ public actor LTXPipeline {
     ///
     /// ## Consecutive runs (segmentation)
     /// The IC-LoRA is fused destructively (no pristine weights are kept for the 22B
-    /// transformer). Consecutive calls with the **same** `lipdubLoraPath` reuse the
-    /// fused transformer without re-fusing or reloading — provided the transformer
-    /// survives between runs, i.e. `memoryOptimization.unloadAfterUse == false`
-    /// (use ``MemoryOptimizationConfig/disabled``). Switching to a different LoRA,
-    /// or calling `generateVideo`/`generateRetake` while fused, throws until
-    /// `loadModels()` + `loadAudioModels()` restore pristine weights. Check
-    /// ``fusedLipDubLoRAPath`` to know the current state.
+    /// transformer). Consecutive calls with the **same** `lipdubLoraPath` and the
+    /// same `lipdubLoRAScale` reuse the fused transformer without re-fusing or
+    /// reloading — provided the transformer survives between runs, i.e.
+    /// `memoryOptimization.unloadAfterUse == false`
+    /// (use ``MemoryOptimizationConfig/disabled``). Switching to a different LoRA
+    /// or scale, or calling `generateVideo`/`generateRetake` while fused, throws
+    /// until `loadModels()` + `loadAudioModels()` restore pristine weights. Check
+    /// ``fusedLipDubLoRAPath`` / ``fusedLipDubLoRAScale`` to know the current state.
+    ///
+    /// - Parameter lipdubLoRAScale: Multiplier on the IC-LoRA delta
+    ///   (`W' = W + scale · B·A`). **Leave at 1.0 unless experimenting**: this is
+    ///   an in-context LoRA, not a style LoRA — it teaches the transformer how to
+    ///   read the appended reference tokens (audio at negative positions, video
+    ///   reference), so scaling it down weakens the conditioning mechanism itself
+    ///   rather than just softening an effect. Lightricks publishes it for use at
+    ///   1.0. Values outside 0.5…1.5 log a warning; ≤ 0 throws.
     public func generateLipDub(
         prompt: String,
         referenceVideoPath: String? = nil,
         referenceImagePath: String? = nil,
         continuationTailPath: String? = nil,
         lipdubLoraPath: String,
+        lipdubLoRAScale: Float = 1.0,
         config: LTXVideoGenerationConfig,
         upscalerWeightsPath: String,
         targetAudioPath: String? = nil,
@@ -1949,6 +1992,7 @@ public actor LTXPipeline {
         guard FileManager.default.fileExists(atPath: lipdubLoraPath) else {
             throw LTXError.fileNotFound("LipDub LoRA not found: \(lipdubLoraPath)")
         }
+        if let warning = try Self.validateLipDubLoRAScale(lipdubLoRAScale) { print(warning) }
         if let targetAudioPath = targetAudioPath {
             guard FileManager.default.fileExists(atPath: targetAudioPath) else {
                 throw LTXError.fileNotFound("Target audio not found: \(targetAudioPath)")
@@ -2021,7 +2065,17 @@ public actor LTXPipeline {
                     "weights: call loadModels() + loadAudioModels() to re-fuse."
                 )
             }
-            print("[lipdub] LoRA already fused (same file) — reusing fused transformer")
+            // Same file at a different scale is a different set of weights, and the
+            // fusion keeps no originals to rescale from.
+            guard fused.scale == lipdubLoRAScale else {
+                throw LTXError.invalidConfiguration(
+                    "The LipDub LoRA is already fused at scale \(fused.scale), but this " +
+                    "call asks for \(lipdubLoRAScale). The fusion is destructive (no " +
+                    "pristine weights kept for the 22B model), so changing the scale " +
+                    "requires reloading: call loadModels() + loadAudioModels() first."
+                )
+            }
+            print("[lipdub] LoRA already fused (same file, scale \(fused.scale)) — reusing fused transformer")
         } else {
             // A generic LoRA fused via fuseLoRA() would be baked under the IC-LoRA
             // delta, and a later unfuseLoRA() would partially wipe it — refuse the
@@ -2040,14 +2094,15 @@ public actor LTXPipeline {
             // Record the mtime BEFORE fusing so an overwrite racing the fusion is
             // detected as "changed" on the next run rather than missed.
             let fusedMtime = Self.loraModificationDate(canonicalLoRA)
-            let (_, fuseResult) = try ltx2.fuseLoRA(from: lipdubLoraPath, scale: 1.0)
+            let (_, fuseResult) = try ltx2.fuseLoRA(from: lipdubLoraPath, scale: lipdubLoRAScale)
             let coverage = fuseResult.totalLayerCount > 0
                 ? Float(fuseResult.modifiedLayerCount) / Float(fuseResult.totalLayerCount) * 100.0
                 : 0
-            print("[lipdub] LoRA fused: \(fuseResult.modifiedLayerCount) / \(fuseResult.totalLayerCount) layer-pairs (\(String(format: "%.1f", coverage))%) — \(fuseResult.loraName)")
+            print("[lipdub] LoRA fused: \(fuseResult.modifiedLayerCount) / \(fuseResult.totalLayerCount) layer-pairs (\(String(format: "%.1f", coverage))%) at scale \(lipdubLoRAScale) — \(fuseResult.loraName)")
             eval(ltx2.parameters())
             Memory.clearCache()
-            lipdubFusion = LipDubFusionRecord(path: canonicalLoRA, modificationDate: fusedMtime)
+            lipdubFusion = LipDubFusionRecord(
+                path: canonicalLoRA, modificationDate: fusedMtime, scale: lipdubLoRAScale)
         }
 
         // 2. Snap target frame count to 8k+1 based on the reference video.

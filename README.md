@@ -192,7 +192,9 @@ ltx-video lipdub 'Speaking in French saying: "…suite du dialogue."' \
     -w 704 -h 1024 -f 233
 ```
 
-**Consecutive runs (Swift package):** the IC-LoRA is fused destructively into the 22B transformer. Consecutive `generateLipDub` calls with the same LoRA reuse the fused transformer without re-fusing — no model reload per segment — provided the transformer survives between runs (`MemoryOptimizationConfig.disabled`, i.e. `unloadAfterUse: false`). Switching LoRA, or running `generateVideo`/`generateRetake` while fused, throws until `loadModels()` + `loadAudioModels()` restore pristine weights. Check `pipeline.fusedLipDubLoRAPath` for the current state.
+**Consecutive runs (Swift package):** the IC-LoRA is fused destructively into the 22B transformer. Consecutive `generateLipDub` calls with the same LoRA **and the same scale** reuse the fused transformer without re-fusing — no model reload per segment — provided the transformer survives between runs (`MemoryOptimizationConfig.disabled`, i.e. `unloadAfterUse: false`). Switching LoRA or scale, or running `generateVideo`/`generateRetake` while fused, throws until `loadModels()` + `loadAudioModels()` restore pristine weights. Check `pipeline.fusedLipDubLoRAPath` / `fusedLipDubLoRAScale` for the current state.
+
+**LoRA scale (`--lora-scale`, `lipdubLoRAScale:`, default 1.0)** — experimental. The delta is applied as `W' = W + scale · B·A`; the shipped IC-LoRA carries no `alpha` keys, so the value you pass is the whole multiplier. **Leave it at 1.0 unless you are experimenting**: this is an *in-context* LoRA, not a style LoRA — it teaches the transformer how to read the appended reference tokens (audio at negative positions, video reference), so scaling it down weakens the conditioning mechanism itself rather than softening an effect. Lightricks publishes it for use at 1.0. Values outside `0.5...1.5` log a warning; `<= 0` throws.
 
 ### LoRA Training (Beta)
 

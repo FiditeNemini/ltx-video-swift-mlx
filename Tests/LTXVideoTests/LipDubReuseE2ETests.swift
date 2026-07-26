@@ -126,5 +126,19 @@ struct LipDubReuseE2ETests {
                 upscalerWeightsPath: upscalerPath
             )
         }
+
+        // Same LoRA at a different scale must also throw: the fusion keeps no
+        // originals, so the delta cannot be rescaled in place.
+        #expect(await pipeline.fusedLipDubLoRAScale == 1.0)
+        await #expect(throws: LTXError.self) {
+            _ = try await pipeline.generateLipDub(
+                prompt: prompt,
+                referenceVideoPath: refVideo,
+                lipdubLoraPath: loraPath,
+                lipdubLoRAScale: 0.8,
+                config: config,
+                upscalerWeightsPath: upscalerPath
+            )
+        }
     }
 }
