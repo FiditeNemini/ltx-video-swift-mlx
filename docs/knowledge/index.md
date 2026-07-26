@@ -39,12 +39,15 @@ or re-litigated.
 * [Keyframes: append guide tokens, never slot-inject](pitfalls/keyframes-append-not-inject.md) - why slot overwrite is structurally wrong past frame 0
 * [Connector GELU must be tanh-approximate](pitfalls/gelu-approximate-connector.md) - exact GELU surfaced as 94-98% sub-bass audio noise
 * [VAE decoder D2S blocks: residual=false](pitfalls/decoder-d2s-residual-false.md) - the grid-artifact root cause, plus decoder facts worth not re-deriving
+* [LipDub segments cap at ~233 frames](pitfalls/lipdub-segment-bound-233.md) - the negative-position audio reference doubles the RoPE span; 481 is only for generate/retake
+* [The continuation-tail clip must be re-encoded](pitfalls/continuation-tail-clip-encoding.md) - an input seek leaves frame 0 off t=0 and the zero-tolerance extractor refuses it
 
 # Investigations
 
 * [Cross-modal AdaLN sigma swap (May 2026)](investigations/crossmodal-adaln-sigma-swap-2026-05.md) - the LipDub mouth-modulation root cause, two expensively-refuted hypotheses, and the audio-anchored vs pose-anchored trade-off
 * [LipDub segmentation campaign (July 2026)](investigations/lipdub-segmentation-asks-2026-07.md) - what unit tests, the in-process E2E, the code review and real reruns each caught that the others missed
+* [Custom-voice timbre chain (July 2026)](investigations/custom-voice-timbre-chain-2026-07.md) - attributing a bad custom-voice LipDub across Voxtral enrollment and LTX; the decoder was innocent
 
 # Playbooks
 
-* [Diagnosing a lip-sync offset](playbooks/lipsync-offset-diagnosis.md) - the ordered checklist (prompt → channels → windows → fusion) before suspecting the model
+* [Diagnosing a lip-sync offset](playbooks/lipsync-offset-diagnosis.md) - the ordered checklist (transcript → segment length → prompt → channels → windows → fusion → timbre) before suspecting the model

@@ -24,6 +24,13 @@ segment cuts.
 
 # Caveats
 
+- **LipDub does not get this budget.** Its audio reference sits at negative
+  RoPE positions, so the audio stream spans ~2× the segment duration against
+  the same 20 s window: the usable bound is ~233 frames per segment. Measured
+  in July 2026 — see
+  [the segment-bound pitfall](/docs/knowledge/pitfalls/lipdub-segment-bound-233.md).
+  `validate()` keeps 481 (correct for generate/retake); `generateLipDub`
+  warns when the span overruns.
 - Training clips are typically ~10 s: expect some quality softening on very
   long videos even within the bound. A 481f vs 241f same-seed comparison was
   generated for the PR #36 validation — judge visually per use case.

@@ -2172,6 +2172,23 @@ public actor LTXPipeline {
         let refChannels = refWaveform.ndim == 1 ? 1 : refWaveform.dim(0)
         let refSamples = refWaveform.dim(refWaveform.ndim - 1)
         print("[lipdub] reference audio: \(refChannels) ch × \(refSamples) samples (\(String(format: "%.2f", Float(refSamples) / 16000.0))s)")
+        // The audio reference sits at NEGATIVE RoPE positions (see buildAudioReference),
+        // so the audio stream spans [-(refDur + 0.04), targetDur] — roughly TWICE the
+        // segment duration, against the same audioMaxPos window the video side uses.
+        // Measured: a 15.7 s segment lip-syncs with a constant ~0.75 s lag; the same
+        // source at 9.7 s is in sync. 481 frames remains correct for generate/retake —
+        // it is only LipDub that pays the doubled span.
+        let lipdubAudioSpan = Float(refSamples) / 16000.0 + Float(numFrames) / 24.0 + 0.04
+        let lipdubAudioBudget = Float(ltx2.config.audioMaxPos.first ?? 20)
+        if lipdubAudioSpan > lipdubAudioBudget {
+            let maxFrames = Int(((lipdubAudioBudget - 0.04) / 2 * 24 - 1) / 8) * 8 + 1
+            print(String(
+                format: "[lipdub] WARNING: audio reference + target span %.1fs exceeds the "
+                    + "%.0fs RoPE window — expect a growing lip-sync lag. Split the dialogue "
+                    + "into segments of at most %d frames (%.1fs) and chain them with "
+                    + "continuationTailPath.",
+                lipdubAudioSpan, lipdubAudioBudget, maxFrames, Float(maxFrames) / 24.0))
+        }
         let refMel = try audioProcessor.melSpectrogram(refWaveform)
         print("[lipdub] reference mel spectrogram: \(refMel.shape)")
         let refAudioLatent = try audioVAE.encode(refMel)  // (1, 8, T_audio_ref, 16)
@@ -2608,10 +2625,21 @@ public actor LTXPipeline {
     /// still-image anchor, it preserves velocity across the segment cut.
     ///
     /// Contract for callers: only the clip's FIRST 9 pixel frames are read,
-    /// so pass exactly the tail — the last 9 frames of the previous segment
-    /// (e.g. `ffmpeg -sseof -0.4 -i seg.mp4 tail.mp4`). A longer clip anchors
-    /// on the wrong moment. The new segment's first output frame reproduces
-    /// the anchor — drop one frame at concatenation (overlap-and-trim).
+    /// so pass exactly the tail — the last 9 frames of the previous segment.
+    /// A longer clip anchors on the wrong moment. The new segment's first
+    /// output frame reproduces the anchor — drop one frame at concatenation
+    /// (overlap-and-trim).
+    ///
+    /// The clip must be RE-ENCODED with frame 0 exactly at t=0: extraction
+    /// reads it with a zero-tolerance `AVAssetImageGenerator`, which refuses
+    /// (`AVFoundationErrorDomain -11832`) any clip whose first frame carries a
+    /// seek offset or an edit list. An input seek (`ffmpeg -sseof …`) produces
+    /// exactly such a clip, with or without `-c copy`. What works:
+    ///
+    /// ```
+    /// ffmpeg -i seg.mp4 -vf "select='gte(n,N-9)',setpts=N/24/TB" -r 24 \
+    ///        -c:v libx264 -g 1 -crf 12 -pix_fmt yuv420p -an tail.mp4
+    /// ```
     private func encodeContinuationTail(
         path: String,
         width: Int,
