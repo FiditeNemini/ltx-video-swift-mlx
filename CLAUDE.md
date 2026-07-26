@@ -40,7 +40,7 @@ MLX products used: `MLX`, `MLXNN`, `MLXRandom`, `Transformers`
 
 ## Model Constraints
 
-**Frame count**: Must be `8n + 1` (valid: 9, 17, 25, ..., 481). Max 481 = 20 s at 24 fps, the RoPE positional range (`maxPos[0]` = 20 s).
+**Frame count**: Must be `8n + 1` (valid: 9, 17, 25, ..., 481). Max 481 = 20 s at 24 fps, the RoPE positional range (`maxPos[0]` = 20 s). **LipDub is capped lower — ~233 frames per segment**: its audio reference sits at negative RoPE positions, so the audio stream spans twice the segment duration. Chain longer dialogue with `continuationTailPath` (image mode); in video mode, slice the reference video and re-run per slice.
 
 **Resolution**: Must be divisible by 32. Recommended: 512x512, 768x512, 512x768, 832x480, 1024x576
 

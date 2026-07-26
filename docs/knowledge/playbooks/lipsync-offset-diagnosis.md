@@ -6,8 +6,23 @@ tags: [lipdub, diagnosis, lip-sync, playbook]
 timestamp: 2026-07-16T00:00:00Z
 ---
 
-Bad LipDub output has four known causes with distinct signatures. Check in
+Bad LipDub output has six known causes with distinct signatures. Check in
 this order — each step is cheaper than the next.
+
+# 0. Prompt text vs spoken audio (sync measurements are MEANINGLESS)
+
+Before measuring anything: transcribe the reference audio (any STT) and
+compare it with the prompt's dialogue. The generated speech follows the
+**prompt**, so a mismatch guarantees desync and voids every timing number.
+This wasted a day in July 2026. See
+[the prompt pitfall](/docs/knowledge/pitfalls/lipdub-prompt-needs-dialogue.md).
+
+# 0b. Segment length (CONSTANT lag, grows with duration)
+
+Over ~233 frames (9.9 s) the audio reference's negative RoPE positions push
+the span past the 20 s window: measured constant ~0.75 s lag at 377 frames,
+in sync at 233. `generateLipDub` warns. See
+[the segment-bound pitfall](/docs/knowledge/pitfalls/lipdub-segment-bound-233.md).
 
 # 1. Prompt format (wrong mouth SHAPES, sync irrelevant)
 
@@ -57,7 +72,18 @@ delta or a stale file should be impossible since PR #36 (guards throw), but
 if you see burned/saturated output, check
 [the double-delta pitfall](/docs/knowledge/pitfalls/lora-refusion-double-delta.md).
 
-# When all four pass
+# 5. The voice itself sounds wrong (timbre, not timing)
+
+If sync is fine but the voice is unrecognisable, the loss is almost certainly
+upstream of LTX. Measure **F0 vs H2** (energy at the fundamental against the
+second harmonic, median over voiced frames) on the reference *and* on the
+generated audio: a healthy voice sits near 0 dB, and the decoder transmits
+that ratio nearly unchanged. A thin reference in, a thin voice out. Do not
+trust a plain F0 tracker here — with a depleted fundamental it locks onto
+2×F0 and reports a plausible wrong number. Full attribution chain in
+[the custom-voice investigation](/docs/knowledge/investigations/custom-voice-timbre-chain-2026-07.md).
+
+# When all of them pass
 
 The residual is the known audio-anchored vs pose-anchored trade-off — see
 [the AdaLN investigation](/docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md)

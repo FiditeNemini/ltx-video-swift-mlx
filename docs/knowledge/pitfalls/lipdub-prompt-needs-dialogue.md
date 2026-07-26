@@ -20,10 +20,33 @@ the voice. A prompt like *"a man speaking French in a podcast studio"*
 failure, not a theory. Single speaker only; match dialogue length to the
 clip; negative prompt is irrelevant (distilled, no CFG).
 
+# The dialogue must be what the audio actually says
+
+Stronger than "include some dialogue": the text **drives the generated
+speech**. LipDub denoises a video stream and an audio stream jointly; the
+audio it produces follows the prompt's dialogue, and the lips follow that
+generated audio. When the prompt text and the reference audio disagree, the
+model speaks the *prompt* and the result cannot be in sync with the
+reference — no amount of audio conditioning repairs it.
+
+Verified (July 2026), reference audio saying *"FluxForge Studio transforme
+votre Mac en un studio de création IA complet…"* against a prompt carrying a
+different marketing line: the generated audio transcribes back as the
+**prompt text, word for word**, and every timing measurement against the
+reference was meaningless. Re-running with the audio's own transcript
+brought the offsets from 0.5–0.9 s down to 0.2–0.3 s.
+
+Practical consequence for integrators: the caller almost always *has* the
+exact text (it drove the TTS) — pass that, not a paraphrase. When the text is
+unknown (a supplied recording), transcribe it first; a STT pass is cheap next
+to a generation. Any measurement of lip-sync quality is void unless prompt
+and audio agree.
+
 # The defense
 
 - Always format `generateLipDub` / `lipdub` CLI prompts with
-  `speaking in <LANG> saying: "<TEXT>"`.
+  `speaking in <LANG> saying: "<TEXT>"`, where `<TEXT>` is the **verbatim
+  transcript of the target audio**.
 - The VLM prompt-enhancement path can rephrase or drop the wrapper —
   `LTXPipeline` repairs it (`speaking|speaks|saying|says` + `in` detection,
   wrapper re-glued when lost). Keep that repair when touching enhancement.
