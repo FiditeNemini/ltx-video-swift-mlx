@@ -735,6 +735,9 @@ struct LipDub: AsyncParsableCommand {
     @Option(name: .long, help: "Path to LipDub IC-LoRA .safetensors (default: auto-download from HuggingFace)")
     var lora: String?
 
+    @Option(name: .long, help: "LipDub IC-LoRA scale (default: 1.0). Experimental — this LoRA carries the reference-token conditioning itself, not a style, so values away from 1.0 weaken lip-sync rather than soften an effect. Outside 0.5...1.5 warns; must be > 0.")
+    var loraScale: Float = 1.0
+
     @Option(name: .long, help: "Video bitrate in kbps (e.g., 1000 for 1 Mbps). Default: quality-based encoding")
     var bitrate: Int?
 
@@ -880,6 +883,9 @@ struct LipDub: AsyncParsableCommand {
             }
             loraPath = url.path
         }
+        if loraScale != 1.0 {
+            print("LipDub LoRA scale: \(loraScale) (published value is 1.0)")
+        }
 
         // Download upscaler (always needed for two-stage)
         print("Downloading upscaler weights (if needed)...")
@@ -903,6 +909,7 @@ struct LipDub: AsyncParsableCommand {
             referenceImagePath: referenceImage,
             continuationTailPath: continuationTail,
             lipdubLoraPath: loraPath,
+            lipdubLoRAScale: loraScale,
             config: config,
             upscalerWeightsPath: upscalerPath,
             targetAudioPath: targetAudio,

@@ -15,9 +15,13 @@ policy:
   `fuseLoRA()`/`unfuseLoRA()` pair, which keeps them).
 - **Reuse is keyed on `LipDubFusionRecord`**: canonical path (symlinks
   resolved, standardized — different spellings of the same file must not
-  force a reload) **plus the file's mtime at fusion time** (a file
-  overwritten in place must not be silently reused). The mtime is recorded
-  *before* fusing so an overwrite racing the fusion reads as "changed".
+  force a reload), **the file's mtime at fusion time** (a file overwritten
+  in place must not be silently reused), **and the scale the delta was fused
+  at** (since `lipdubLoRAScale` was exposed: the same file at another scale
+  is a different set of weights, and with no originals kept it cannot be
+  rescaled in place — the call throws and asks for a reload). The mtime is
+  recorded *before* fusing so an overwrite racing the fusion reads as
+  "changed".
 - **Everything else throws while fused** rather than corrupting silently —
   see [the double-delta pitfall](/docs/knowledge/pitfalls/lora-refusion-double-delta.md).
 - **Precondition**: the transformer must survive between runs —
