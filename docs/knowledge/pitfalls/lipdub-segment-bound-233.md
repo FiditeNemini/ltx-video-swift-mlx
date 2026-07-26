@@ -37,11 +37,14 @@ The bound: `2 × duration + 0.04 ≤ 20 s` → **9.98 s → 233 frames** in `8n+
 # The defense
 
 - Split dialogue at **233 frames** per LipDub segment (the app-side
-  segmenter, not the framework, owns the split), and chain segments with
-  `continuationTailPath` — see
+  segmenter, not the framework, owns the split). In **image mode**, chain the
+  segments with `continuationTailPath` — see
   [the continuation decision](/docs/knowledge/decisions/lipdub-continuation-anchor.md).
+  In **video mode** that parameter throws by design: slice the reference video
+  the same way and re-run per slice, which is where its continuity comes from.
 - `generateLipDub` prints a WARNING when the computed span exceeds
-  `audioMaxPos`, naming the largest safe frame count.
+  `audioMaxPos`, naming the largest safe frame count and the remedy for the
+  mode it is running in.
 - Cut segments **inside speech pauses**: both sides of the seam then have a
   closed mouth, which hides any residual discontinuity. Verified on a
   3-segment / 19 s chain — seams invisible.

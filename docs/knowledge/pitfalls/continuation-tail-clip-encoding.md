@@ -43,16 +43,34 @@ The codec is not the variable — the input seek is.
 
 # The defense
 
-Re-encode with a frame **filter** (no input seek) and reset the timestamps:
+Re-encode with a frame **filter** (no input seek) and rebase the timestamps:
 
 ```
-ffmpeg -i seg.mp4 -vf "select='gte(n,N-9)',setpts=N/24/TB" -r 24 \
+ffmpeg -i seg.mp4 -vf "select='gte(n,NFRAMES-9)',setpts=PTS-STARTPTS" -r 24 \
        -c:v libx264 -g 1 -crf 12 -pix_fmt yuv420p -an tail.mp4
 ```
 
-where `N` is the segment's frame count. `setpts=N/24/TB` rebuilds timestamps
-from zero; `-g 1` makes every frame a keyframe. The CLI help and the
-`encodeContinuationTail` doc comment carry this recipe.
+Substitute `NFRAMES` with the segment's frame count. `PTS-STARTPTS` rebases
+the first frame to t=0; `-g 1` makes every frame a keyframe. The CLI help and
+the `encodeContinuationTail` doc comment carry this recipe.
+
+**Do not write the placeholder as `N`.** `N` is also ffmpeg's own per-frame
+variable inside `setpts`, so a recipe using it twice (`select='gte(n,N-9)'`
+with `setpts=N/24/TB`) reads as one placeholder and invites a global
+substitution — which breaks, with a symptom that varies by ffmpeg build:
+
+| Substitution | Result |
+|---|---|
+| `setpts=N/24/TB` left as the variable | 9 frames, first PTS 0.000 — correct |
+| both `N` replaced by the frame count | **124 frames** (all stamped alike, then re-timed by `-r 24`), first PTS 0.000 — reads fine but is the wrong clip |
+| (reported on ffmpeg 6.1.1) | 3 frames at PTS 5.0 → `-11832` |
+
+The 124-frame case is the dangerous one: `loadVideoFrames` samples its 9
+frames **uniformly across the clip's whole duration**, so a tail clip longer
+than 9 frames silently anchors on frames spread over the entire segment
+instead of its last 0.375 s. No error, wrong anchor. Hence: exactly 9 frames
+in the clip, and a placeholder that cannot be confused with a filter
+variable.
 
 Framework-side hardening left undone (deliberate): the extractor could accept
 a non-zero tolerance for frame 0, or surface a message naming the clip

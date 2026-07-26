@@ -2182,12 +2182,18 @@ public actor LTXPipeline {
         let lipdubAudioBudget = Float(ltx2.config.audioMaxPos.first ?? 20)
         if lipdubAudioSpan > lipdubAudioBudget {
             let maxFrames = Int(((lipdubAudioBudget - 0.04) / 2 * 24 - 1) / 8) * 8 + 1
+            // The remedy differs by mode: continuationTailPath is image-mode only
+            // (video mode throws on it — continuity there comes from slicing the
+            // source), so naming it unconditionally would send a video-mode caller
+            // straight into that throw.
+            let remedy = isImageMode
+                ? "chain them with continuationTailPath"
+                : "slice the reference video the same way and re-run per slice"
             print(String(
                 format: "[lipdub] WARNING: audio reference + target span %.1fs exceeds the "
                     + "%.0fs RoPE window — expect a growing lip-sync lag. Split the dialogue "
-                    + "into segments of at most %d frames (%.1fs) and chain them with "
-                    + "continuationTailPath.",
-                lipdubAudioSpan, lipdubAudioBudget, maxFrames, Float(maxFrames) / 24.0))
+                    + "into segments of at most %d frames (%.1fs) and %@.",
+                lipdubAudioSpan, lipdubAudioBudget, maxFrames, Float(maxFrames) / 24.0, remedy))
         }
         let refMel = try audioProcessor.melSpectrogram(refWaveform)
         print("[lipdub] reference mel spectrogram: \(refMel.shape)")
@@ -2637,9 +2643,13 @@ public actor LTXPipeline {
     /// exactly such a clip, with or without `-c copy`. What works:
     ///
     /// ```
-    /// ffmpeg -i seg.mp4 -vf "select='gte(n,N-9)',setpts=N/24/TB" -r 24 \
+    /// ffmpeg -i seg.mp4 -vf "select='gte(n,NFRAMES-9)',setpts=PTS-STARTPTS" -r 24 \
     ///        -c:v libx264 -g 1 -crf 12 -pix_fmt yuv420p -an tail.mp4
     /// ```
+    ///
+    /// Substitute `NFRAMES` with the segment's frame count. `PTS-STARTPTS`
+    /// rebases the first frame to t=0 without introducing a placeholder that
+    /// could be confused with ffmpeg's own per-frame `N` variable.
     private func encodeContinuationTail(
         path: String,
         width: Int,
