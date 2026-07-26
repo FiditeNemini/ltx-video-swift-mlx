@@ -12,6 +12,12 @@
   — the LTX audio decoder cleared by three measurements, the real losses being
   upstream in Voxtral enrollment (mlx-voxtral-swift#44).
 
+* **Creation**: [The LipDub audio contract](/docs/knowledge/pitfalls/lipdub-audio-contract.md)
+  — one place for what an integrator must respect on the audio side (ship the
+  generated track, verbatim transcript, ≤233-frame segments, reference quality,
+  why post-hoc normalisation does not repair one, and F0-vs-H2 as the timbre
+  metric), each rule carrying the measurement that established it.
+
 * **Update**: [The prompt pitfall](/docs/knowledge/pitfalls/lipdub-prompt-needs-dialogue.md)
   now states the stronger rule — the dialogue must be the *verbatim
   transcript* of the target audio, because the generated speech follows the

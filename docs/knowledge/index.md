@@ -39,6 +39,7 @@ or re-litigated.
 * [Keyframes: append guide tokens, never slot-inject](pitfalls/keyframes-append-not-inject.md) - why slot overwrite is structurally wrong past frame 0
 * [Connector GELU must be tanh-approximate](pitfalls/gelu-approximate-connector.md) - exact GELU surfaced as 94-98% sub-bass audio noise
 * [VAE decoder D2S blocks: residual=false](pitfalls/decoder-d2s-residual-false.md) - the grid-artifact root cause, plus decoder facts worth not re-deriving
+* [The LipDub audio contract](pitfalls/lipdub-audio-contract.md) - ship the generated track, feed a clean reference; six rules with the measurements behind them
 * [LipDub segments cap at ~233 frames](pitfalls/lipdub-segment-bound-233.md) - the negative-position audio reference doubles the RoPE span; 481 is only for generate/retake
 * [The continuation-tail clip must be re-encoded](pitfalls/continuation-tail-clip-encoding.md) - an input seek leaves frame 0 off t=0 and the zero-tolerance extractor refuses it
 
