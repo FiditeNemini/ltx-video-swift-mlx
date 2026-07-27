@@ -67,6 +67,28 @@ gate, divergence guard); follow-ups tracked in issue #45.
 After the fix, a voice enrolled from a clean mic recording carried its pitch
 exactly (87.9 Hz source → 87.9 Hz synthesis) at preset-comparable level.
 
+# Closed out by the Voxtral team (26 July)
+
+Three findings that settle the loose ends, two of which correct what this
+investigation had assumed:
+
+- **q6 is the right variant for cloned voices**, not bf16: 99.4 % vs 96.5 %
+  coverage, RTF 1.47 vs 3.44, 3.5 GB vs 8 GB. A dropped word observed once
+  during this campaign was generation variance; recommending bf16 from that
+  single sample was wrong and has been withdrawn upstream.
+- **The exact digital zeros come from the codec**, not from the enrollment
+  gate, and vary **3.4 %–10.5 % between generations of the same voice**. They
+  are therefore not a per-embedding property and no consumer may assume a
+  natural floor. Ours does not — see rule 7 of
+  [the audio contract](/docs/knowledge/pitfalls/lipdub-audio-contract.md).
+- **The residual ~5 dB of fundamental is inherent**: the enrolled codes are
+  faithful, generation is where it is lost. No upstream fix is pending, and a
+  synthesis a few dB under its own reference is expected.
+
+The lesson on our side is the first one: an n=1 observation was written into a
+recommendation on someone else's tracker, and it pointed the wrong way. Sample
+size belongs in the finding, or the finding does not get filed.
+
 # Method notes worth keeping
 
 - **F0 vs H2** (energy at the fundamental against the second harmonic,
