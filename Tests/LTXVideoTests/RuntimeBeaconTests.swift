@@ -20,9 +20,15 @@ struct RuntimeBeaconTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         RuntimeBeacon.directoryOverride = dir
         RuntimeBeacon.isEnabled = enabled
+        // The env var force-enables the beacon, so a developer (or CI) with
+        // LTX_RUNTIME_BEACON=1 exported would fail the disabled-by-default
+        // assertion. Neutralize it for the duration and put it back after.
+        let exportedBeaconEnv = getenv("LTX_RUNTIME_BEACON").map { String(cString: $0) }
+        unsetenv("LTX_RUNTIME_BEACON")
         defer {
             RuntimeBeacon.isEnabled = false
             RuntimeBeacon.directoryOverride = nil
+            if let exportedBeaconEnv { setenv("LTX_RUNTIME_BEACON", exportedBeaconEnv, 1) }
             try? FileManager.default.removeItem(at: dir)
         }
         return try body(dir)
@@ -106,6 +112,55 @@ struct RuntimeBeaconTests {
             #expect(!names.contains("99999997-deadbeef.json"))
             #expect(names.contains("1-cafebabe.json"))
             #expect(names.count == 2)  // live foreign + our session
+        }
+    }
+
+    /// `update()` racing `end()` must never leave a manifest behind. Before the
+    /// I/O moved inside the state lock, an update that had passed the `!ended`
+    /// check could be preempted by `end()` and then re-create the file it had
+    /// just deleted — a phantom nothing could remove afterwards (`end()` is
+    /// idempotent, and stale-GC skips own-pid files), so a monitor showed
+    /// activity for the rest of the process.
+    @Test("update() racing end() never resurrects the manifest")
+    func concurrentUpdateAndEndLeaveNoManifest() throws {
+        for attempt in 0 ..< 40 {
+            try withSandbox { dir in
+                let session = try #require(RuntimeBeacon.begin(task: "generate", model: "distilled"))
+
+                // Hammer update() from several threads while end() lands in the
+                // middle; the interleaving that used to resurrect the file is
+                // timing-dependent, hence the repeats.
+                DispatchQueue.concurrentPerform(iterations: 8) { i in
+                    if i == 4 {
+                        session.end()
+                    } else {
+                        session.update(phase: "denoising", step: i, totalSteps: 8)
+                    }
+                }
+                // Late updates after end() must also stay no-ops.
+                session.update(phase: "denoising", step: 99, totalSteps: 8)
+                session.end()
+
+                #expect(manifestFiles(in: dir).isEmpty,
+                        "manifest survived end() on attempt \(attempt)")
+            }
+        }
+    }
+
+    /// Sequential updates keep the last write on disk (the lock also orders the
+    /// atomic writes, which racing writers outside it could commit in reverse).
+    @Test("the last update is what remains on disk")
+    func lastUpdateWins() throws {
+        try withSandbox { dir in
+            let session = try #require(RuntimeBeacon.begin(task: "generate", model: "distilled"))
+            defer { session.end() }
+
+            for step in 1 ... 5 { session.update(phase: "denoising", step: step, totalSteps: 5) }
+
+            let file = try #require(manifestFiles(in: dir).first)
+            let json = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any]
+            #expect(json?["step"] as? Int == 5)
+            #expect(json?["phase"] as? String == "denoising")
         }
     }
 }
