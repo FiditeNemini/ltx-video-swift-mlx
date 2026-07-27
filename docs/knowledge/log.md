@@ -1,5 +1,22 @@
 # Directory Update Log
 
+## 2026-07-27
+
+* **Update**: Voxtral closed out the custom-voice loose ends, and two of their
+  findings correct ours. **q6 beats bf16 on cloned voices** (99.4 % vs 96.5 %
+  coverage, RTF 1.47 vs 3.44, 3.5 GB vs 8) — the opposite of what a single
+  observation of ours had suggested, withdrawn upstream; the **exact digital
+  zeros come from the codec** and vary 3.4 %–10.5 % *between generations*, so
+  they are not an enrollment artefact and no consumer may assume a natural
+  floor; and the **residual ~5 dB of fundamental is inherent** to generation,
+  with no fix pending. Recorded as rules 7 and 8 of
+  [the audio contract](/docs/knowledge/pitfalls/lipdub-audio-contract.md)
+  (rule 7 also pins why `detectSpeechWindow`'s credibility guard must survive
+  any rewrite) and in the
+  [investigation](/docs/knowledge/investigations/custom-voice-timbre-chain-2026-07.md),
+  which now carries the process lesson: an n=1 result was filed as a
+  recommendation on another team's tracker and pointed the wrong way.
+
 ## 2026-07-26
 
 * **Creation**: Custom-voice LipDub attribution campaign (23–26 July).

@@ -58,6 +58,13 @@ noise floor** (not digital zeros), and fluent delivery. Note the direction of
 that last one — a hard-gated reference is *worse* than a slightly noisy one,
 because exact zeros are out of distribution.
 
+Caveat on that last point, from the Voxtral side (July 2026): a TTS reference
+may carry exact zeros that came from **the codec, not from a gate**, and their
+proportion varies **3.4 %–10.5 % between generations of the same voice**. So
+"the reference has digital zeros" is not by itself evidence of a gating bug
+upstream, and nothing downstream may assume a natural floor is present. Our
+own silence detection already survives this — see rule 7.
+
 # 5. Normalising the level afterwards does not fix a bad reference
 
 Tempting shortcut, measured and rejected: taking a −38 dB reference and
@@ -75,10 +82,38 @@ misleading here — with a depleted fundamental both autocorrelation and HPS
 lock onto 2×F0 and report a plausible wrong number (199 Hz for an 88 Hz
 voice, in the measured case).
 
+Do not chase the last few dB. Between a clean mic recording and its cloned
+synthesis, ~5 dB of fundamental is lost **inherently**: the enrolled codes are
+faithful, the loss happens in generation (established by the Voxtral team,
+July 2026). A synthesis landing a few dB under its own reference is normal and
+not a defect to escalate.
+
+# 7. Do not assume a natural noise floor is present
+
+Related to rule 4, but it constrains *us*, not the caller: a TTS reference can
+contain exact digital zeros produced by the codec, in a proportion that varies
+**3.4 %–10.5 % between generations**. Any analysis that estimates a floor must
+therefore treat "no floor at all" as a normal input.
+
+`AudioPreprocessor.detectSpeechWindow` already does: the 10th-percentile frame
+RMS is only trusted when it is non-zero **and** at least 15 dB below the
+loudest frame; otherwise the absolute −35 dBFS threshold takes over. A
+generation full of zeros degrades to that fallback instead of producing a
+nonsense window. Keep that guard if the detector is ever rewritten.
+
+# 8. Quantization of the upstream TTS is not a LipDub concern
+
+For the record, because the opposite was briefly (and wrongly) recommended
+from a single observation: on cloned voices Voxtral **q6 beats bf16** —
+99.4 % vs 96.5 % coverage, RTF 1.47 vs 3.44, 3.5 GB vs 8 GB. A dropped word in
+one q6 synthesis is generation variance, not a quantization effect. Nothing in
+the LipDub path cares which variant produced the reference; judge a reference
+by rules 4 and 6, never by its provenance.
+
 # What the framework does NOT do
 
 No external binary is invoked anywhere in generation or export: frames go out
 through `AVAssetWriter`, audio through a hand-built WAV writer and
-`AVAssetWriter`, and the two are muxed by `AVMutableComposition`. Any ffmpeg
-in a LipDub workflow is caller-side preparation (segmenting a dialogue,
-building a tail clip) and can be replaced by AVFoundation on Apple platforms.
+`AVAssetWriter`, and the two are muxed by `AVMutableComposition`. Since the
+continuation anchor reads its tail natively, a LipDub workflow needs no
+external tool at all.
