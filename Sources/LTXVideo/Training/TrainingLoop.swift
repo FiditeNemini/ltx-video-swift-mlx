@@ -456,12 +456,18 @@ public class LoRATrainer {
                         state: &trainingState, isPause: true
                     )
                     ctrl.notifyObservers { $0.trainingPaused(atStep: step) }
+                    // Tell monitors the GPU is idle: waitWhilePaused blocks for
+                    // an unbounded time, and without this the manifest keeps
+                    // advertising an active training phase with a fresh
+                    // updatedAt while nothing is running.
+                    beacon?.update(phase: "paused", step: step, totalSteps: config.maxSteps)
                     // Block until resumed or stopped
                     if !ctrl.waitWhilePaused() {
                         wasStopped = true
                         break
                     }
                     print("  Resumed at step \(step)")
+                    beacon?.update(phase: "training", step: step, totalSteps: config.maxSteps)
                     ctrl.notifyObservers { $0.trainingResumed(atStep: step) }
                 }
             }
