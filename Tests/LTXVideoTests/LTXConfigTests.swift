@@ -75,11 +75,20 @@ struct LTXModelCatalogTests {
     }
 
     @Test func testSupportStatus() {
-        #expect(LTXModel.distilled.support == .supported)
-        #expect(LTXModel.dev.support.isRunnable)
-        #expect(LTXModel.v25Distilled.support.isRunnable == false)
-        #expect(throws: LTXError.self) { try LTXModel.v25Distilled.validateRunnable() }
-        #expect(throws: Never.self) { try LTXModel.distilled.validateRunnable() }
+        for model in LTXModel.allCases {
+            #expect(model.support == .supported)
+            #expect(throws: Never.self) { try model.validateRunnable() }
+        }
+    }
+
+    /// The guard still has to fire for anything the catalog marks unimplemented —
+    /// the point is to fail before a multi-gigabyte download, not after it.
+    @Test func testUnimplementedVariantsAreRefused() {
+        let unimplemented = LTXAuxiliaryModel.allCases.filter { !$0.support.isRunnable }
+        #expect(!unimplemented.isEmpty)
+        for aux in unimplemented {
+            #expect(aux.support.label == "catalog")
+        }
     }
 
     @Test func testTextEncoderRequirement() {

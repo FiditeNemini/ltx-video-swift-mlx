@@ -377,6 +377,53 @@ public actor ModelDownloader {
         return destination
     }
 
+    // MARK: - Checkpoint resolution
+
+    /// Download whatever files `model` needs and return their locations.
+    ///
+    /// Unified checkpoints (LTX-2.3) resolve to a single file referenced three
+    /// times; split checkpoints (LTX-2.5) pull the transformer, the conv video VAE
+    /// and the text-encoder bundle separately. The diffusion video decoder and the
+    /// duration head are deliberately not fetched: neither is implemented, and
+    /// together they would add gigabytes a caller cannot use.
+    public func downloadCheckpoint(
+        model: LTXModel,
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> LTXCheckpointPaths {
+        let unified = try await downloadUnifiedWeights(model: model, progress: progress)
+
+        switch model.weightsLayout {
+        case .unified:
+            return LTXCheckpointPaths(transformer: unified, videoVAE: unified)
+
+        case .split:
+            let localDir = componentCacheDir(model: model)
+            var resolved: [LTXComponentFile.Kind: URL] = [:]
+            let wanted: [LTXComponentFile.Kind] = [.videoVAE, .textEncoder]
+            let files = model.family.sharedComponentFiles.filter { wanted.contains($0.kind) }
+
+            for (index, file) in files.enumerated() {
+                let destination = localDir.appendingPathComponent(file.filename)
+                if !FileManager.default.fileExists(atPath: destination.path) {
+                    progress?(DownloadProgress(
+                        progress: Double(index) / Double(files.count),
+                        currentFile: file.filename,
+                        message: "Downloading \(file.filename) (~\(String(format: "%.1f", file.sizeGB)) GB)..."))
+                    try await downloadFile(
+                        repoId: model.huggingFaceRepo, filename: file.path, to: destination)
+                }
+                resolved[file.kind] = destination
+            }
+
+            guard let videoVAE = resolved[.videoVAE], let textEncoder = resolved[.textEncoder] else {
+                throw LTXError.downloadFailed("Incomplete split checkpoint for \(model.displayName)")
+            }
+            progress?(DownloadProgress(progress: 1.0, message: "Checkpoint ready"))
+            return LTXCheckpointPaths(
+                transformer: unified, videoVAE: videoVAE, textEncoder: textEncoder)
+        }
+    }
+
     // MARK: - VLM Gemma (Shared 4-bit Model)
 
     /// HuggingFace repo for the shared VLM Gemma model (4-bit QAT, ~7.5GB)

@@ -126,6 +126,9 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "Path to local LTX unified weights file")
     var ltxWeights: String?
 
+    @Option(name: .long, help: "Model variant: distilled, dev, 2.5-distilled, 2.5-dev (default: distilled)")
+    var model: String = "distilled"
+
     mutating func run() async throws {
         // Configure custom models directory if specified
         if let dir = modelsDir {
@@ -220,14 +223,17 @@ struct Generate: AsyncParsableCommand {
             guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
                 throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
             }
-            quantConfig = LTXQuantizationConfig(transformer: quantOption)
+            // The 2.5 text encoder ships in bf16 only (~24 GB), so it follows the
+            // transformer's level rather than staying at full precision.
+            quantConfig = LTXQuantizationConfig(transformer: quantOption, textEncoder: quantOption)
         }
 
-        // Create pipeline (always distilled)
+        let modelVariant = try parseModelVariant(model)
+
         print("Creating pipeline...")
         fflush(stdout)
         let pipeline = LTXPipeline(
-            model: .distilled,
+            model: modelVariant,
             quantization: quantConfig,
             hfToken: hfToken
         )

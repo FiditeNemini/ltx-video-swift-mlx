@@ -453,15 +453,14 @@ extension LTXModel {
     public var textEncoder: LTXTextEncoderRequirement { family.textEncoder }
 
     /// Whether the pipeline can run this checkpoint today.
+    ///
+    /// For LTX-2.5 this covers text- and image-to-video. Audio generation and the
+    /// Dub-It IC-LoRA have not been exercised against a 2.5 checkpoint, and the
+    /// diffusion video decoder, the duration head and the temporal upscaler are
+    /// not implemented at all — the conv decoder ships alongside the DiffVAE and
+    /// is what this package loads.
     public var support: LTXModelSupport {
-        switch self {
-        case .distilled, .dev:
-            return .supported
-        case .v25Distilled, .v25Dev:
-            return .notImplemented(
-                "LTX-2.5 uses a Gemma 4 12B text encoder (gemma4-12b-ltx-v1) that this package "
-                + "does not implement yet")
-        }
+        .supported
     }
 
     /// Every file that must be downloaded to run this checkpoint, excluding the

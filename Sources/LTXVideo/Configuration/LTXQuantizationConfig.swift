@@ -101,9 +101,11 @@ public enum TransformerQuantization: String, CaseIterable, Sendable {
 
 /// Quantization configuration for the LTX-2 pipeline.
 ///
-/// Controls on-the-fly quantization of the transformer model.
-/// The text encoder (Gemma 3 12B) is always loaded with its pre-quantized
-/// weights (4-bit from mlx-community) — no separate quantization option needed.
+/// Controls on-the-fly quantization of the transformer and, for LTX-2.5, of the
+/// text encoder. LTX-2.3's Gemma 3 encoder is downloaded already quantized
+/// (4-bit QAT from mlx-community) and ignores `textEncoder`; LTX-2.5's Gemma 4
+/// derivative is published in bf16 only, so quantizing it is the only way to
+/// shrink its ~24 GB footprint.
 ///
 /// ## Usage
 /// ```swift
@@ -197,12 +199,22 @@ public struct LTXQuantizationConfig: Sendable {
     /// Mixed precision: per-block quantization (overrides `transformer` when set)
     public var mixedPrecision: MixedPrecisionConfig?
 
+    /// Text-encoder quantization, applied on the fly after loading.
+    ///
+    /// Only meaningful for LTX-2.5: its Gemma 4 encoder is a checkpoint-specific
+    /// derivative published in bf16 only (~24 GB resident), so quantizing is the
+    /// sole way to shrink it. LTX-2.3 ignores this — its Gemma 3 encoder is
+    /// downloaded already quantized (4-bit QAT).
+    public var textEncoder: TransformerQuantization
+
     public init(
         transformer: TransformerQuantization = .bf16,
-        mixedPrecision: MixedPrecisionConfig? = nil
+        mixedPrecision: MixedPrecisionConfig? = nil,
+        textEncoder: TransformerQuantization = .bf16
     ) {
         self.transformer = transformer
         self.mixedPrecision = mixedPrecision
+        self.textEncoder = textEncoder
     }
 
     // MARK: - Presets
@@ -211,10 +223,12 @@ public struct LTXQuantizationConfig: Sendable {
     public static let `default` = LTXQuantizationConfig(transformer: .bf16)
 
     /// Memory-efficient: 8-bit transformer (~50% memory reduction)
-    public static let memoryEfficient = LTXQuantizationConfig(transformer: .qint8)
+    public static let memoryEfficient = LTXQuantizationConfig(
+        transformer: .qint8, textEncoder: .qint8)
 
     /// Minimal memory: 4-bit transformer (~75% memory reduction)
-    public static let minimal = LTXQuantizationConfig(transformer: .int4)
+    public static let minimal = LTXQuantizationConfig(
+        transformer: .int4, textEncoder: .int4)
 
     /// Mixed precision: first/last blocks qint8, middle blocks int4 (~60% reduction)
     public static let mixedDefault = LTXQuantizationConfig(
@@ -224,6 +238,7 @@ public struct LTXQuantizationConfig: Sendable {
 
 extension LTXQuantizationConfig: CustomStringConvertible {
     public var description: String {
-        "LTXQuantizationConfig(transformer: \(transformer.displayName))"
+        "LTXQuantizationConfig(transformer: \(transformer.displayName), "
+            + "textEncoder: \(textEncoder.displayName))"
     }
 }

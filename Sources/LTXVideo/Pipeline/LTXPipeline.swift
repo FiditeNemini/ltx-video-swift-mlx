@@ -154,11 +154,10 @@ public actor LTXPipeline {
     /// Flow-matching scheduler
     private let scheduler: LTXScheduler
 
-    /// Gemma 3 language model for text encoding
-    private var gemmaModel: Gemma3TextModel?
-
-    /// Tokenizer for Gemma
-    private var tokenizer: Tokenizers.Tokenizer?
+    /// Prompt encoder: Gemma 3 for LTX-2.3, Gemma 4 for LTX-2.5. Both produce the
+    /// 49 hidden states the feature extractor consumes, so every downstream stage
+    /// is generation-agnostic.
+    private var gemmaEncoder: (any LTXGemmaEncoding)?
 
     /// Text encoder (feature extractor + connector)
     private var textEncoder: VideoGemmaTextEncoderModel?
@@ -281,8 +280,7 @@ public actor LTXPipeline {
     /// re-encode text without reloading models.
     private func unloadGemmaIfConfigured() {
         guard memoryOptimization.unloadAfterUse else { return }
-        gemmaModel = nil
-        tokenizer = nil
+        gemmaEncoder = nil
         Memory.clearCache()
     }
 
@@ -293,7 +291,7 @@ public actor LTXPipeline {
 
     /// Whether Gemma model is available for text encoding
     public var isGemmaLoaded: Bool {
-        gemmaModel != nil && tokenizer != nil
+        gemmaEncoder != nil
     }
 
     // MARK: - Initialization
@@ -323,6 +321,82 @@ public actor LTXPipeline {
     /// Resolution order is: explicit caller override, cached path for the model
     /// if it still exists, then downloader/cache lookup. Explicit overrides are
     /// cached as-is so later lazy component loads use the same caller-supplied file.
+    /// Resolve every file the current model needs, downloading what is missing.
+    ///
+    /// `overrideTransformerPath` names the transformer file (the whole checkpoint
+    /// for unified layouts); the other components still resolve through the cache.
+    private func resolveCheckpoint(
+        overrideTransformerPath: String? = nil,
+        progressCallback: DownloadProgressCallback? = nil
+    ) async throws -> LTXCheckpointPaths {
+        try model.validateRunnable()
+
+        switch model.weightsLayout {
+        case .unified:
+            let path = try await resolveUnifiedWeightsPath(
+                for: model, overridePath: overrideTransformerPath,
+                progressCallback: progressCallback)
+            let url = URL(fileURLWithPath: path)
+            return LTXCheckpointPaths(transformer: url, videoVAE: url)
+
+        case .split:
+            var paths = try await downloader.downloadCheckpoint(model: model) { progress in
+                progressCallback?(progress)
+            }
+            if let overrideTransformerPath {
+                paths = LTXCheckpointPaths(
+                    transformer: URL(fileURLWithPath: overrideTransformerPath),
+                    videoVAE: paths.videoVAE,
+                    textEncoder: paths.textEncoder)
+            }
+            unifiedWeightsPathCache.store(paths.transformer.path, for: model)
+            return paths
+        }
+    }
+
+    /// Build the prompt encoder this checkpoint was trained with.
+    private func loadGemmaEncoder(
+        checkpoint: LTXCheckpointPaths,
+        source: LTXCheckpointSource,
+        gemmaModelPath: String?,
+        tokenizerPath: String?,
+        progressCallback: DownloadProgressCallback?
+    ) async throws -> any LTXGemmaEncoding {
+        switch model.textEncoder {
+        case .gemma4_12bLTX:
+            guard let textEncoderPath = checkpoint.textEncoder else {
+                throw LTXError.modelNotLoaded(
+                    "\(model.displayName) needs its bundled Gemma 4 encoder, which was not resolved")
+            }
+            LTXDebug.log("Loading Gemma 4 encoder from \(textEncoderPath.lastPathComponent)...")
+            return try await Gemma4TextEncoder.load(
+                fileURL: textEncoderPath,
+                tokenizerCacheDirectory: LTXModelRegistry.modelsDirectory
+                    .appendingPathComponent("ltx25-gemma4-tokenizer", isDirectory: true),
+                transformerMetadata: try source.transformerMetadata(),
+                quantization: quantization.textEncoder)
+
+        case .gemma3_12b:
+            let gemmaURL: URL
+            let tokenizerURL: URL
+            if let gemmaModelPath {
+                gemmaURL = URL(fileURLWithPath: gemmaModelPath)
+                tokenizerURL = tokenizerPath.map { URL(fileURLWithPath: $0) } ?? gemmaURL
+            } else {
+                LTXDebug.log("Downloading Gemma text encoder for \(model.displayName) (if needed)...")
+                let paths = try await downloader.downloadGemma(model: model) { progress in
+                    progressCallback?(progress)
+                }
+                gemmaURL = paths.modelDir
+                tokenizerURL = paths.tokenizerDir
+            }
+            LTXDebug.log("Loading Gemma3 model from \(gemmaURL.path)...")
+            return Gemma3Encoder(
+                model: try Gemma3WeightLoader.loadModel(from: gemmaURL),
+                tokenizer: try await AutoTokenizer.from(modelFolder: tokenizerURL))
+        }
+    }
+
     private func resolveUnifiedWeightsPath(
         for model: LTXModel,
         overridePath: String? = nil,
@@ -375,58 +449,32 @@ public actor LTXPipeline {
         defer { beacon?.end() }
         var stepStart = Date()
 
-        // Step 1: Load Gemma model and tokenizer
-        progressCallback?(DownloadProgress(progress: 0.1, message: "Loading Gemma model..."))
+        // Step 1: Resolve the checkpoint's files (one for 2.3, several for 2.5)
+        progressCallback?(DownloadProgress(progress: 0.1, message: "Resolving checkpoint..."))
+        let checkpoint = try await resolveCheckpoint(
+            overrideTransformerPath: ltxWeightsPath, progressCallback: progressCallback)
+        let source = LTXCheckpointSource(model: model, paths: checkpoint)
 
-        let gemmaURL: URL
-        let tokenizerURL: URL
-        if let gemmaPath = gemmaModelPath {
-            gemmaURL = URL(fileURLWithPath: gemmaPath)
-            tokenizerURL = tokenizerPath.map { URL(fileURLWithPath: $0) } ?? gemmaURL
-        } else {
-            LTXDebug.log("Downloading Gemma text encoder for \(model.displayName) (if needed)...")
-            let paths = try await downloader.downloadGemma(model: model) { progress in
-                progressCallback?(progress)
-            }
-            gemmaURL = paths.modelDir
-            tokenizerURL = paths.tokenizerDir
-        }
-        LTXDebug.log("[TIME] Gemma download check: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
-
+        // Step 2: Load the prompt encoder — Gemma 4 ships inside 2.5 checkpoints,
+        // Gemma 3 is an external download for 2.3.
+        progressCallback?(DownloadProgress(progress: 0.2, message: "Loading text encoder..."))
         stepStart = Date()
-        LTXDebug.log("Loading Gemma3 model from \(gemmaURL.path)...")
-        gemmaModel = try Gemma3WeightLoader.loadModel(from: gemmaURL)
-        LTXDebug.log("[TIME] Gemma load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s — \(gemmaModel!.config.hiddenLayers) layers")
+        gemmaEncoder = try await loadGemmaEncoder(
+            checkpoint: checkpoint,
+            source: source,
+            gemmaModelPath: gemmaModelPath,
+            tokenizerPath: tokenizerPath,
+            progressCallback: progressCallback)
+        LTXDebug.log("[TIME] Text encoder load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
+        // Step 3: Load LTX component weights
+        progressCallback?(DownloadProgress(progress: 0.3, message: "Loading \(model.family.displayName) weights..."))
         stepStart = Date()
-        progressCallback?(DownloadProgress(progress: 0.2, message: "Loading tokenizer..."))
-        LTXDebug.log("Loading tokenizer from \(tokenizerURL.path)...")
-        tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
-        LTXDebug.log("[TIME] Tokenizer load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
-
-        // Step 2: Download/load LTX component weights
-        progressCallback?(DownloadProgress(progress: 0.3, message: "Loading LTX-2.3 weights..."))
-
-        let transformerWeights: [String: MLXArray]
-        let vaeWeights: [String: MLXArray]
-        let connectorWeights: [String: MLXArray]
-
-        stepStart = Date()
-        if ltxWeightsPath == nil {
-            progressCallback?(DownloadProgress(progress: 0.35, message: "Downloading unified weights..."))
-        }
-        let unifiedPath = try await resolveUnifiedWeightsPath(
-            for: model,
-            overridePath: ltxWeightsPath,
-            progressCallback: progressCallback
-        )
-
-        LTXDebug.log("Splitting unified weights from \(unifiedPath)...")
-        let split = try LTXWeightLoader.splitUnifiedWeightsFile(path: unifiedPath)
-        transformerWeights = split.transformer
-        vaeWeights = split.vae
-        connectorWeights = split.connector
-        LTXDebug.log("[TIME] Download + split unified weights: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
+        let split = try source.loadComponents()
+        let transformerWeights = split.transformer
+        let vaeWeights = split.vae
+        let connectorWeights = split.connector
+        LTXDebug.log("[TIME] Load checkpoint components: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
         // Step 3: Create and load transformer
         progressCallback?(DownloadProgress(progress: 0.5, message: "Loading transformer..."))
@@ -523,12 +571,14 @@ public actor LTXPipeline {
 
         stepStart = Date()
         LTXDebug.log("Loading Gemma3 model from \(gemmaURL.path)...")
-        gemmaModel = try Gemma3WeightLoader.loadModel(from: gemmaURL)
+        let gemma3Model = try Gemma3WeightLoader.loadModel(from: gemmaURL)
         LTXDebug.log("[TIME] Gemma load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
         stepStart = Date()
         progressCallback?(DownloadProgress(progress: 0.5, message: "Loading tokenizer..."))
-        tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
+        gemmaEncoder = Gemma3Encoder(
+            model: gemma3Model,
+            tokenizer: try await AutoTokenizer.from(modelFolder: tokenizerURL))
         LTXDebug.log("[TIME] Tokenizer load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
         // Step 2: Download unified file and extract connector weights
@@ -936,20 +986,8 @@ public actor LTXPipeline {
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
 
-        profiler.start("Tokenization")
-        let (inputIds, attentionMask) = try tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
-        MLX.eval(inputIds, attentionMask)
-        profiler.end("Tokenization")
-
-        guard let gemma = gemmaModel else {
-            throw LTXError.modelNotLoaded("Gemma model not loaded")
-        }
-
         profiler.start("Gemma Forward")
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            throw LTXError.generationFailed("Failed to extract Gemma hidden states")
-        }
+        let (states, attentionMask) = try encodeHiddenStates(effectivePrompt)
         MLX.eval(states[states.count - 1])
         profiler.end("Gemma Forward")
 
@@ -1427,16 +1465,7 @@ public actor LTXPipeline {
         // Phase 1: Text encoding
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
-        let (inputIds, attentionMask) = try tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
-
-        guard let gemma = gemmaModel else {
-            throw LTXError.modelNotLoaded("Gemma model not loaded")
-        }
-
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            throw LTXError.generationFailed("Failed to extract Gemma hidden states")
-        }
+        let (states, attentionMask) = try encodeHiddenStates(effectivePrompt)
 
         let encoderOutput = try textEncoder.encodeFromHiddenStates(
             hiddenStates: states,
@@ -1553,18 +1582,11 @@ public actor LTXPipeline {
             // resident, and an unconditional loadModels() would rebuild the full
             // Gemma + transformer + VAE stack mid-run on top of the live one).
             // Use empty string as negative prompt (matching Lightricks default for MLX)
-            if gemmaModel == nil || tokenizer == nil {
+            if gemmaEncoder == nil {
                 try await loadModels(progressCallback: nil)
             }
-            guard let gemma2 = gemmaModel else {
-                throw LTXError.modelNotLoaded("Failed to reload Gemma for negative prompt")
-            }
-            let negPrompt = ""
-            let (negInputIds, negAttentionMask) = try tokenizePrompt(negPrompt, maxLength: textMaxLength)
-            let (_, negAllHidden) = gemma2(negInputIds, attentionMask: negAttentionMask, outputHiddenStates: true)
-            guard let negStates = negAllHidden, negStates.count == gemma2.config.hiddenLayers + 1 else {
-                throw LTXError.generationFailed("Failed to extract Gemma hidden states for negative prompt")
-            }
+            // Empty string as negative prompt, matching the Lightricks MLX default.
+            let (negStates, negAttentionMask) = try encodeHiddenStates("")
             let negEncoderOutput = try textEncoder.encodeFromHiddenStates(
                 hiddenStates: negStates,
                 attentionMask: negAttentionMask,
@@ -2124,15 +2146,7 @@ public actor LTXPipeline {
         LTXDebug.log("[lipdub] target frames=\(numFrames), Stage1 latent=\(stage1Shape.frames)x\(stage1Shape.height)x\(stage1Shape.width), audio frames=\(audioNumFrames)")
 
         // 3. Text encode the prompt.
-        let (inputIds, attentionMask) = try tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
-        MLX.eval(inputIds, attentionMask)
-        guard let gemma = gemmaModel else {
-            throw LTXError.modelNotLoaded("Gemma model not loaded")
-        }
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            throw LTXError.generationFailed("Failed to extract Gemma hidden states")
-        }
+        let (states, attentionMask) = try encodeHiddenStates(effectivePrompt)
         let encoderOutput = try textEncoder.encodeFromHiddenStates(
             hiddenStates: states,
             attentionMask: attentionMask,
@@ -3371,8 +3385,7 @@ public actor LTXPipeline {
     /// model references.
     public func clearAll() {
         // Release all model references
-        gemmaModel = nil
-        tokenizer = nil
+        gemmaEncoder = nil
         textEncoder = nil
         transformer = nil
         vaeDecoder = nil
@@ -3395,7 +3408,7 @@ public actor LTXPipeline {
 
     /// Clear only Gemma model (to save memory after encoding)
     public func clearGemma() {
-        gemmaModel = nil
+        gemmaEncoder = nil
         LTXDebug.log("Gemma model cleared")
     }
 
@@ -3426,37 +3439,8 @@ public actor LTXPipeline {
 
     /// 4. Return video encoding [1, textMaxLength, 3840] and attention mask [1, textMaxLength]
     private func encodePrompt(_ prompt: String, encoder: VideoGemmaTextEncoderModel) throws -> (encoding: MLXArray, mask: MLXArray) {
-        guard let gemma = gemmaModel else {
-            LTXDebug.log("Warning: Gemma model not loaded, using placeholder embeddings")
-            let placeholder = createPlaceholderEmbeddings(prompt: prompt)
-            let mask = MLXArray.ones([1, textMaxLength]).asType(.int32)
-            return (placeholder, mask)
-        }
-
-        // Step 1: Tokenize with left-padding
-        let (inputIds, attentionMask) = try tokenizePrompt(prompt, maxLength: textMaxLength)
-        let activeTokens = Int(attentionMask.sum().item(Int32.self))
-        LTXDebug.log("Tokenized: \(inputIds.shape), padding=\(textMaxLength - activeTokens), active=\(activeTokens)")
-        // Debug: show first and last tokens for comparison with Python
-        MLX.eval(inputIds)
-        let idsFlat = inputIds.reshaped([-1])
-        var firstTokens: [Int32] = []
-        var lastTokens: [Int32] = []
-        for i in 0..<min(5, textMaxLength) { firstTokens.append(idsFlat[i].item(Int32.self)) }
-        for i in max(0, textMaxLength-10)..<textMaxLength { lastTokens.append(idsFlat[i].item(Int32.self)) }
-        LTXDebug.log("  First 5 tokens: \(firstTokens)")
-        LTXDebug.log("  Last 10 tokens: \(lastTokens)")
-
-        // Step 2: Run Gemma forward pass to extract all 49 hidden states
-        LTXDebug.log("Running Gemma forward pass...")
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            LTXDebug.log("Warning: Expected \(gemma.config.hiddenLayers + 1) hidden states, using placeholder")
-            let placeholder = createPlaceholderEmbeddings(prompt: prompt)
-            let mask = MLXArray.ones([1, textMaxLength]).asType(.int32)
-            return (placeholder, mask)
-        }
+        // Step 1 & 2: Tokenize and run the Gemma forward pass for all 49 hidden states
+        let (states, attentionMask) = try encodeHiddenStates(prompt)
         LTXDebug.log("Got \(states.count) hidden states from Gemma")
 
         // Step 3: Pass through text encoder (feature extractor + connector)
@@ -3475,36 +3459,18 @@ public actor LTXPipeline {
     }
 
     /// Tokenize prompt with left-padding (matching Python mlx-video max_length=1024)
-    private func tokenizePrompt(_ prompt: String, maxLength: Int = 1024) throws -> (inputIds: MLXArray, attentionMask: MLXArray) {
-        guard let tokenizer = tokenizer else {
-            throw LTXError.modelNotLoaded("Tokenizer not loaded. Call loadModels() first.")
+    /// Run the prompt through the loaded Gemma stack.
+    ///
+    /// The single funnel every generation path goes through: five call sites used
+    /// to repeat tokenize → forward → count-check inline, which meant Gemma 4
+    /// support would have had to be written five times.
+    private func encodeHiddenStates(
+        _ prompt: String
+    ) throws -> (states: [MLXArray], attentionMask: MLXArray) {
+        guard let encoder = gemmaEncoder else {
+            throw LTXError.modelNotLoaded("Gemma model not loaded. Call loadModels() first.")
         }
-
-        // Tokenize (Gemma tokenizer adds BOS=2 automatically)
-        let encoded = tokenizer.encode(text: prompt)
-        var tokens = Array(encoded.suffix(maxLength)).map { Int32($0) }
-
-        // Left-pad with pad_token_id=0 (matching Python tokenizer)
-        let paddingNeeded = maxLength - tokens.count
-        let padTokenId: Int32 = 0  // Gemma pad_token_id=0 (NOT eos=1)
-        if paddingNeeded > 0 {
-            tokens = [Int32](repeating: padTokenId, count: paddingNeeded) + tokens
-        }
-
-        // Attention mask: 0 for padding, 1 for real tokens
-        let mask = [Float](repeating: 0, count: paddingNeeded)
-            + [Float](repeating: 1, count: maxLength - paddingNeeded)
-
-        let inputIds = MLXArray(tokens).reshaped([1, maxLength])
-        let attentionMask = MLXArray(mask).reshaped([1, maxLength])
-
-        return (inputIds, attentionMask)
-    }
-
-    /// Create placeholder embeddings when Gemma is not available
-    private func createPlaceholderEmbeddings(prompt: String) -> MLXArray {
-        let hiddenDim = 3840
-        return MLXArray.zeros([1, textMaxLength, hiddenDim]).asType(.float32)
+        return try encoder.encode(prompt: prompt, maxLength: textMaxLength)
     }
 
     /// Create position indices for RoPE
