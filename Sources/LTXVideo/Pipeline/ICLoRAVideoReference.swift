@@ -22,7 +22,8 @@ extension LTXPipeline {
     ///    reference appended in context;
     /// 2. the *latent* spatial upscaler applied to that result;
     /// 3. a 3-step refinement at the target resolution, starting from the upscaled
-    ///    latent re-noised to σ ≈ 0.91 — **not** from pure noise.
+    ///    latent re-noised to σ ≈ 0.91 — **not** from pure noise, and **without**
+    ///    the reference in context: stage 2 refines what stage 1 composed.
     ///
     /// The two upscalers are links in one chain rather than competing options: the
     /// latent one carries geometry across resolutions, the IC-LoRA supplies detail.
@@ -171,13 +172,6 @@ extension LTXPipeline {
         let stage2Shape = VideoLatentShape.fromPixelDimensions(
             batch: 1, channels: 128,
             frames: config.numFrames, height: config.height, width: config.width)
-        let stage2Reference = buildVideoReference(
-            referenceLatent: referenceLatent,
-            targetShape: stage2Shape,
-            downscaleFactor: downscaleFactor,
-            hasAudio: false,
-            refConfig: transformerConfig)
-
         // Re-noise rather than restart: the upscaled latent already carries the
         // composition, and stage 2 only has to add detail at the higher rate.
         let noiseScale = stage2Sigmas[0]
@@ -192,7 +186,12 @@ extension LTXPipeline {
                 sigma: sigma, phase: .refinement))
             let velocity = runDenoiseStep(
                 sigma: sigma, videoLatent: latent, audioLatentPacked: nil,
-                shape: stage2Shape, videoAppendCtx: stage2Reference, audioRefCtx: nil,
+                // No reference tokens here. `ic_lora.py` conditions stage 1 on the
+                // reference video and stage 2 on images only; the adapter stays fused
+                // either way. Appending it at both stages makes the model synthesise
+                // against the adapter *and* against reference tokens sitting at 2x
+                // positions, which measurably over-textures the result.
+                shape: stage2Shape, videoAppendCtx: nil, audioRefCtx: nil,
                 audioNumFrames: 0,
                 videoTextEmbeddings: encoded.embeddings,
                 audioTextEmbeddings: encoded.embeddings,
