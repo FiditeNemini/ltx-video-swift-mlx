@@ -56,9 +56,17 @@ compressed action scene — and the content difference was attributed to the
 vocoder.
 
 Same failure mode as changing duration and audio in one run earlier the same
-day. **When A/B-ing a decode stage, hold the generation fixed**: same prompt,
-same seed, same frame count. If the old path is no longer reachable, keep a
-sample of its output rather than re-generating at different settings.
+day, and again that evening when a pixel upscaler's framing was called "shifted"
+from eyeballed crops and a bounding box that a single stray red pixel inflates —
+a mass-percentile measure then showed subject scale and position tracking the
+source to within 2%.
+
+**When A/B-ing a stage, hold everything else fixed** (same prompt, same seed,
+same frame count) **and measure with a statistic that outliers cannot move**. If
+the old path is no longer reachable, keep a sample of its output rather than
+re-generating at different settings. Three times in one day, an uncontrolled
+comparison produced a confident wrong conclusion; each time the fix was cheaper
+than the retraction.
 
 # Porting notes worth keeping
 
