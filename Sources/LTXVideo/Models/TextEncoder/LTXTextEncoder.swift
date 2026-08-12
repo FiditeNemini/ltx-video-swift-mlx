@@ -186,7 +186,16 @@ class GemmaFeaturesExtractor: Module {
     // LTX-2 legacy: single shared projection (loaded if video/audio not present)
     @ModuleInfo(key: "aggregate_embed") var aggregateEmbed: Linear?
 
-    init(hiddenDim: Int = 3840, numLayers: Int = 49, splitModalities: Bool = true) {
+    /// - Parameter includeAudio: declare the audio projection. Off for a
+    ///   video-only load, where the audio weights are filtered out of the
+    ///   checkpoint split — declaring a projection nothing feeds would leave a
+    ///   randomly-initialised 2048x188160 matrix in the module tree.
+    init(
+        hiddenDim: Int = 3840,
+        numLayers: Int = 49,
+        splitModalities: Bool = true,
+        includeAudio: Bool = true
+    ) {
         self.hiddenDim = hiddenDim
         self.numLayers = numLayers
 
@@ -195,7 +204,9 @@ class GemmaFeaturesExtractor: Module {
         if splitModalities {
             // LTX-2.3: separate video (→4096) and audio (→2048) projections
             self._videoAggregateEmbed.wrappedValue = Linear(inputDim, 4096, bias: true)
-            self._audioAggregateEmbed.wrappedValue = Linear(inputDim, 2048, bias: true)
+            if includeAudio {
+                self._audioAggregateEmbed.wrappedValue = Linear(inputDim, 2048, bias: true)
+            }
         } else {
             // LTX-2 legacy: single projection (→3840)
             self._aggregateEmbed.wrappedValue = Linear(inputDim, hiddenDim, bias: false)
@@ -826,7 +837,8 @@ func createTextEncoder(
 ) -> VideoGemmaTextEncoderModel {
     let featureExtractor = GemmaFeaturesExtractor(
         hiddenDim: config.hiddenDim,
-        numLayers: config.numGemmaLayers
+        numLayers: config.numGemmaLayers,
+        includeAudio: includeAudioConnector
     )
 
     let embeddingsConnector = Embeddings1DConnector(
