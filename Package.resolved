@@ -1,5 +1,5 @@
 {
-  "originHash" : "86102625e8db021d860cb1f237b030a2323b17a81c53e9d37809ee779ab2f1f8",
+  "originHash" : "8cae12e2e34f3872ca4809a22d82821b3493d1cb1eb47b47215d536d627cb3af",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -8,6 +8,14 @@
       "state" : {
         "revision" : "a3a85a85214caf642abaa96ae664e4c772a59f6e",
         "version" : "1.4.1"
+      }
+    },
+    {
+      "identity" : "gemma-4-swift-mlx",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/VincentGourbin/gemma-4-swift-mlx",
+      "state" : {
+        "revision" : "0b94dc400328d5790919ebe3184b8255050ef9d7"
       }
     },
     {

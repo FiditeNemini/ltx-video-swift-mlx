@@ -24,6 +24,17 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.2"),
         .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.4.0"),
+        // LTX-2.5 encodes prompts with `gemma4-12b-ltx-v1`, a gemma4_unified derivative.
+        // Reused rather than re-ported: that package already implements the architecture
+        // (global_head_dim, attention_k_eq_v, layer_scalar, partial-rotary RoPE).
+        // Pinned by revision, not by branch: SwiftPM refuses a transitive branch
+        // requirement under a semver-tagged package, which would make this package
+        // unconsumable from its first tagged release. The last tag (1.0.0) predates
+        // `forwardCollectingHiddenStates`; move to `from: "1.1.0"` once it ships.
+        .package(
+            url: "https://github.com/VincentGourbin/gemma-4-swift-mlx",
+            revision: "0b94dc400328d5790919ebe3184b8255050ef9d7"
+        ),
     ],
     targets: [
         // MARK: - Library
@@ -41,6 +52,7 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "MLXProfiler", package: "swift-mlx-profiler"),
+                .product(name: "Gemma4Swift", package: "gemma-4-swift-mlx"),
             ]
         ),
         // MARK: - CLI
