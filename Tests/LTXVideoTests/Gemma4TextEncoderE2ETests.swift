@@ -73,6 +73,81 @@ struct Gemma4TextEncoderE2ETests {
         #expect(audio.shape == [2048, 188160])
     }
 
+    /// Shapes and finiteness would survive a mis-mapped checkpoint — a permuted
+    /// layer order or a swapped q/k projection still yields finite numbers. Meaning
+    /// does not: a broken stack cannot rank a paraphrase above an unrelated
+    /// sentence. This is the strongest self-contained check available here;
+    /// elementwise parity against the PyTorch reference is still open.
+    ///
+    /// Note on what is deliberately *not* tested: greedy decoding. This checkpoint
+    /// is an encoder fine-tune with tied embeddings, and its final-norm scale has
+    /// drifted far above stock Gemma 4's (mean 20 vs 7.9, max 600 vs 14). The
+    /// hidden state that reaches the tied head therefore lands deep in the
+    /// `final_logit_softcapping` saturation zone and the head ranks by embedding
+    /// magnitude, emitting single capital letters. Harmless — LTX never reads
+    /// logits, and the feature extractor per-token RMS-normalises the states,
+    /// which is exactly why the scale was free to drift during LTX's training.
+    @Test func encodesMeaningNotJustNumbers() async throws {
+        let encoder = try await Gemma4TextEncoder.load(
+            fileURL: URL(fileURLWithPath: Self.encoderPath),
+            tokenizerCacheDirectory: Self.tokenizerCache
+        )
+
+        func pooled(_ prompt: String) throws -> MLXArray {
+            let (states, mask) = try encoder.encode(prompt: prompt, maxLength: 64)
+            let last = states[states.count - 1].asType(.float32)
+            let weights = mask.asType(.float32).expandedDimensions(axis: -1)
+            let summed = (last * weights).sum(axis: 1)
+            let vector = summed / weights.sum(axis: 1)
+            return vector / MLX.sqrt((vector * vector).sum(axis: -1, keepDims: true))
+        }
+        func cosine(_ a: MLXArray, _ b: MLXArray) -> Float {
+            let value = (a * b).sum()
+            MLX.eval(value)
+            return value.item(Float.self)
+        }
+
+        let reference = try pooled("a dog running through a sunny park")
+        let paraphrase = try pooled("a puppy runs across a sunlit park")
+        let unrelated = try pooled("quantum chromodynamics equations on a blackboard")
+
+        let near = cosine(reference, paraphrase)
+        let far = cosine(reference, unrelated)
+        #expect(near > far,
+                "paraphrase similarity \(near) should exceed unrelated \(far) — the stack is mis-mapped")
+
+        // Encoding is deterministic: the same prompt gives the same vector.
+        #expect(cosine(reference, try pooled("a dog running through a sunny park")) > 0.999)
+    }
+
+    /// The stack must stay numerically stable across all 48 layers: a scale that
+    /// explodes or collapses is the signature of a mis-applied norm convention
+    /// (Gemma stores RMSNorm weights as direct scales here, not as `1 + w` offsets).
+    @Test func hiddenStateScaleStaysStable() async throws {
+        let encoder = try await Gemma4TextEncoder.load(
+            fileURL: URL(fileURLWithPath: Self.encoderPath),
+            tokenizerCacheDirectory: Self.tokenizerCache
+        )
+        let maxLength = 16
+        let (states, mask) = try encoder.encode(
+            prompt: "The capital of France is", maxLength: maxLength)
+        let realTokens = Int(mask.asArray(Float.self).reduce(0, +))
+
+        var scales: [Float] = []
+        for state in states {
+            let real = state[0..., (maxLength - realTokens)..., 0...].asType(.float32)
+            MLX.eval(real)
+            scales.append(MLX.sqrt((real * real).mean()).item(Float.self))
+        }
+
+        // Layers 0…47 stay within an order of magnitude of the embedding scale;
+        // only the last entry is post-final-norm, which deliberately rescales.
+        for (index, rms) in scales.dropLast().enumerated() {
+            #expect(rms > 0.1 && rms < 50, "state \(index) rms=\(rms) is out of band")
+        }
+        #expect(scales[scales.count - 1] > 1 && scales[scales.count - 1] < 500)
+    }
+
     @Test func encodesAPromptIntoFortyNineHiddenStates() async throws {
         let encoder = try await Gemma4TextEncoder.load(
             fileURL: URL(fileURLWithPath: Self.encoderPath),

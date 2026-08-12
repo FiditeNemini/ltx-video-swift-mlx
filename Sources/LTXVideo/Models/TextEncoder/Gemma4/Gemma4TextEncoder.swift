@@ -203,4 +203,5 @@ final class Gemma4TextEncoder: LTXGemmaEncoding {
         let zeros = MLXArray.zeros([state.dim(0), count, state.dim(2)], dtype: state.dtype)
         return MLX.concatenated([zeros, state], axis: 1)
     }
+
 }
