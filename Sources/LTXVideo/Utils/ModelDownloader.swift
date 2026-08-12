@@ -365,7 +365,7 @@ public actor ModelDownloader {
         let destination = localDir.appendingPathComponent((filename as NSString).lastPathComponent)
 
         if FileManager.default.fileExists(atPath: destination.path) {
-            progress?(DownloadProgress(progress: 1.0, message: "Unified weights already downloaded"))
+            progress?(DownloadProgress(progress: 1.0, message: "\(destination.lastPathComponent) already downloaded"))
             return destination
         }
 
@@ -373,7 +373,7 @@ public actor ModelDownloader {
 
         progress?(DownloadProgress(progress: 0.1, currentFile: filename, message: "Downloading \(filename)..."))
         try await downloadFile(repoId: repoId, filename: filename, to: destination)
-        progress?(DownloadProgress(progress: 1.0, message: "Unified weights download complete"))
+        progress?(DownloadProgress(progress: 1.0, message: "\(destination.lastPathComponent) download complete"))
         return destination
     }
 

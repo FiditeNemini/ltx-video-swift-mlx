@@ -1,4 +1,4 @@
-// LTXVideoCLI.swift - Command-line interface for LTX-2.3 video generation
+// LTXVideoCLI.swift - Command-line interface for LTX-2 video generation
 // Copyright 2025
 
 import ArgumentParser
@@ -9,7 +9,7 @@ import LTXVideo
 struct LTXVideoCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ltx-video",
-        abstract: "LTX-2.3 video generation on Mac with MLX",
+        abstract: "LTX-2 video generation on Mac with MLX (LTX-2.3 and LTX-2.5)",
         version: "0.1.0",
         subcommands: [Generate.self, Retake.self, LipDub.self, Profile.self, ExportQuantized.self, Download.self, Train.self, TrainingControl.self, Models.self, Info.self],
         defaultSubcommand: Info.self
@@ -130,6 +130,9 @@ struct Generate: AsyncParsableCommand {
     var model: String = "distilled"
 
     mutating func run() async throws {
+        // Resolved up front so every message names the variant actually running.
+        let parsedModelVariant = try parseModelVariant(model)
+
         // Configure custom models directory if specified
         if let dir = modelsDir {
             LTXModelRegistry.customModelsDirectory = URL(fileURLWithPath: dir)
@@ -146,8 +149,8 @@ struct Generate: AsyncParsableCommand {
         var profilingSession: ProfilingSession? = nil
         if profile {
             let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
-            session.title = "LTX-2.3 PROFILING REPORT"
-            session.metadata["model"] = "distilled"
+            session.title = "\(parsedModelVariant.displayName) PROFILING REPORT"
+            session.metadata["model"] = parsedModelVariant.rawValue
             session.metadata["quant"] = mixedPrecision ? "mixed" : transformerQuant
             session.metadata["resolution"] = "\(width)x\(height)"
             session.metadata["frames"] = String(frames)
@@ -170,7 +173,7 @@ struct Generate: AsyncParsableCommand {
         }
         let isI2V = image != nil || !parsedKeyframes.isEmpty
 
-        print("LTX-2.3 Video Generation (Two-Stage Distilled)")
+        print("\(parsedModelVariant.displayName) — Video Generation (Two-Stage Distilled)")
         print("================================================")
         if !parsedKeyframes.isEmpty {
             print("Mode: keyframe interpolation (\(parsedKeyframes.count) keyframe\(parsedKeyframes.count == 1 ? "" : "s"))")
@@ -236,7 +239,7 @@ struct Generate: AsyncParsableCommand {
             quantConfig = LTXQuantizationConfig(transformer: quantOption, textEncoder: quantOption)
         }
 
-        let modelVariant = try parseModelVariant(model)
+        let modelVariant = parsedModelVariant
 
         print("Creating pipeline...")
         fflush(stdout)
@@ -774,7 +777,7 @@ struct LipDub: AsyncParsableCommand {
     @Flag(name: .long, help: "Enhance the prompt via the VLM (Gemma) by analyzing --reference-image. Generates a richer scene description while preserving the `speaking in <LANG> saying: \"...\"` LipDub signature. Image mode only.")
     var enhancePrompt: Bool = false
 
-    @Option(name: .long, help: "HuggingFace token for gated models (LipDub LoRA + LTX-2.3 are gated)")
+    @Option(name: .long, help: "HuggingFace token for gated models (the IC-LoRAs and every LTX-2.5 repo are gated)")
     var hfToken: String?
 
     @Option(name: .long, help: "Custom directory for model storage")
@@ -1109,13 +1112,13 @@ struct Models: ParsableCommand {
 
 struct Info: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Show information about LTX-2.3 implementation"
+        abstract: "Show information about this LTX implementation"
     )
 
     mutating func run() throws {
         print(
             """
-            LTX-2.3 Video Generation for Apple Silicon
+            LTX-2 Video Generation for Apple Silicon (LTX-2.3 + LTX-2.5)
             =========================================
 
             Version: \(LTXVideo.version)
