@@ -75,15 +75,25 @@ struct LTX25TextEncoderAssets {
 
     /// Text-model configuration for the bundled Gemma 4.
     ///
-    /// The blob is a `gemma4_unified` config: vision and audio sections are present
-    /// but irrelevant here — prompt encoding only runs the text stack.
+    /// The blob is a `gemma4_unified` config carrying vision and audio sections
+    /// this encoder never runs — prompt encoding only needs the text stack. Only
+    /// `text_config` is handed to the decoder: routing through the full
+    /// `Gemma4Config` would make it attempt the vision/audio sections, whose
+    /// reduced schema fails to decode and logs a scary-looking (but harmless)
+    /// fallback on every single run.
     func textConfig() throws -> Gemma4TextConfig {
         let data = try gemmaConfigData()
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let textSection = root["text_config"],
+              let textData = try? JSONSerialization.data(withJSONObject: textSection) else {
+            throw LTXError.weightLoadingFailed(
+                "The bundled Gemma config has no `text_config` section")
+        }
         do {
-            return try JSONDecoder().decode(Gemma4Config.self, from: data).textConfig
+            return try JSONDecoder().decode(Gemma4TextConfig.self, from: textData)
         } catch {
             throw LTXError.weightLoadingFailed(
-                "Could not decode the bundled Gemma config: \(error)")
+                "Could not decode the bundled Gemma text config: \(error)")
         }
     }
 
