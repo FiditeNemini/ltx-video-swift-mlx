@@ -163,16 +163,16 @@ public actor LTXPipeline {
     private var textEncoder: VideoGemmaTextEncoderModel?
 
     /// Diffusion transformer
-    private var transformer: LTXTransformer?
+    internal var transformer: LTXTransformer?
 
     /// VAE decoder
-    private var vaeDecoder: VideoDecoder?
+    internal var vaeDecoder: VideoDecoder?
 
     /// VAE encoder (loaded only for image-to-video)
     private var vaeEncoder: VideoEncoder?
 
     /// Audio: dual video/audio transformer (alternative to video-only transformer)
-    private var ltx2Transformer: LTX2Transformer?
+    internal var ltx2Transformer: LTX2Transformer?
 
     /// Audio VAE decoder
     private var audioVAE: AudioVAE?
@@ -278,7 +278,7 @@ public actor LTXPipeline {
     /// Unload Gemma + tokenizer (~7.5 GB) when the memory config asks for it.
     /// Kept resident with `unloadAfterUse == false` so consecutive runs can
     /// re-encode text without reloading models.
-    private func unloadGemmaIfConfigured() {
+    internal func unloadGemmaIfConfigured() {
         guard memoryOptimization.unloadAfterUse else { return }
         gemmaEncoder = nil
         Memory.clearCache()
@@ -746,7 +746,7 @@ public actor LTXPipeline {
     /// dual-stream `LTX2Transformer`). Both are unpatchified and float32 — ready
     /// for the scheduler step. Velocities are already cropped back to the
     /// original token counts when their respective `*AppendCtx` was provided.
-    private struct StepVelocity {
+    internal struct StepVelocity {
         let video: MLXArray
         let audio: MLXArray?
     }
@@ -768,7 +768,7 @@ public actor LTXPipeline {
     /// Caller is responsible for the scheduler step and post-step `MLX.eval`.
     /// This split keeps the Stage 1 (Euler scheduler) and Stage 2 (manual Euler)
     /// integration code untouched, since their numerical contracts differ.
-    private func runDenoiseStep(
+    internal func runDenoiseStep(
         sigma: Float,
         videoLatent: MLXArray,
         audioLatentPacked: MLXArray?,
@@ -2641,7 +2641,7 @@ public actor LTXPipeline {
     ///   - height: Target video height
     ///   - numFrames: Number of frames to extract
     /// - Returns: Video latent tensor (1, 128, latent_F, latent_H, latent_W)
-    private func encodeVideo(
+    internal func encodeVideo(
         path: String, width: Int, height: Int, numFrames: Int, tail: Bool = false
     ) async throws -> MLXArray {
         let videoTensor = try await loadVideo(
