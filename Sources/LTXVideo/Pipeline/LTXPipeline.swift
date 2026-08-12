@@ -3373,6 +3373,8 @@ public actor LTXPipeline {
         // would capture LipDub-contaminated weights as the "originals" — a later
         // unfuseLoRA() would then restore corrupted weights as if pristine.
         try ensureNoLipDubLoRAFused(wouldCorrupt: "fuseLoRA (its unfuse originals)")
+        LoRALoader.warnOnGenerationMismatch(
+            loraPath: loraPath, checkpointVersion: model.family.checkpointModelVersion)
         let target = try getTransformerModule()
         let (originals, result) = try target.fuseLoRA(from: loraPath, scale: scale)
         // Store state for unfusing

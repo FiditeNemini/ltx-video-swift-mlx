@@ -789,6 +789,9 @@ struct LipDub: AsyncParsableCommand {
     @Option(name: .long, help: "Path to local LTX unified weights file")
     var ltxWeights: String?
 
+    @Option(name: .long, help: "Model variant: distilled or 2.5-distilled (default: distilled)")
+    var model: String = "distilled"
+
     mutating func run() async throws {
         if let dir = modelsDir {
             LTXModelRegistry.customModelsDirectory = URL(fileURLWithPath: dir)
@@ -797,7 +800,7 @@ struct LipDub: AsyncParsableCommand {
 
         RuntimeBeacon.isEnabled = beacon
 
-        print("LTX-2.3 LipDub")
+        print("\(try parseModelVariant(model).displayName) — LipDub")
         print("==============")
         if let tail = continuationTail {
             guard referenceVideo == nil else {

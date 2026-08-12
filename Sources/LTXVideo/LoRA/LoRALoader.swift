@@ -84,6 +84,31 @@ class LoRALoader {
         }
     }
 
+    /// The generation a LoRA declares it was trained against, e.g. `"2.3.0"`.
+    /// `nil` when the adapter carries no `model_version` (community LoRAs often don't).
+    static func declaredModelVersion(from path: String) -> String? {
+        (try? loadMetadata(from: path))?["model_version"]
+    }
+
+    /// Warn — never refuse — when a LoRA was trained against another generation.
+    ///
+    /// Measured on this repo's adapters (LipDub 1344 modules, the camera LoRAs 384
+    /// each): every module a 2.3 LoRA targets exists in the 2.5 transformer, so
+    /// fusion is mechanically sound and upstream reports most adapters transfer.
+    /// What cannot be checked statically is behaviour: 2.5's block FFNs are
+    /// bias-free where 2.3's were not, so a delta trained on `ff.net.*` was learned
+    /// against a slightly different base. Hence a warning the user can act on
+    /// rather than a wall they have to work around.
+    static func warnOnGenerationMismatch(loraPath: String, checkpointVersion: String) {
+        guard let declared = declaredModelVersion(from: loraPath) else { return }
+        let loraGeneration = declared.split(separator: ".").prefix(2).joined(separator: ".")
+        let modelGeneration = checkpointVersion.split(separator: ".").prefix(2).joined(separator: ".")
+        guard loraGeneration != modelGeneration else { return }
+        print("[LoRA] \((loraPath as NSString).lastPathComponent) declares LTX-\(loraGeneration), "
+            + "the checkpoint is LTX-\(modelGeneration). Every targeted module exists in both, so it "
+            + "will fuse — check the result before relying on it.")
+    }
+
     /// Parse LoRA layer structure from weight keys
     private static func parseLoRALayers(from weights: [String: MLXArray]) -> [LoRALayerInfo] {
         var layers: [LoRALayerInfo] = []
@@ -135,14 +160,20 @@ class LoRALoader {
         return layers
     }
 
-    /// Infer rank from weights
+    /// The adapter's nominal rank — the most common one when ranks vary per module.
+    ///
+    /// Rank is not always uniform: LTX-2.5's distilled LoRA carries 450 on 1360
+    /// modules but 256, 128 and 32 on others. Returning whichever module happened
+    /// to be enumerated first (dictionary order is unspecified) would report a
+    /// different rank run to run. Fusion is per-module and unaffected — this value
+    /// is descriptive, so it reports the dominant rank and nothing depends on it
+    /// being the only one.
     private static func inferRank(from weights: [String: MLXArray]) -> Int {
-        for (key, value) in weights {
-            if key.contains("lora_down") || key.contains("lora_A") {
-                return value.dim(0)
-            }
+        var counts: [Int: Int] = [:]
+        for (key, value) in weights where key.contains("lora_down") || key.contains("lora_A") {
+            counts[value.dim(0), default: 0] += 1
         }
-        return 0
+        return counts.max { ($0.value, $1.key) < ($1.value, $0.key) }?.key ?? 0
     }
 
     /// Infer target modules from weights
