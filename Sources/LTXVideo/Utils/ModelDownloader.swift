@@ -424,6 +424,32 @@ public actor ModelDownloader {
         }
     }
 
+    /// Download the LTX-2.5 duration head (~4 MB).
+    ///
+    /// Kept out of ``downloadCheckpoint`` because it is optional: a caller that
+    /// always passes an explicit frame count never needs it.
+    public func downloadDurationHead(
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> URL {
+        guard let file = LTXModelFamily.ltx25.sharedComponentFiles.first(where: { $0.kind == .durationHead })
+        else {
+            throw LTXError.downloadFailed("No duration head is published for this generation")
+        }
+        let destination = cacheDirectory
+            .appendingPathComponent("ltx-2.5-duration-head")
+            .appendingPathComponent(file.filename)
+
+        if FileManager.default.fileExists(atPath: destination.path) {
+            progress?(DownloadProgress(progress: 1.0, message: "Duration head already downloaded"))
+            return destination
+        }
+        progress?(DownloadProgress(progress: 0.1, message: "Downloading duration head..."))
+        try await downloadFile(
+            repoId: LTXModelFamily.ltx25.huggingFaceRepo, filename: file.path, to: destination)
+        progress?(DownloadProgress(progress: 1.0, message: "Duration head download complete"))
+        return destination
+    }
+
     // MARK: - VLM Gemma (Shared 4-bit Model)
 
     /// HuggingFace repo for the shared VLM Gemma model (4-bit QAT, ~7.5GB)

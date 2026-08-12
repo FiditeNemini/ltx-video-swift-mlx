@@ -3173,6 +3173,56 @@ public actor LTXPipeline {
         )
     }
 
+    // MARK: - Auto Duration (LTX-2.5)
+
+    /// Predict a clip length from the prompt, as LTX-2.5's `--auto-duration` does.
+    ///
+    /// Runs the text encoder and the 3.8 MB duration head — no diffusion — and
+    /// returns a frame count already snapped to the `8k + 1` grid, so the result
+    /// can be handed straight to ``LTXVideoGenerationConfig``.
+    ///
+    /// The clamp is a safety rail: an outlier prediction would otherwise request a
+    /// degenerate or OOM-sized generation. `wasClamped` reports when it bit, so a
+    /// caller can tell "the model asked for 3 s" from "the model asked for 90 s".
+    ///
+    /// - Throws: when the checkpoint predates LTX-2.5 — no earlier generation
+    ///   ships a duration head, and guessing a length would defeat the purpose.
+    public func predictFrameCount(
+        for prompt: String,
+        frameRate: Float = 24.0,
+        minSeconds: Float = 1.0,
+        maxSeconds: Float = 20.0
+    ) async throws -> (frames: Int, seconds: Float, wasClamped: Bool) {
+        guard model.family == .ltx25 else {
+            throw LTXError.invalidConfiguration(
+                "Auto duration needs a duration head, which ships from LTX-2.5 onward — "
+                + "\(model.displayName) has none. Pass an explicit frame count.")
+        }
+        if !isGemmaLoaded || textEncoder == nil {
+            try await loadModels(progressCallback: nil)
+        }
+        guard let textEncoder else {
+            throw LTXError.modelNotLoaded("Text encoder not loaded")
+        }
+
+        let headPath = try await downloader.downloadDurationHead()
+        let head = try LTXDurationHead.load(from: headPath)
+
+        let (states, attentionMask) = try encodeHiddenStates(prompt)
+        let encoded = try textEncoder.encodeFromHiddenStates(
+            hiddenStates: states, attentionMask: attentionMask, paddingSide: "left")
+
+        let result = try head.predictFrameCount(
+            videoTokens: encoded.videoEncoding,
+            audioTokens: encoded.audioEncoding,
+            frameRate: frameRate,
+            minSeconds: minSeconds,
+            maxSeconds: maxSeconds)
+        LTXDebug.log("Duration head: \(result.rawSeconds)s → \(result.frames) frames"
+            + (result.wasClamped ? " (clamped)" : ""))
+        return (result.frames, result.rawSeconds, result.wasClamped)
+    }
+
     // MARK: - Download Helpers
 
     /// Download the spatial upscaler matching this pipeline's checkpoint generation.

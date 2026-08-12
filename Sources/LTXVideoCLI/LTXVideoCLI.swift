@@ -68,8 +68,8 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Video height in pixels (must be divisible by 64 for two-stage)")
     var height: Int = 512
 
-    @Option(name: .shortAndLong, help: "Number of frames (must be 8n+1, e.g., 9, 17, 25, 33...)")
-    var frames: Int = 121
+    @Option(name: .shortAndLong, help: "Number of frames (8n+1, e.g. 9, 17, 25...), or 'auto' to predict it from the prompt (LTX-2.5 only)")
+    var frames: String = "121"
 
     @Option(name: .long, help: "Random seed for reproducibility")
     var seed: UInt64?
@@ -205,8 +205,16 @@ struct Generate: AsyncParsableCommand {
         print()
 
         // Validate frame count (must be 8n+1)
-        guard (frames - 1) % 8 == 0 else {
-            throw ValidationError("Frame count must be 8n+1 (e.g., 9, 17, 25, 33, ...). Got \(frames)")
+        let autoDuration = frames.lowercased() == "auto"
+        var frameCount = 121
+        if !autoDuration {
+            guard let parsed = Int(frames) else {
+                throw ValidationError("Frames must be a number or 'auto'. Got \(frames)")
+            }
+            guard (parsed - 1) % 8 == 0 else {
+                throw ValidationError("Frame count must be 8n+1 (e.g., 9, 17, 25, 33, ...). Got \(parsed)")
+            }
+            frameCount = parsed
         }
 
         // Validate dimensions (must be divisible by 64 for two-stage)
@@ -272,6 +280,16 @@ struct Generate: AsyncParsableCommand {
             print("LoRA fused (\(fusedCount) layer-pairs)")
         }
 
+        // Auto duration: ask the duration head before committing to a frame count
+        if autoDuration {
+            print("Predicting duration from the prompt...")
+            fflush(stdout)
+            let predicted = try await pipeline.predictFrameCount(for: prompt)
+            frameCount = predicted.frames
+            let clampNote = predicted.wasClamped ? " (clamped from \(String(format: "%.1f", predicted.seconds))s)" : ""
+            print("Duration: \(String(format: "%.2f", Float(frameCount) / 24.0))s → \(frameCount) frames\(clampNote)")
+        }
+
         // Download upscaler (always needed for two-stage)
         print("Downloading upscaler weights (if needed)...")
         fflush(stdout)
@@ -282,7 +300,7 @@ struct Generate: AsyncParsableCommand {
         let config = LTXVideoGenerationConfig(
             width: width,
             height: height,
-            numFrames: frames,
+            numFrames: frameCount,
             numSteps: 8,
             seed: seed,
             enhancePrompt: enhancePrompt,
