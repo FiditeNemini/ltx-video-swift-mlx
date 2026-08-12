@@ -129,6 +129,11 @@ struct LTXModelCatalogTests {
         // 2.3 ships ff.net.{0.proj,2}.bias for every block; 2.5 sets ff_bias: false.
         #expect(LTXTransformerConfig.ltx23.ffBias == true)
         #expect(LTXTransformerConfig.ltx25.ffBias == false)
+        // The two streams diverge in 2.5: `ff_bias: false` but `audio_ff_bias`
+        // unset, and audio_ff.net.{0.proj,2}.bias is present for all 48 blocks.
+        // Tying them together drops 96 trained audio biases.
+        #expect(LTXTransformerConfig.ltx23.audioFfBias == true)
+        #expect(LTXTransformerConfig.ltx25.audioFfBias == true)
         #expect(LTXTransformerConfig.ltx25.keyframesAbsPosEmbedding == true)
         // Everything else is identical between the two generations.
         #expect(LTXTransformerConfig.ltx25.numLayers == LTXTransformerConfig.ltx23.numLayers)

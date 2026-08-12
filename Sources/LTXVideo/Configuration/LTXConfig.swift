@@ -16,8 +16,9 @@ import Foundation
 ///
 /// **LTX-2.5** (`Lightricks/LTX-2.5`, gated) ships one file per component and swaps
 /// the text encoder for an LTX-specific Gemma 4 12B derivative bundled with the
-/// checkpoint. Catalogued here with its licence and download metadata, but the
-/// pipeline cannot run it yet — see ``LTXModel/support``.
+/// checkpoint. Text- and image-to-video run; the diffusion decoder, the temporal
+/// upscaler and the pixel upscaler IC-LoRA are not implemented — see
+/// ``LTXModel/support``.
 ///
 /// Licensing, gating and packaging live in `LTXModelCatalog.swift`.
 public enum LTXModel: String, CaseIterable, Sendable {
@@ -261,7 +262,7 @@ public struct LTXTransformerConfig: Codable, Sendable {
     /// When true, both `captionProjection` and `audioCaptionProjection` are skipped.
     public var captionProjBeforeConnector: Bool
 
-    /// Whether the block-level feed-forward layers carry biases.
+    /// Whether the **video** block feed-forward layers carry biases.
     ///
     /// LTX-2.3 checkpoints ship `ff.net.0.proj.bias` and `ff.net.2.bias` for every
     /// block; LTX-2.5 sets `ff_bias: false` and ships neither. Building bias-carrying
@@ -269,6 +270,14 @@ public struct LTXTransformerConfig: Codable, Sendable {
     /// in the forward pass, so this must track the checkpoint.
     /// (Connector blocks keep their FFN biases in both generations.)
     public var ffBias: Bool
+
+    /// Whether the **audio** block feed-forward layers carry biases.
+    ///
+    /// Separate from ``ffBias`` because LTX-2.5 diverges between the two streams:
+    /// it sets `ff_bias: false` but leaves `audio_ff_bias` unset, and the audio
+    /// blocks do ship `audio_ff.net.{0.proj,2}.bias`. Tying the two together drops
+    /// 96 trained audio biases — which the video path never notices.
+    public var audioFfBias: Bool
 
     /// LTX-2.5 `use_keyframes_abs_pos_embedding`: the checkpoint carries a learned
     /// `keyframes_abs_pos_embedding` marker added to *generated* keyframe slots
@@ -297,6 +306,7 @@ public struct LTXTransformerConfig: Codable, Sendable {
         crossAttentionAdaLN: Bool = false,
         captionProjBeforeConnector: Bool = false,
         ffBias: Bool = true,
+        audioFfBias: Bool = true,
         keyframesAbsPosEmbedding: Bool = false
     ) {
         self.numLayers = numLayers
@@ -319,6 +329,7 @@ public struct LTXTransformerConfig: Codable, Sendable {
         self.crossAttentionAdaLN = crossAttentionAdaLN
         self.captionProjBeforeConnector = captionProjBeforeConnector
         self.ffBias = ffBias
+        self.audioFfBias = audioFfBias
         self.keyframesAbsPosEmbedding = keyframesAbsPosEmbedding
     }
 
@@ -360,14 +371,17 @@ public struct LTXTransformerConfig: Codable, Sendable {
     /// LTX-2.3's apart from two added keys, `ff_bias: false` and
     /// `use_keyframes_abs_pos_embedding: true`. Layer count, head geometry, RoPE
     /// parameters, connector shape and every tensor shape are unchanged; the only
-    /// tensor-level differences are the 96 dropped FFN biases and the new
-    /// `keyframes_abs_pos_embedding` marker.
+    /// tensor-level differences are the 96 dropped **video** FFN biases and the new
+    /// `keyframes_abs_pos_embedding` marker. The audio blocks keep their FFN biases:
+    /// the checkpoint sets `ff_bias: false` and leaves `audio_ff_bias` unset, and
+    /// `audio_ff.net.{0.proj,2}.bias` is present for all 48 blocks.
     public static let ltx25 = LTXTransformerConfig(
         captionChannels: 4096,
         gatedAttention: true,
         crossAttentionAdaLN: true,
         captionProjBeforeConnector: true,
         ffBias: false,
+        audioFfBias: true,
         keyframesAbsPosEmbedding: true
     )
 }

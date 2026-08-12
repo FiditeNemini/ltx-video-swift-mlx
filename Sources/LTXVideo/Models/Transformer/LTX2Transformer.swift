@@ -140,7 +140,8 @@ class LTX2Transformer: Module {
                 normEps: config.normEps,
                 gatedAttention: gated,
                 crossAttentionAdaLN: crossAttnAdaLN,
-                ffBias: config.ffBias
+                ffBias: config.ffBias,
+                audioFfBias: config.audioFfBias
             )
         }
     }
