@@ -652,13 +652,13 @@ public actor LTXPipeline {
         // plus additional audio-specific keys. We reload from the unified file.
         progressCallback?(DownloadProgress(progress: 0.6, message: "Loading dual audio/video transformer..."))
 
-        let unifiedPath = try await resolveUnifiedWeightsPath(for: model, progressCallback: progressCallback)
-
-        // Load and split unified weights (includeAudio: true to keep audio transformer keys)
-        let (transformerWeights, _, connectorWeightsFromUnified) = try LTXWeightLoader.splitUnifiedWeightsFile(
-            path: unifiedPath,
-            includeAudio: true
-        )
+        // Same source as loadModels: on a split checkpoint the aggregate projections
+        // live with the text encoder, so resolving only the transformer file here
+        // would rebuild the encoder below with randomly-initialised projections.
+        let checkpoint = try await resolveCheckpoint(progressCallback: progressCallback)
+        let source = LTXCheckpointSource(model: model, paths: checkpoint)
+        let (transformerWeights, _, connectorWeightsFromUnified) =
+            try source.loadComponents(includeAudio: true)
 
         // Create LTX2 dual transformer
         let ltx2 = LTX2Transformer(

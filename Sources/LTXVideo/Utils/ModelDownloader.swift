@@ -1274,6 +1274,22 @@ class LTXWeightLoader {
             }
         }
 
+        // Every declared parameter must be fed. An unfed aggregate projection is not
+        // a degraded encoder, it is a random one: the prompt embedding becomes noise
+        // and generation silently produces a plausible video of the wrong thing.
+        // This bit twice on LTX-2.5 — the split checkpoint keeps `text_embedding_projection.*`
+        // in the text-encoder bundle, so any path that reloads the encoder from the
+        // transformer file alone leaves the projections at their random initialisation.
+        let declared = Set(flatParameters.keys)
+        let unfed = declared.subtracting(updates.keys).sorted()
+        guard unfed.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "Text encoder: \(unfed.count) parameters were not fed by the checkpoint "
+                + "(\(unfed.prefix(5).joined(separator: ", "))\(unfed.count > 5 ? ", …" : "")). "
+                + "A split checkpoint keeps the aggregate projections with the text encoder, "
+                + "not with the transformer — load both.")
+        }
+
         _ = model.update(parameters: ModuleParameters.unflattened(updates))
         if skippedAudio > 0 {
             LTXDebug.log("Applied \(updates.count) weights to TextEncoder (skipped \(skippedAudio) audio connector keys)")
