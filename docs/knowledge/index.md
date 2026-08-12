@@ -41,6 +41,8 @@ or re-litigated.
 * [VAE decoder D2S blocks: residual=false](pitfalls/decoder-d2s-residual-false.md) - the grid-artifact root cause, plus decoder facts worth not re-deriving
 * [The LipDub audio contract](pitfalls/lipdub-audio-contract.md) - ship the generated track, feed a clean reference; six rules with the measurements behind them
 * [LipDub segments cap at ~233 frames](pitfalls/lipdub-segment-bound-233.md) - the negative-position audio reference doubles the RoPE span; 481 is only for generate/retake
+* [Split-checkpoint lookups fail silently](pitfalls/split-checkpoint-silent-empty-load.md) - a wrong-file prefix returns zero keys, not an error; the VAE encoder ran randomly initialised through a whole generation
+* [Don't validate the LTX Gemma by generating text](pitfalls/ltx-gemma-head-is-vestigial.md) - its tied head is saturated by design; check parameter coverage, scale band and meaning instead
 * [The continuation-tail clip must be re-encoded](pitfalls/continuation-tail-clip-encoding.md) - an input seek leaves frame 0 off t=0 and the zero-tolerance extractor refuses it
 
 # Investigations

@@ -2,6 +2,17 @@
 
 ## 2026-08-12
 
+* **Update**: LTX-2.5 now runs (text/image-to-video). Two pitfalls recorded from
+  the port: [split-checkpoint lookups fail silently](/docs/knowledge/pitfalls/split-checkpoint-silent-empty-load.md)
+  — the VAE encoder was read from the transformer file, matched zero keys, kept
+  its random initialisation and encoded every conditioning image to noise, while
+  the run still produced coherent video of the wrong car — and
+  [the LTX Gemma head is vestigial](/docs/knowledge/pitfalls/ltx-gemma-head-is-vestigial.md)
+  — greedy decoding emits single capital letters on any prompt because the
+  encoder fine-tune let the final-norm scale drift 2.5x above stock, saturating
+  the logit softcap; norm statistics compared against
+  mlx-community/gemma-4-e4b-it-4bit confirm the conventions match.
+
 * **Creation**: [What LTX-2.5 actually changes](/docs/knowledge/investigations/ltx-2.5-checkpoint-diff-2026-08.md)
   — every 2.5 component's safetensors header read by HTTP range request and
   diffed against 2.3. The DiT differs by two config keys (`ff_bias: false`,
