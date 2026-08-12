@@ -121,7 +121,8 @@ class LTX2TransformerBlock: Module {
         ropeType: LTXRopeType = .split,
         normEps: Float = 1e-6,
         gatedAttention: Bool = false,
-        crossAttentionAdaLN: Bool = false
+        crossAttentionAdaLN: Bool = false,
+        ffBias: Bool = true
     ) {
         self.normEps = normEps
         self.videoDim = videoDim
@@ -144,7 +145,7 @@ class LTX2TransformerBlock: Module {
             gatedAttention: gatedAttention
         )
         self._norm3.wrappedValue = RMSNorm(dims: videoDim, eps: normEps)
-        self._ff.wrappedValue = LTXFeedForward(dim: videoDim, dimOut: videoDim)
+        self._ff.wrappedValue = LTXFeedForward(dim: videoDim, dimOut: videoDim, bias: ffBias)
         self._scaleShiftTable.wrappedValue = MLXArray.zeros([numSSTValues, videoDim])
 
         // --- Audio ---
@@ -163,7 +164,7 @@ class LTX2TransformerBlock: Module {
             gatedAttention: gatedAttention
         )
         self._audioNorm3.wrappedValue = RMSNorm(dims: audioDim, eps: normEps)
-        self._audioFf.wrappedValue = LTXFeedForward(dim: audioDim, dimOut: audioDim)
+        self._audioFf.wrappedValue = LTXFeedForward(dim: audioDim, dimOut: audioDim, bias: ffBias)
         self._audioScaleShiftTable.wrappedValue = MLXArray.zeros([numSSTValues, audioDim])
 
         // --- Cross-modal ---

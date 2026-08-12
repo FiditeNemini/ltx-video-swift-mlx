@@ -139,7 +139,8 @@ class LTX2Transformer: Module {
                 ropeType: ropeType,
                 normEps: config.normEps,
                 gatedAttention: gated,
-                crossAttentionAdaLN: crossAttnAdaLN
+                crossAttentionAdaLN: crossAttnAdaLN,
+                ffBias: config.ffBias
             )
         }
     }

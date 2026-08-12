@@ -328,6 +328,10 @@ public actor LTXPipeline {
         overridePath: String? = nil,
         progressCallback: DownloadProgressCallback? = nil
     ) async throws -> String {
+        // Fail here rather than after a 40 GB download or with a wall of unmatched
+        // weight keys: catalogued-but-unimplemented variants have no runnable path.
+        try model.validateRunnable()
+
         if let overridePath {
             unifiedWeightsPathCache.store(overridePath, for: model)
             return overridePath

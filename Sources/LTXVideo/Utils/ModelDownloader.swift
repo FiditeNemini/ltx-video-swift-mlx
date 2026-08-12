@@ -162,13 +162,53 @@ public actor ModelDownloader {
 
         let (tempURL, response) = try await session.download(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
+        guard let httpResponse = response as? HTTPURLResponse else {
             throw LTXError.downloadFailed("Failed to download \(filename)")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw Self.downloadError(
+                statusCode: httpResponse.statusCode,
+                repoId: repoId,
+                filename: filename,
+                hasToken: hfToken != nil)
         }
 
         // Move to destination
         try FileManager.default.moveItem(at: tempURL, to: destination)
+    }
+
+    /// Turn an HTTP failure into an actionable error.
+    ///
+    /// Gated repositories (every LTX-2.5 repo, and the IC-LoRA repos) answer 401
+    /// without a token and 403 when the token's account has not accepted the
+    /// licence. Both used to surface as a bare "Failed to download", which gives
+    /// the user nothing to act on.
+    private static func downloadError(
+        statusCode: Int,
+        repoId: String,
+        filename: String,
+        hasToken: Bool
+    ) -> LTXError {
+        let repoURL = "https://huggingface.co/\(repoId)"
+        switch statusCode {
+        case 401:
+            return .downloadFailed(
+                "\(repoId) requires authentication (HTTP 401). Accept the licence at \(repoURL), "
+                + "then provide a token via --hf-token, $HF_TOKEN, or `huggingface-cli login`.")
+        case 403:
+            let detail = hasToken
+                ? "the token's HuggingFace account has not accepted the licence"
+                : "no HuggingFace token was found"
+            return .downloadFailed(
+                "Access to \(repoId) is gated (HTTP 403) — \(detail). "
+                + "Click \"Agree and Access\" at \(repoURL), then retry.")
+        case 404:
+            return .downloadFailed(
+                "\(filename) was not found in \(repoId) (HTTP 404). The file may have been "
+                + "renamed or superseded upstream — check \(repoURL)/tree/main.")
+        default:
+            return .downloadFailed("Failed to download \(filename) from \(repoId) (HTTP \(statusCode))")
+        }
     }
 
     // MARK: - Per-Component Downloads
@@ -320,7 +360,9 @@ public actor ModelDownloader {
         let repoId = model.huggingFaceRepo
         let filename = model.unifiedWeightsFilename
         let localDir = componentCacheDir(model: model)
-        let destination = localDir.appendingPathComponent(filename)
+        // Split checkpoints (LTX-2.5) address files by repo-relative path; the cache
+        // stores them flat under the variant's directory.
+        let destination = localDir.appendingPathComponent((filename as NSString).lastPathComponent)
 
         if FileManager.default.fileExists(atPath: destination.path) {
             progress?(DownloadProgress(progress: 1.0, message: "Unified weights already downloaded"))
@@ -484,96 +526,113 @@ public actor ModelDownloader {
 
     // MARK: - Upscaler & LoRA Downloads
 
+    /// Filenames that a given auxiliary model has shipped under, newest first.
+    ///
+    /// Upstream renames files in place (the LipDub IC-LoRA became Dub-It, the x2
+    /// spatial upscaler went 1.0 → 1.1 and the old revision was withdrawn), so a
+    /// cache populated by an earlier release holds a name the catalog no longer
+    /// knows. Downloads always use `filePath`; cache lookups accept any known name.
+    private static func knownFilenames(for aux: LTXAuxiliaryModel) -> [String] {
+        switch aux {
+        case .spatialUpscalerX2_23:
+            return [aux.filename, "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"]
+        case .dubItLoRA_23:
+            return [aux.filename, "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"]
+        default:
+            return [aux.filename]
+        }
+    }
+
+    /// Local path of an already-downloaded auxiliary model, if any.
+    public func cachedPath(for aux: LTXAuxiliaryModel) -> URL? {
+        let dir = cacheDirectory.appendingPathComponent(aux.cacheDirectoryName)
+        for name in Self.knownFilenames(for: aux) {
+            let candidate = dir.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// Download an auxiliary model (upscaler, LoRA, model patch) described by the catalog.
+    ///
+    /// Gated artefacts require a token whose HuggingFace account accepted the licence
+    /// on `aux.huggingFaceURL`; a missing or unauthorised token surfaces as a
+    /// descriptive `LTXError.downloadFailed` rather than a bare failure.
+    public func downloadAuxiliaryModel(
+        _ aux: LTXAuxiliaryModel,
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> URL {
+        if let cached = cachedPath(for: aux) {
+            progress?(DownloadProgress(progress: 1.0, message: "\(aux.displayName) already downloaded"))
+            return cached
+        }
+
+        let destination = cacheDirectory
+            .appendingPathComponent(aux.cacheDirectoryName)
+            .appendingPathComponent(aux.filename)
+
+        progress?(DownloadProgress(
+            progress: 0.1,
+            currentFile: aux.filename,
+            message: "Downloading \(aux.displayName)..."))
+        try await downloadFile(repoId: aux.huggingFaceRepo, filename: aux.filePath, to: destination)
+        progress?(DownloadProgress(progress: 1.0, message: "\(aux.displayName) download complete"))
+        return destination
+    }
+
+    /// Whether an auxiliary model is present in the cache.
+    public func isDownloaded(_ aux: LTXAuxiliaryModel) -> Bool {
+        cachedPath(for: aux) != nil
+    }
+
     /// Spatial upscaler filename on HuggingFace (LTX-2.3 x2 upscaler)
-    public static let spatialUpscalerFilename = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+    public static var spatialUpscalerFilename: String { LTXAuxiliaryModel.spatialUpscalerX2_23.filename }
 
     /// Distilled LoRA filename on HuggingFace
-    public static let distilledLoRAFilename = "ltx-2.3-22b-distilled-lora-384.safetensors"
+    public static var distilledLoRAFilename: String { LTXAuxiliaryModel.distilledLoRA_23.filename }
 
     /// Download spatial upscaler weights
     public func downloadUpscalerWeights(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
-        let repoId = "Lightricks/LTX-2.3"
-        let filename = Self.spatialUpscalerFilename
-
-        let weightsDir = cacheDirectory.appendingPathComponent("ltx-upscaler")
-        let destination = weightsDir.appendingPathComponent(filename)
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            progress?(DownloadProgress(progress: 1.0, message: "Upscaler weights already downloaded"))
-            return destination
-        }
-
-        progress?(DownloadProgress(progress: 0.1, message: "Downloading spatial upscaler weights..."))
-        try await downloadFile(repoId: repoId, filename: filename, to: destination)
-        progress?(DownloadProgress(progress: 1.0, message: "Upscaler download complete"))
-        return destination
+        try await downloadAuxiliaryModel(.spatialUpscalerX2_23, progress: progress)
     }
 
     /// Check if spatial upscaler weights are downloaded
     public func isUpscalerDownloaded() -> Bool {
-        let destination = cacheDirectory.appendingPathComponent("ltx-upscaler/\(Self.spatialUpscalerFilename)")
-        return FileManager.default.fileExists(atPath: destination.path)
+        isDownloaded(.spatialUpscalerX2_23)
     }
 
     /// Download distilled LoRA weights
     public func downloadDistilledLoRA(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
-        let repoId = "Lightricks/LTX-2.3"
-        let filename = Self.distilledLoRAFilename
-
-        let weightsDir = cacheDirectory.appendingPathComponent("ltx-lora")
-        let destination = weightsDir.appendingPathComponent(filename)
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            progress?(DownloadProgress(progress: 1.0, message: "Distilled LoRA already downloaded"))
-            return destination
-        }
-
-        progress?(DownloadProgress(progress: 0.1, message: "Downloading distilled LoRA weights..."))
-        try await downloadFile(repoId: repoId, filename: filename, to: destination)
-        progress?(DownloadProgress(progress: 1.0, message: "Distilled LoRA download complete"))
-        return destination
+        try await downloadAuxiliaryModel(.distilledLoRA_23, progress: progress)
     }
 
     /// Check if distilled LoRA weights are downloaded
     public func isDistilledLoRADownloaded() -> Bool {
-        let destination = cacheDirectory.appendingPathComponent("ltx-lora/\(Self.distilledLoRAFilename)")
-        return FileManager.default.fileExists(atPath: destination.path)
+        isDownloaded(.distilledLoRA_23)
     }
 
-    /// LipDub IC-LoRA filename on HuggingFace
-    public static let lipDubLoRAFilename = "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+    /// Dub-It (formerly LipDub) IC-LoRA filename on HuggingFace
+    public static var lipDubLoRAFilename: String { LTXAuxiliaryModel.dubItLoRA_23.filename }
 
-    /// Download the LipDub IC-LoRA from `Lightricks/LTX-2.3-22b-IC-LoRA-LipDub`.
+    /// Download the Dub-It IC-LoRA from `Lightricks/LTX-2.3-22b-IC-LoRA-DubIt`
+    /// (published as "LipDub" until August 2026).
     /// Repo is gated; the user must have accepted the license on HF and provided
     /// `hfToken` at downloader construction time.
     public func downloadLipDubLoRA(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
-        let repoId = "Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
-        let filename = Self.lipDubLoRAFilename
-
-        let weightsDir = cacheDirectory.appendingPathComponent("ltx-lora-lipdub")
-        let destination = weightsDir.appendingPathComponent(filename)
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            progress?(DownloadProgress(progress: 1.0, message: "LipDub IC-LoRA already downloaded"))
-            return destination
-        }
-
-        progress?(DownloadProgress(progress: 0.1, message: "Downloading LipDub IC-LoRA weights..."))
-        try await downloadFile(repoId: repoId, filename: filename, to: destination)
-        progress?(DownloadProgress(progress: 1.0, message: "LipDub IC-LoRA download complete"))
-        return destination
+        try await downloadAuxiliaryModel(.dubItLoRA_23, progress: progress)
     }
 
-    /// Check if LipDub IC-LoRA weights are downloaded
+    /// Check if Dub-It / LipDub IC-LoRA weights are downloaded
     public func isLipDubLoRADownloaded() -> Bool {
-        let destination = cacheDirectory.appendingPathComponent("ltx-lora-lipdub/\(Self.lipDubLoRAFilename)")
-        return FileManager.default.fileExists(atPath: destination.path)
+        isDownloaded(.dubItLoRA_23)
     }
 
     /// Clear downloaded models

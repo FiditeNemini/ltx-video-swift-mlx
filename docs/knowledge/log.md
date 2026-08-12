@@ -1,5 +1,18 @@
 # Directory Update Log
 
+## 2026-08-12
+
+* **Creation**: [What LTX-2.5 actually changes](/docs/knowledge/investigations/ltx-2.5-checkpoint-diff-2026-08.md)
+  — every 2.5 component's safetensors header read by HTTP range request and
+  diffed against 2.3. The DiT differs by two config keys (`ff_bias: false`,
+  `use_keyframes_abs_pos_embedding: true`), 96 dropped FFN biases and one new
+  `[1, 4096]` marker; the conv video VAE, the audio VAE + vocoder and the
+  latent spatial upscaler are tensor-for-tensor identical; the sigma schedules
+  are unchanged. The port cost is the `gemma4-12b-ltx-v1` text encoder, which
+  exists only inside the 26 GB LTX file. Also records two dead download URLs
+  found live (LipDub → DubIt rename, spatial upscaler 1.0 withdrawn) and the
+  new `reference_spatial_scale_factor` IC-LoRA metadata key.
+
 ## 2026-07-27
 
 * **Update**: Voxtral closed out the custom-voice loose ends, and two of their

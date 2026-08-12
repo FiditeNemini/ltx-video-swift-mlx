@@ -34,9 +34,11 @@ struct LTXModelTests {
 
     @Test func testCaseIterable() {
         let allCases = LTXModel.allCases
-        #expect(allCases.count == 2)
+        #expect(allCases.count == 4)
         #expect(allCases.contains(.distilled))
         #expect(allCases.contains(.dev))
+        #expect(allCases.contains(.v25Distilled))
+        #expect(allCases.contains(.v25Dev))
     }
 
     @Test func testDevProperties() {
@@ -48,6 +50,82 @@ struct LTXModelTests {
         #expect(model.huggingFaceRepo == "Lightricks/LTX-2.3")
         #expect(model.unifiedWeightsFilename == "ltx-2.3-22b-dev.safetensors")
         #expect(model.transformerConfig.gatedAttention == true)
+    }
+}
+
+// MARK: - Catalog / licensing Tests
+
+@Suite("LTXModelCatalog")
+struct LTXModelCatalogTests {
+    @Test func testFamilyAndGating() {
+        #expect(LTXModel.distilled.family == .ltx23)
+        #expect(LTXModel.v25Dev.family == .ltx25)
+        // LTX-2.3 is an open repo; every LTX-2.5 repo requires accepting the licence.
+        #expect(LTXModel.distilled.isGated == false)
+        #expect(LTXModel.v25Distilled.isGated == true)
+        #expect(LTXModel.v25Distilled.huggingFaceRepo == "Lightricks/LTX-2.5")
+    }
+
+    @Test func testLicenseIsSharedAcrossGenerations() {
+        for model in LTXModel.allCases {
+            #expect(model.licenseInfo == .ltx2Community)
+            #expect(model.isCommercialUseAllowed == true)
+            #expect(model.licenseURL.hasPrefix("https://"))
+        }
+    }
+
+    @Test func testSupportStatus() {
+        #expect(LTXModel.distilled.support == .supported)
+        #expect(LTXModel.dev.support.isRunnable)
+        #expect(LTXModel.v25Distilled.support.isRunnable == false)
+        #expect(throws: LTXError.self) { try LTXModel.v25Distilled.validateRunnable() }
+        #expect(throws: Never.self) { try LTXModel.distilled.validateRunnable() }
+    }
+
+    @Test func testTextEncoderRequirement() {
+        #expect(LTXModel.distilled.textEncoder == .gemma3_12b)
+        #expect(LTXModel.distilled.textEncoder.externalRepo == "mlx-community/gemma-3-12b-it-qat-4bit")
+        // LTX-2.5 bundles its Gemma 4 derivative inside the checkpoint.
+        #expect(LTXModel.v25Dev.textEncoder == .gemma4_12bLTX)
+        #expect(LTXModel.v25Dev.textEncoder.externalRepo == nil)
+    }
+
+    @Test func testWeightsLayoutAndComponents() {
+        #expect(LTXModel.distilled.weightsLayout == .unified)
+        #expect(LTXModel.distilled.componentFiles.count == 1)
+
+        #expect(LTXModel.v25Distilled.weightsLayout == .split)
+        let kinds = LTXModel.v25Distilled.componentFiles.map(\.kind)
+        #expect(kinds.contains(.transformer))
+        #expect(kinds.contains(.textEncoder))
+        #expect(kinds.contains(.videoVAE))
+        #expect(kinds.contains(.audioVAE))
+        #expect(kinds.contains(.durationHead))
+    }
+
+    @Test func testAuxiliaryModelMetadata() {
+        // Renamed upstream in August 2026 — the old repo/filename 404s.
+        #expect(LTXAuxiliaryModel.dubItLoRA_23.huggingFaceRepo == "Lightricks/LTX-2.3-22b-IC-LoRA-DubIt")
+        #expect(LTXAuxiliaryModel.dubItLoRA_23.filename == "ltx-2.3-22b-ic-lora-dubit-0.9.safetensors")
+        // 1.0 was withdrawn from the repo; only 1.1 resolves.
+        #expect(LTXAuxiliaryModel.spatialUpscalerX2_23.filename == "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
+        // IC-LoRA repos are gated even where the base checkpoint repo is open.
+        #expect(LTXAuxiliaryModel.spatialUpscalerX2_23.gating == .open)
+        #expect(LTXAuxiliaryModel.dubItLoRA_23.gating == .licenseAcceptanceRequired)
+        #expect(LTXAuxiliaryModel.pixelSpatialUpscalerX2_25.gating == .licenseAcceptanceRequired)
+        #expect(LTXAuxiliaryModel.pixelSpatialUpscalerX2_25.family == .ltx25)
+    }
+
+    @Test func testFeedForwardBiasTracksCheckpoint() {
+        // 2.3 ships ff.net.{0.proj,2}.bias for every block; 2.5 sets ff_bias: false.
+        #expect(LTXTransformerConfig.ltx23.ffBias == true)
+        #expect(LTXTransformerConfig.ltx25.ffBias == false)
+        #expect(LTXTransformerConfig.ltx25.keyframesAbsPosEmbedding == true)
+        // Everything else is identical between the two generations.
+        #expect(LTXTransformerConfig.ltx25.numLayers == LTXTransformerConfig.ltx23.numLayers)
+        #expect(LTXTransformerConfig.ltx25.innerDim == LTXTransformerConfig.ltx23.innerDim)
+        #expect(LTXTransformerConfig.ltx25.maxPos == LTXTransformerConfig.ltx23.maxPos)
+        #expect(LTXTransformerConfig.ltx25.captionChannels == LTXTransformerConfig.ltx23.captionChannels)
     }
 }
 

@@ -45,6 +45,7 @@ or re-litigated.
 
 # Investigations
 
+* [What LTX-2.5 actually changes (August 2026)](investigations/ltx-2.5-checkpoint-diff-2026-08.md) - tensor-level diff against 2.3: the DiT moves by two flags, the VAEs and upscaler are unchanged, the cost is the Gemma 4 encoder
 * [Cross-modal AdaLN sigma swap (May 2026)](investigations/crossmodal-adaln-sigma-swap-2026-05.md) - the LipDub mouth-modulation root cause, two expensively-refuted hypotheses, and the audio-anchored vs pose-anchored trade-off
 * [LipDub segmentation campaign (July 2026)](investigations/lipdub-segmentation-asks-2026-07.md) - what unit tests, the in-process E2E, the code review and real reruns each caught that the others missed
 * [Custom-voice timbre chain (July 2026)](investigations/custom-voice-timbre-chain-2026-07.md) - attributing a bad custom-voice LipDub across Voxtral enrollment and LTX; the decoder was innocent

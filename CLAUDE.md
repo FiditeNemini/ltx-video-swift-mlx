@@ -44,10 +44,17 @@ MLX products used: `MLX`, `MLXNN`, `MLXRandom`, `Transformers`
 
 **Resolution**: Must be divisible by 32. Recommended: 512x512, 768x512, 512x768, 832x480, 1024x576
 
-**Model variants** (from HuggingFace Acelogic):
-- `distilledFP8` (~12GB RAM) - Fastest, FP8 quantized
-- `distilled` (~16GB RAM) - Balanced
-- `dev` (~25GB RAM) - Full quality
+**Model variants** — see `ltx-video models`, backed by `LTXModelCatalog.swift`:
+- `distilled` / `dev` (LTX-2.3, ~46 GB, open repo, Gemma 3 encoder) — runnable
+- `2.5-distilled` / `2.5-dev` (LTX-2.5, ~70 GB, **gated** repo, Gemma 4 encoder) —
+  catalogued only; `validateRunnable()` refuses them until the Gemma 4 text
+  encoder lands. What 2.5 changes is measured in
+  [docs/knowledge](docs/knowledge/investigations/ltx-2.5-checkpoint-diff-2026-08.md).
+
+Every checkpoint and auxiliary model (upscalers, LoRAs) carries its licence,
+gating and HuggingFace URL in the catalog. Gated repos need the licence
+accepted on the model page plus a token (`--hf-token`, `$HF_TOKEN`, or
+`~/.cache/huggingface/token`).
 
 ## Engineering Knowledge Base
 
