@@ -101,6 +101,28 @@ Latent stride is 8 — two keyframes within the same 8-pixel-frame group
 See [docs/examples/keyframe-interpolation/](docs/examples/keyframe-interpolation/)
 for validated end-to-end examples and timings.
 
+### Generative upscaling (LTX-2.5)
+
+The `upscale` command re-renders a finished clip at 2x through the pixel spatial
+upscaler IC-LoRA. This is not the latent upscaler `generate` already runs between
+its two stages: that one refines inside the diffusion loop, this one takes a
+low-resolution clip as a reference and **synthesises** detail that was never in
+the source.
+
+```bash
+ltx-video upscale "A red vintage car on a gravel driveway, cinematic daylight" \
+    --input lowres_384x256.mp4 \
+    --width 768 --height 512 --frames 121 \
+    --model 2.5-distilled \
+    -o upscaled.mp4
+```
+
+The scale factor is not an option — it comes from the adapter's
+`reference_downscale_factor` metadata, and an output size that does not divide by
+it is refused rather than asking the model for a mapping it never learned. The
+reference must cover the same shot, duration and framing as the target: this is
+not a reframing model.
+
 ### LoRA
 
 ```bash
@@ -114,6 +136,13 @@ ltx-video generate "arc shot, camera orbiting the subject, a red car on a road" 
 ltx-video generate "arc shot, camera orbiting the subject" \
     --lora /path/to/lora.safetensors --lora-scale 0.5
 ```
+
+> **2.3 adapters on a 2.5 checkpoint.** Every module this repo's LoRAs target
+> exists in the LTX-2.5 transformer (verified: LipDub 1344 modules, the camera
+> LoRAs 384 each, none missing), so they fuse and run — `lipdub --model
+> 2.5-distilled` included. The pipeline prints a notice when an adapter declares
+> a different generation, because what cannot be checked statically is
+> behaviour: 2.5's block FFNs are bias-free where 2.3's were not.
 
 ### Retake (Video-to-Video)
 
