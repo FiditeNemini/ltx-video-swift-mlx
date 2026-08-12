@@ -2,6 +2,15 @@
 
 ## 2026-08-12
 
+* **Creation**: [LipDub overwrites anything crossing the mouth](/docs/knowledge/pitfalls/lipdub-overwrites-objects-crossing-the-mouth.md)
+  — the IC-LoRA repaints the mouth region without modelling occlusion, so a
+  headset band, hand or microphone in front of the lips is painted over.
+  Demonstrated on the repo's own teaser (frames 52–64), which predates the
+  vocoder work, so it is a property of the method rather than a regression. Also
+  records the attribution lesson: colour and occlusion differences between two
+  LipDub outputs were both blamed on a vocoder that only runs after video
+  decoding.
+
 * **Update**: The audio decode stage was running the wrong vocoder — recorded in
   [the vocoder pitfall](/docs/knowledge/pitfalls/wrong-vocoder-lost-the-top-octave.md).
   LTX-2.3 and LTX-2.5 bundle a BigVGAN v2 + bandwidth-extension pair (667+557
