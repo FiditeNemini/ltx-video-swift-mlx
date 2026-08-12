@@ -11,30 +11,50 @@ extension LTXPipeline {
     /// This is the shape LTX's pixel spatial upscaler takes: the reference is the
     /// low-resolution clip, the output is a re-render at `referenceDownscaleFactor`
     /// times its linear resolution, with fine detail **synthesised** rather than
-    /// interpolated. Composition, motion and identity carry over from the
-    /// reference; texture and micro-contrast are invented.
+    /// interpolated.
     ///
-    /// The scale factor is not a parameter: it is read from the adapter's
-    /// safetensors metadata (`reference_downscale_factor`), which is how the
-    /// reference implementation derives it too. Passing a mismatched output size
-    /// would silently ask the model for a mapping it was never trained on.
+    /// ## Two stages, and why that matters
     ///
-    /// Unlike `generateLipDub`, this path is video-only — no audio reference, no
-    /// dialogue prompt — so it runs on the single-stream transformer.
+    /// The adapter alone does not produce the output resolution. Following
+    /// `ic_lora.py`, a run is:
+    ///
+    /// 1. a full 8-step denoise **at the reference's own resolution**, with the
+    ///    reference appended in context;
+    /// 2. the *latent* spatial upscaler applied to that result;
+    /// 3. a 3-step refinement at the target resolution, starting from the upscaled
+    ///    latent re-noised to σ ≈ 0.91 — **not** from pure noise.
+    ///
+    /// The two upscalers are links in one chain rather than competing options: the
+    /// latent one carries geometry across resolutions, the IC-LoRA supplies detail.
+    /// Denoising the target resolution from pure noise instead leaves composition
+    /// pinned only by the appended tokens, which lets pose and texture wander even
+    /// when the framing survives.
+    ///
+    /// The scale factor is read from the adapter's `reference_downscale_factor`
+    /// metadata rather than taken as a parameter, matching how the reference
+    /// implementation derives it.
     ///
     /// - Parameters:
     ///   - prompt: describes the scene. The upscaler still conditions on text.
     ///   - referenceVideoPath: the low-resolution clip.
     ///   - loraPath: the IC-LoRA. Fused for the run and unfused afterwards.
+    ///   - upscalerWeightsPath: the *latent* spatial upscaler for this generation.
     ///   - config: target geometry. `width`/`height` are the **output** size.
     ///   - loraScale: adapter strength; these weights ship pre-scaled for 1.0.
+    ///   - stageOneOutputPath: when set, the stage-1 result is written there at
+    ///     reference resolution — what the adapter produced before the upscale, the
+    ///     equivalent of the reference implementation's `--skip-stage-2`. Written
+    ///     here rather than handed back through a callback because `MLXArray` is
+    ///     not `Sendable` and this pipeline is an actor.
     public func generateWithVideoReference(
         prompt: String,
         referenceVideoPath: String,
         loraPath: String,
+        upscalerWeightsPath: String,
         config: LTXVideoGenerationConfig,
         loraScale: Float = 1.0,
-        onProgress: (@Sendable (GenerationProgress) -> Void)? = nil
+        onProgress: (@Sendable (GenerationProgress) -> Void)? = nil,
+        stageOneOutputPath: String? = nil
     ) async throws -> VideoGenerationResult {
         let startTime = Date()
         try config.validate()
@@ -46,8 +66,7 @@ extension LTXPipeline {
         // latent one here would fuse zero layers and silently produce a plain
         // text-to-video generation at the target size — plausible output, wrong
         // operation. Cheaper to refuse it by inspecting the file.
-        let adapterKeys = try LoRALoader.load(from: loraPath).layers
-        guard !adapterKeys.isEmpty else {
+        guard try !LoRALoader.load(from: loraPath).layers.isEmpty else {
             throw LTXError.invalidLoRA(
                 "\((loraPath as NSString).lastPathComponent) carries no LoRA layers. The *latent* "
                 + "spatial upscaler is a standalone conv model used between generation stages; "
@@ -70,69 +89,120 @@ extension LTXPipeline {
         let beacon = RuntimeBeacon.begin(task: "ic-lora-video", model: model.rawValue)
         defer { beacon?.end() }
 
-        // 1. Encode the reference at its own, smaller geometry.
         LTXDebug.log("[ic-lora] reference \(referenceWidth)x\(referenceHeight) → output "
             + "\(config.width)x\(config.height) (x\(downscaleFactor)), \(config.numFrames) frames")
         let referenceLatent = try await encodeVideo(
             path: referenceVideoPath,
             width: referenceWidth, height: referenceHeight, numFrames: config.numFrames)
 
-        // 2. Text conditioning.
         let encoded = try await encodeText(prompt)
         unloadGemmaIfConfigured()
 
-        // 3. Fuse the adapter for this run only. Fusion is destructive, so the
-        //    unfuse is deferred rather than left to the caller.
+        // Fuse the adapter for this run only. Fusion is destructive, so the unfuse
+        // is deferred rather than left to the caller.
         let fusedLayers = try fuseLoRA(from: loraPath, scale: loraScale)
         defer { unfuseLoRA() }
         LTXDebug.log("[ic-lora] fused \(fusedLayers) layer-pairs at scale \(loraScale)")
 
-        // 4. Denoise at the output geometry with the reference appended in context.
-        let targetShape = VideoLatentShape.fromPixelDimensions(
-            batch: 1, channels: 128,
-            frames: config.numFrames, height: config.height, width: config.width)
         guard let transformerConfig = (transformer?.config ?? ltx2Transformer?.config) else {
             throw LTXError.modelNotLoaded("Transformer not loaded")
         }
-        let referenceContext = buildVideoReference(
+        guard let decoder = vaeDecoder else {
+            throw LTXError.modelNotLoaded("VAE decoder not loaded")
+        }
+
+        // ---- Stage 1: denoise at the reference's own resolution ----
+        let stage1Shape = VideoLatentShape.fromPixelDimensions(
+            batch: 1, channels: 128,
+            frames: config.numFrames, height: referenceHeight, width: referenceWidth)
+        let stage1Reference = buildVideoReference(
             referenceLatent: referenceLatent,
-            targetShape: targetShape,
-            downscaleFactor: downscaleFactor,
+            targetShape: stage1Shape,
+            downscaleFactor: 1,          // reference and stage 1 share a resolution
             hasAudio: false,
             refConfig: transformerConfig)
-        LTXDebug.log("[ic-lora] reference tokens=\(referenceContext.guideCount) "
-            + "target tokens=\(referenceContext.originalCount)")
 
-        let sigmas = DISTILLED_SIGMA_VALUES
-        let steps = sigmas.count - 1
-        var latent = generateNoise(shape: targetShape, seed: config.seed)
+        let stage1Sigmas = DISTILLED_SIGMA_VALUES
+        let stage2Sigmas = STAGE_2_DISTILLED_SIGMA_VALUES
+        let totalSteps = (stage1Sigmas.count - 1) + (stage2Sigmas.count - 1)
+
+        var latent = generateNoise(shape: stage1Shape, seed: config.seed)
         MLX.eval(latent)
 
-        for step in 0 ..< steps {
-            let sigma = sigmas[step]
+        for step in 0 ..< (stage1Sigmas.count - 1) {
+            let sigma = stage1Sigmas[step]
             onProgress?(GenerationProgress(
-                currentStep: step, totalSteps: steps, sigma: sigma, phase: .denoising))
+                currentStep: step, totalSteps: totalSteps, sigma: sigma, phase: .denoising))
             let velocity = runDenoiseStep(
-                sigma: sigma,
-                videoLatent: latent,
-                audioLatentPacked: nil,
-                shape: targetShape,
-                videoAppendCtx: referenceContext,
-                audioRefCtx: nil,
+                sigma: sigma, videoLatent: latent, audioLatentPacked: nil,
+                shape: stage1Shape, videoAppendCtx: stage1Reference, audioRefCtx: nil,
                 audioNumFrames: 0,
                 videoTextEmbeddings: encoded.embeddings,
                 audioTextEmbeddings: encoded.embeddings,
                 textMask: encoded.mask)
-            latent = latent + MLXArray(sigmas[step + 1] - sigma) * velocity.video
+            latent = latent + MLXArray(stage1Sigmas[step + 1] - sigma) * velocity.video
             MLX.eval(latent)
         }
 
-        // 5. Decode.
-        onProgress?(GenerationProgress(
-            currentStep: steps, totalSteps: steps, sigma: 0, phase: .decoding))
-        guard let decoder = vaeDecoder else {
-            throw LTXError.modelNotLoaded("VAE decoder not loaded")
+        if let stageOneOutputPath {
+            let stage1Frames = decodeVideo(
+                latent: latent, decoder: decoder, timestep: nil,
+                temporalTileSize: memoryOptimization.vaeTemporalTileSize,
+                temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap)
+            MLX.eval(stage1Frames)
+            _ = try await VideoExporter.exportVideo(
+                frames: stage1Frames, width: referenceWidth, height: referenceHeight,
+                fps: 24, to: URL(fileURLWithPath: stageOneOutputPath))
+            LTXDebug.log("[ic-lora] stage 1 written to \(stageOneOutputPath)")
         }
+
+        // ---- Latent upscale between the stages ----
+        onProgress?(GenerationProgress(
+            currentStep: stage1Sigmas.count - 1, totalSteps: totalSteps,
+            sigma: 0, phase: .upscaling))
+        let upscaler = try loadSpatialUpscaler(from: upscalerWeightsPath)
+        let mean5d = decoder.meanOfMeans.reshaped([1, -1, 1, 1, 1])
+        let std5d = decoder.stdOfMeans.reshaped([1, -1, 1, 1, 1])
+        latent = (upscaler(latent * std5d + mean5d) - mean5d) / std5d
+        MLX.eval(latent)
+        LTXDebug.log("[ic-lora] upscaled latent \(latent.shape)")
+
+        // ---- Stage 2: refine at the target resolution from the upscaled latent ----
+        let stage2Shape = VideoLatentShape.fromPixelDimensions(
+            batch: 1, channels: 128,
+            frames: config.numFrames, height: config.height, width: config.width)
+        let stage2Reference = buildVideoReference(
+            referenceLatent: referenceLatent,
+            targetShape: stage2Shape,
+            downscaleFactor: downscaleFactor,
+            hasAudio: false,
+            refConfig: transformerConfig)
+
+        // Re-noise rather than restart: the upscaled latent already carries the
+        // composition, and stage 2 only has to add detail at the higher rate.
+        let noiseScale = stage2Sigmas[0]
+        latent = MLXArray(noiseScale) * generateNoise(shape: stage2Shape, seed: config.seed)
+            + MLXArray(1.0 - noiseScale) * latent
+        MLX.eval(latent)
+
+        for step in 0 ..< (stage2Sigmas.count - 1) {
+            let sigma = stage2Sigmas[step]
+            onProgress?(GenerationProgress(
+                currentStep: stage1Sigmas.count - 1 + step, totalSteps: totalSteps,
+                sigma: sigma, phase: .refinement))
+            let velocity = runDenoiseStep(
+                sigma: sigma, videoLatent: latent, audioLatentPacked: nil,
+                shape: stage2Shape, videoAppendCtx: stage2Reference, audioRefCtx: nil,
+                audioNumFrames: 0,
+                videoTextEmbeddings: encoded.embeddings,
+                audioTextEmbeddings: encoded.embeddings,
+                textMask: encoded.mask)
+            latent = latent + MLXArray(stage2Sigmas[step + 1] - sigma) * velocity.video
+            MLX.eval(latent)
+        }
+
+        onProgress?(GenerationProgress(
+            currentStep: totalSteps, totalSteps: totalSteps, sigma: 0, phase: .decoding))
         let frames = decodeVideo(
             latent: latent, decoder: decoder, timestep: nil,
             temporalTileSize: memoryOptimization.vaeTemporalTileSize,

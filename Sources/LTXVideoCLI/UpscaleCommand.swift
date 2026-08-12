@@ -58,6 +58,9 @@ struct Upscale: AsyncParsableCommand {
     @Option(name: .long, help: "Video bitrate in kbps")
     var bitrate: Int?
 
+    @Option(name: .long, help: "Also write the stage-1 result, before the latent upscale — what the adapter produced at reference resolution")
+    var stageOne: String?
+
     @Flag(name: .long, help: "Enable debug output")
     var debug: Bool = false
 
@@ -111,17 +114,27 @@ struct Upscale: AsyncParsableCommand {
         let config = LTXVideoGenerationConfig(
             width: width, height: height, numFrames: frames, numSteps: 8, seed: seed)
 
+        // The latent upscaler carries geometry between the stages; the IC-LoRA
+        // supplies detail. Both are needed.
+        print("Fetching the latent upscaler...")
+        let latentUpscalerPath = try await pipeline.downloadUpscalerWeights()
+
+
         let start = Date()
         let result = try await pipeline.generateWithVideoReference(
             prompt: prompt,
             referenceVideoPath: input,
             loraPath: adapterPath,
+            upscalerWeightsPath: latentUpscalerPath,
             config: config,
-            loraScale: loraScale
-        ) { progress in
-            print("  Step \(progress.currentStep + 1)/\(progress.totalSteps) [\(progress.phase)]")
-            fflush(stdout)
-        }
+            loraScale: loraScale,
+            onProgress: { progress in
+                print("  Step \(progress.currentStep + 1)/\(progress.totalSteps) [\(progress.phase)]")
+                fflush(stdout)
+            },
+            stageOneOutputPath: stageOne)
+
+        if let stageOne { print("Stage 1 (before upscale): \(stageOne)") }
         print("Upscaled in \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
 
         var exportConfig = VideoExportConfig.default
