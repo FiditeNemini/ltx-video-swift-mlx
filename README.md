@@ -1,6 +1,6 @@
 # LTX-Video-Swift-MLX
 
-Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video generation, optimized for Apple Silicon using [MLX](https://github.com/ml-explore/mlx-swift). Runs entirely on-device.
+Swift implementation of [LTX-2](https://github.com/Lightricks/LTX-2) video generation — **LTX-2.3 and LTX-2.5** — optimized for Apple Silicon using [MLX](https://github.com/ml-explore/mlx-swift). Runs entirely on-device.
 
 ## Features
 
@@ -13,6 +13,9 @@ Swift implementation of [LTX-2.3](https://github.com/Lightricks/LTX-2) video gen
 | LoRA inference | **Done** | Fuse any LTX-2.3 compatible LoRA |
 | LoRA training (QLoRA) | **Beta** | Fine-tune 22B transformer on Apple Silicon |
 | Quantization (qint8/int4) | **Done** | [Benchmarked](docs/benchmarks/) — int4 halves memory |
+| LTX-2.5 (text/image-to-video) | **Done** | Gated repo; bundled Gemma 4 encoder, split checkpoint |
+| LTX-2.5 auto-duration | **Done** | `--frames auto` predicts the length from the prompt |
+| LTX-2.5 diffusion decoder / temporal upscaler | Not implemented | The conv decoder ships alongside and is what loads |
 
 ## Requirements
 
@@ -235,7 +238,17 @@ A `learning_curve.svg` is generated live in the output directory for monitoring.
 | `quality` | 96GB | 64 | 512x512 | 9 |
 | `max` | 192GB+ | 128 | 512x512 (bf16) | 9 |
 
-Models (~30 GB total) are downloaded automatically on first run from [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) and [mlx-community/gemma-3-12b-it-qat-4bit](https://huggingface.co/mlx-community/gemma-3-12b-it-qat-4bit).
+Models are downloaded automatically on first run.
+
+**LTX-2.3** (~30 GB, open repos): [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) plus [mlx-community/gemma-3-12b-it-qat-4bit](https://huggingface.co/mlx-community/gemma-3-12b-it-qat-4bit) for the text encoder.
+
+**LTX-2.5** (~70 GB, **gated**): [Lightricks/LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) ships one file per component and bundles its own Gemma 4 text encoder — there is no community quantization of that derivative, so `--transformer-quant` drives the encoder too. Accept the licence on the model page, then provide a token via `--hf-token`, `$HF_TOKEN`, or `huggingface-cli login`.
+
+```bash
+ltx-video models          # variants, licences, gating and what actually runs today
+ltx-video generate --model 2.5-distilled --frames auto \
+    --image first-frame.png "your prompt"
+```
 
 ## Swift Package Integration
 
@@ -340,11 +353,18 @@ try await trainer.train { progress in
 ```swift
 import LTXVideo
 
-// List available models
+// List available models with their licensing and gating
 for model in LTXModel.allCases {
     print("\(model.rawValue): inference=\(model.isForInference), training=\(model.isForTraining)")
     print("  \(model.variantDescription)")
-    print("  Size: \(model.estimatedSizeGB)GB, License: \(model.license)")
+    print("  Size: \(model.estimatedSizeGB)GB, licence: \(model.licenseName)")
+    print("  Gated: \(model.isGated) — \(model.huggingFaceURL)")
+    print("  Text encoder: \(model.textEncoder.displayName)")
+}
+
+// Upscalers, distilled LoRAs and IC-LoRAs carry the same metadata
+for aux in LTXAuxiliaryModel.allCases where aux.gating.requiresToken {
+    print("\(aux.displayName) needs a licence accepted at \(aux.huggingFaceURL)")
 }
 
 // Print formatted table
