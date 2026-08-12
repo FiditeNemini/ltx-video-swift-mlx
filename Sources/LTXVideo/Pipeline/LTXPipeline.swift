@@ -2679,13 +2679,23 @@ public actor LTXPipeline {
 
     // MARK: - Image-to-Video Helpers
 
-    /// Load VAE encoder weights from the unified safetensors file
+    /// Load VAE encoder weights from wherever this checkpoint keeps them.
+    ///
+    /// Unified checkpoints hold them under `vae.encoder.*`; split ones put them in
+    /// the VAE file. Reading the wrong file yields *zero* matching keys and leaves
+    /// the encoder at its random initialisation, which does not fail loudly — it
+    /// silently encodes every conditioning image to noise. Hence the guard below.
     private func loadVAEEncoder() async throws {
         if vaeEncoder != nil { return }  // Already loaded
 
         LTXDebug.log("Loading VAE encoder...")
-        let resolvedUnifiedPath = try await resolveUnifiedWeightsPath(for: model)
-        let encoderWeights = try LTXWeightLoader.loadVAEEncoderWeightsFromUnified(from: resolvedUnifiedPath)
+        let checkpoint = try await resolveCheckpoint()
+        let source = LTXCheckpointSource(model: model, paths: checkpoint)
+        let encoderWeights = try source.loadVAEEncoderWeights()
+        guard !encoderWeights.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "No VAE encoder weights found in \(checkpoint.videoVAE.lastPathComponent)")
+        }
 
         let encoder = VideoEncoder()
         try LTXWeightLoader.applyVAEEncoderWeights(encoderWeights, to: encoder)
@@ -3165,10 +3175,14 @@ public actor LTXPipeline {
 
     // MARK: - Download Helpers
 
-    /// Download spatial upscaler weights (if not already cached)
+    /// Download the spatial upscaler matching this pipeline's checkpoint generation.
+    ///
+    /// The module is architecturally identical across 2.3 and 2.5 — same 24 tensor
+    /// patterns, same shapes — but the weights are not: a 2.5 latent is not a 2.3
+    /// latent, so the two-stage pass must use its own generation's upscaler.
     /// - Returns: Path to the upscaler safetensors file
     public func downloadUpscalerWeights() async throws -> String {
-        let url = try await downloader.downloadUpscalerWeights()
+        let url = try await downloader.downloadAuxiliaryModel(model.defaultSpatialUpscaler)
         return url.path
     }
 
