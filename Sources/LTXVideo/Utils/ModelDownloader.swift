@@ -381,11 +381,13 @@ public actor ModelDownloader {
 
     /// Download whatever files `model` needs and return their locations.
     ///
-    /// Unified checkpoints (LTX-2.3) resolve to a single file referenced three
-    /// times; split checkpoints (LTX-2.5) pull the transformer, the conv video VAE
-    /// and the text-encoder bundle separately. The diffusion video decoder and the
-    /// duration head are deliberately not fetched: neither is implemented, and
-    /// together they would add gigabytes a caller cannot use.
+    /// Unified checkpoints (LTX-2.3) resolve to a single file referenced several
+    /// times; split checkpoints (LTX-2.5) pull the transformer, the conv video VAE,
+    /// the text-encoder bundle and the audio bundle separately. The audio file is
+    /// small (~350 MB) and carries the vocoder, so it comes down with the rest. The
+    /// diffusion video decoder and the duration head are deliberately not fetched:
+    /// neither is implemented, and together they would add gigabytes a caller
+    /// cannot use.
     public func downloadCheckpoint(
         model: LTXModel,
         progress: DownloadProgressCallback? = nil
@@ -399,7 +401,7 @@ public actor ModelDownloader {
         case .split:
             let localDir = componentCacheDir(model: model)
             var resolved: [LTXComponentFile.Kind: URL] = [:]
-            let wanted: [LTXComponentFile.Kind] = [.videoVAE, .textEncoder]
+            let wanted: [LTXComponentFile.Kind] = [.videoVAE, .textEncoder, .audioVAE]
             let files = model.family.sharedComponentFiles.filter { wanted.contains($0.kind) }
 
             for (index, file) in files.enumerated() {
@@ -415,12 +417,14 @@ public actor ModelDownloader {
                 resolved[file.kind] = destination
             }
 
-            guard let videoVAE = resolved[.videoVAE], let textEncoder = resolved[.textEncoder] else {
+            guard let videoVAE = resolved[.videoVAE], let textEncoder = resolved[.textEncoder],
+                  let audioBundle = resolved[.audioVAE] else {
                 throw LTXError.downloadFailed("Incomplete split checkpoint for \(model.displayName)")
             }
             progress?(DownloadProgress(progress: 1.0, message: "Checkpoint ready"))
             return LTXCheckpointPaths(
-                transformer: unified, videoVAE: videoVAE, textEncoder: textEncoder)
+                transformer: unified, videoVAE: videoVAE,
+                textEncoder: textEncoder, audioBundle: audioBundle)
         }
     }
 

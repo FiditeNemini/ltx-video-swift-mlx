@@ -20,10 +20,16 @@ public struct LTXCheckpointPaths: Sendable, Equatable {
     /// `nil` for LTX-2.3, whose encoder is an external Gemma 3 checkpoint.
     public let textEncoder: URL?
 
-    public init(transformer: URL, videoVAE: URL, textEncoder: URL? = nil) {
+    /// File carrying `vocoder.*` — the BigVGAN generator plus its bandwidth
+    /// extension. Unified checkpoints keep it alongside everything else; split
+    /// ones put it in the audio-VAE component.
+    public let audioBundle: URL
+
+    public init(transformer: URL, videoVAE: URL, textEncoder: URL? = nil, audioBundle: URL? = nil) {
         self.transformer = transformer
         self.videoVAE = videoVAE
         self.textEncoder = textEncoder
+        self.audioBundle = audioBundle ?? transformer
     }
 }
 

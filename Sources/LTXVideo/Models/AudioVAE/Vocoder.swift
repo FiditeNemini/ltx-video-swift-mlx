@@ -116,6 +116,21 @@ class VocoderUpsampler: Module {
     }
 }
 
+// MARK: - Vocoder protocol
+
+/// A mel→waveform stage.
+///
+/// Two exist: ``LTX2Vocoder`` (the LTX-2-era HiFi-GAN, 24 kHz) and
+/// ``LTXVocoderWithBWE`` (BigVGAN v2 + bandwidth extension, 48 kHz), which is
+/// what LTX-2.3 and LTX-2.5 checkpoints actually ship. Callers read
+/// ``outputSampleRate`` rather than assuming one.
+protocol LTXVocoding: AnyObject {
+    var outputSampleRate: Int { get }
+    /// - Parameter melSpectrogram: `(B, 2, T, 64)`.
+    /// - Returns: `(B, 2, samples)`.
+    func callAsFunction(_ melSpectrogram: MLXArray) -> MLXArray
+}
+
 // MARK: - LTX2 Vocoder
 
 /// HiFi-GAN style vocoder for LTX-2 audio
@@ -129,7 +144,7 @@ class VocoderUpsampler: Module {
 ///
 /// Total upsample: 6*5*2*2*2 = 240x temporal expansion
 /// Output: 24kHz stereo waveform
-class LTX2Vocoder: Module {
+class LTX2Vocoder: Module, LTXVocoding {
     let outputSampleRate: Int
 
     @ModuleInfo(key: "conv_in") var convIn: Conv1d
@@ -321,11 +336,11 @@ class LTX2Vocoder: Module {
 ///   - latents: Audio latents (B, 8, T_latent, 16)
 ///   - audioVAE: The audio VAE model
 ///   - vocoder: The HiFi-GAN vocoder
-/// - Returns: Stereo waveform (B, 2, audio_samples) at 24kHz
+/// - Returns: Stereo waveform (B, 2, audio_samples) at the vocoder's output rate
 func decodeAudio(
     latents: MLXArray,
     audioVAE: AudioVAE,
-    vocoder: LTX2Vocoder
+    vocoder: any LTXVocoding
 ) -> MLXArray {
     var input = latents
 

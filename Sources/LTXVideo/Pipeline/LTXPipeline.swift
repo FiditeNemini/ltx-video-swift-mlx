@@ -178,7 +178,7 @@ public actor LTXPipeline {
     private var audioVAE: AudioVAE?
 
     /// Audio vocoder (mel → waveform)
-    private var vocoder: LTX2Vocoder?
+    private var vocoder: (any LTXVocoding)?
 
     /// Whether audio models are loaded
     public var isAudioLoaded: Bool {
@@ -641,11 +641,8 @@ public actor LTXPipeline {
         let vocoderPath = try await downloader.downloadVocoder { progress in
             progressCallback?(progress)
         }
-        let vocoderWeights = try LTXWeightLoader.loadVocoderWeights(from: vocoderPath.path)
-
-        vocoder = LTX2Vocoder()
-        try LTXWeightLoader.applyVocoderWeights(vocoderWeights, to: vocoder!)
-        LTXDebug.log("Vocoder loaded")
+        vocoder = try loadVocoder(audioVAEPath: audioVAEPath, legacyPath: vocoderPath)
+        LTXDebug.log("Vocoder loaded (\(vocoder!.outputSampleRate) Hz)")
 
         // Step 3: Create LTX2 dual transformer and load unified weights
         // The LTX2 transformer uses the same weight keys as the video-only transformer
@@ -3171,6 +3168,55 @@ public actor LTXPipeline {
             mean: mean,
             std: std
         )
+    }
+
+    // MARK: - Vocoder selection
+
+    /// Build the vocoder this checkpoint ships, falling back to the LTX-2 one.
+    ///
+    /// LTX-2.3 and LTX-2.5 both bundle a BigVGAN v2 generator plus a
+    /// bandwidth-extension stage (667 + 557 tensors, byte-identical between the two
+    /// generations) that outputs 48 kHz. The `Lightricks/LTX-2` standalone vocoder
+    /// this package used to load is a different architecture entirely — it shares
+    /// no key with them and stops at 24 kHz. It decodes the same latent space, so
+    /// it produces plausible audio, which is exactly why the mismatch went
+    /// unnoticed; it is kept only as a fallback for checkpoints that ship nothing
+    /// better.
+    private func loadVocoder(audioVAEPath: URL, legacyPath: URL) throws -> any LTXVocoding {
+        let bundle = (try? resolveCheckpointSync())?.audioBundle ?? audioVAEPath
+        for candidate in [bundle, audioVAEPath] {
+            do {
+                let vocoder = try BigVGANWeightLoader.load(from: candidate)
+                LTXDebug.log("Vocoder: BigVGAN + BWE from \(candidate.lastPathComponent)")
+                return vocoder
+            } catch {
+                LTXDebug.log("Vocoder: \(candidate.lastPathComponent) has no BigVGAN (\(error))")
+            }
+        }
+
+        LTXDebug.log("Vocoder: falling back to the LTX-2 generator (24 kHz)")
+        let weights = try LTXWeightLoader.loadVocoderWeights(from: legacyPath.path)
+        let legacy = LTX2Vocoder()
+        try LTXWeightLoader.applyVocoderWeights(weights, to: legacy)
+        return legacy
+    }
+
+    /// The checkpoint paths resolved earlier in this load, without re-downloading.
+    private func resolveCheckpointSync() throws -> LTXCheckpointPaths? {
+        guard let cached = unifiedWeightsPathCache.cachedPath(for: model) else { return nil }
+        let transformer = URL(fileURLWithPath: cached)
+        switch model.weightsLayout {
+        case .unified:
+            return LTXCheckpointPaths(transformer: transformer, videoVAE: transformer)
+        case .split:
+            let directory = transformer.deletingLastPathComponent()
+            guard let audio = model.family.sharedComponentFiles.first(where: { $0.kind == .audioVAE })
+            else { return nil }
+            return LTXCheckpointPaths(
+                transformer: transformer,
+                videoVAE: transformer,
+                audioBundle: directory.appendingPathComponent(audio.filename))
+        }
     }
 
     // MARK: - Auto Duration (LTX-2.5)
