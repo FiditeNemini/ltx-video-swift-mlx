@@ -2,6 +2,18 @@
 
 ## 2026-08-12
 
+* **Update**: The audio decode stage was running the wrong vocoder — recorded in
+  [the vocoder pitfall](/docs/knowledge/pitfalls/wrong-vocoder-lost-the-midrange.md).
+  LTX-2.3 and LTX-2.5 bundle a BigVGAN v2 + bandwidth-extension pair (667+557
+  tensors, byte-identical between the two generations, 48 kHz); this package
+  loaded LTX-2's 194-tensor 24 kHz vocoder, which shares no key with them. The
+  audio VAE is byte-identical across all three, so the mismatch decoded into
+  plausible audio instead of noise — with the 1–4 kHz band 56 dB below total,
+  now −16.2 dB. Since the vocoder is the same in 2.3, **every LipDub track
+  produced so far went through the amputated stage**; the July timbre
+  investigation's decoder probes stand as taken but could not see this hole, and
+  its upstream attributions are flagged for re-measurement.
+
 * **Update**: LTX-2.5 now runs (text/image-to-video). Two pitfalls recorded from
   the port: [split-checkpoint lookups fail silently](/docs/knowledge/pitfalls/split-checkpoint-silent-empty-load.md)
   — the VAE encoder was read from the transformer file, matched zero keys, kept

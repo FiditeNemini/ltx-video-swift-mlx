@@ -32,6 +32,16 @@ are those where prompt and audio provably agree.
 
 # 3. The LTX audio decoder — innocent (measured)
 
+> **August 2026 caveat.** The probes below compare an input against its
+> generation *through the same decoder*, so a deficiency common to both largely
+> cancels — and the decoder in question was the wrong one. LTX-2.3 bundles a
+> BigVGAN v2 + bandwidth-extension vocoder that this package was not running; the
+> stage actually used left 1–4 kHz some 56 dB below total. See
+> [the vocoder pitfall](/docs/knowledge/pitfalls/wrong-vocoder-lost-the-midrange.md).
+> These measurements stand as taken; the conclusions attributed upstream deserve
+> a re-run with the correct vocoder before being treated as settled.
+
+
 Three independent measurements clear the AudioVAE + vocoder chain:
 
 | Probe | Input → generated |
