@@ -42,6 +42,18 @@ extension LTXPipeline {
             throw LTXError.fileNotFound("Reference video not found: \(referenceVideoPath)")
         }
 
+        // The two upscaler families share a name and nothing else. Handing the
+        // latent one here would fuse zero layers and silently produce a plain
+        // text-to-video generation at the target size — plausible output, wrong
+        // operation. Cheaper to refuse it by inspecting the file.
+        let adapterKeys = try LoRALoader.load(from: loraPath).layers
+        guard !adapterKeys.isEmpty else {
+            throw LTXError.invalidLoRA(
+                "\((loraPath as NSString).lastPathComponent) carries no LoRA layers. The *latent* "
+                + "spatial upscaler is a standalone conv model used between generation stages; "
+                + "this path needs the *pixel* spatial upscaler IC-LoRA.")
+        }
+
         let downscaleFactor = LoRALoader.referenceDownscaleFactor(from: loraPath)
         guard downscaleFactor >= 1 else {
             throw LTXError.invalidLoRA("reference_downscale_factor must be >= 1")

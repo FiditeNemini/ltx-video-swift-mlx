@@ -97,8 +97,10 @@ struct Upscale: AsyncParsableCommand {
             adapterPath = lora
         } else {
             print("Fetching the upscaler adapter...")
-            let aux: LTXAuxiliaryModel = variant.family == .ltx25
-                ? .pixelSpatialUpscalerX2_25 : .spatialUpscalerX2_23
+            // The *pixel* upscaler, published for both generations — not the latent
+            // one `generate` runs between its stages, which is a conv model with no
+            // LoRA keys and would fuse into nothing.
+            let aux = LTXAuxiliaryModel.pixelSpatialUpscaler(for: variant.family)
             let downloader = ModelDownloader(hfToken: hfToken)
             adapterPath = try await downloader.downloadAuxiliaryModel(aux) { progress in
                 print("  \(progress.message)")

@@ -125,6 +125,26 @@ struct LTXModelCatalogTests {
         #expect(LTXAuxiliaryModel.pixelSpatialUpscalerX2_25.family == .ltx25)
     }
 
+    /// Two upscaler families share the word "upscaler" and nothing else: the latent
+    /// one is a conv model run between generation stages, the pixel one an IC-LoRA
+    /// that re-renders from a reference video. Feeding one to the other's code path
+    /// fuses zero layers and silently produces the wrong operation.
+    @Test func testUpscalerFamiliesAreDistinguishable() {
+        for latent: LTXAuxiliaryModel in [.spatialUpscalerX2_23, .latentSpatialUpscalerX2_25,
+                                          .latentTemporalUpscalerX2_25] {
+            #expect(latent.isAdapter == false, "\(latent.rawValue) is not a LoRA")
+        }
+        for pixel: LTXAuxiliaryModel in [.pixelSpatialUpscalerX2_23, .pixelSpatialUpscalerX4_23,
+                                         .pixelSpatialUpscalerX2_25] {
+            #expect(pixel.isAdapter, "\(pixel.rawValue) is a LoRA")
+        }
+        // Both generations publish a pixel upscaler; the resolver must not fall back
+        // to a latent one for 2.3.
+        #expect(LTXAuxiliaryModel.pixelSpatialUpscaler(for: .ltx23) == .pixelSpatialUpscalerX2_23)
+        #expect(LTXAuxiliaryModel.pixelSpatialUpscaler(for: .ltx25) == .pixelSpatialUpscalerX2_25)
+        #expect(LTXAuxiliaryModel.pixelSpatialUpscaler(for: .ltx23).isAdapter)
+    }
+
     @Test func testFeedForwardBiasTracksCheckpoint() {
         // 2.3 ships ff.net.{0.proj,2}.bias for every block; 2.5 sets ff_bias: false.
         #expect(LTXTransformerConfig.ltx23.ffBias == true)

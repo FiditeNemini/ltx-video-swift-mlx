@@ -284,13 +284,23 @@ public struct LTXComponentFile: Sendable, Equatable, Hashable {
 /// (also gated) LTX-2.5 base repo.
 public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
     /// LTX-2.3 latent spatial upscaler ×2, used by the two-stage HQ pipeline.
-    case spatialUpscalerX2_23 = "spatial-upscaler-x2-2.3"
+    ///
+    /// A standalone convolutional model that upscales **latents** between stages —
+    /// not to be confused with the pixel upscaler below, which is an IC-LoRA over
+    /// the transformer. They share a name and nothing else.
+    case spatialUpscalerX2_23 = "latent-spatial-upscaler-x2-2.3"
 
     /// LTX-2.5 latent spatial upscaler ×2.
     case latentSpatialUpscalerX2_25 = "latent-spatial-upscaler-x2-2.5"
 
     /// LTX-2.5 latent temporal upscaler ×2 (frame-rate doubling stage of the DFR pipeline).
     case latentTemporalUpscalerX2_25 = "latent-temporal-upscaler-x2-2.5"
+
+    /// LTX-2.3 pixel-space spatial upscaler ×2 (IC-LoRA over the 22B transformer).
+    case pixelSpatialUpscalerX2_23 = "pixel-spatial-upscaler-x2-2.3"
+
+    /// LTX-2.3 pixel-space spatial upscaler ×4.
+    case pixelSpatialUpscalerX4_23 = "pixel-spatial-upscaler-x4-2.3"
 
     /// LTX-2.5 pixel-space spatial upscaler, shipped as an IC-LoRA over the 22B transformer.
     case pixelSpatialUpscalerX2_25 = "pixel-spatial-upscaler-x2-2.5"
@@ -307,6 +317,8 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
     public var displayName: String {
         switch self {
         case .spatialUpscalerX2_23: return "LTX-2.3 latent spatial upscaler ×2"
+        case .pixelSpatialUpscalerX2_23: return "LTX-2.3 pixel spatial upscaler ×2 (IC-LoRA)"
+        case .pixelSpatialUpscalerX4_23: return "LTX-2.3 pixel spatial upscaler ×4 (IC-LoRA)"
         case .latentSpatialUpscalerX2_25: return "LTX-2.5 latent spatial upscaler ×2"
         case .latentTemporalUpscalerX2_25: return "LTX-2.5 latent temporal upscaler ×2"
         case .pixelSpatialUpscalerX2_25: return "LTX-2.5 pixel spatial upscaler ×2 (IC-LoRA)"
@@ -318,7 +330,8 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
 
     public var family: LTXModelFamily {
         switch self {
-        case .spatialUpscalerX2_23, .distilledLoRA_23, .dubItLoRA_23:
+        case .spatialUpscalerX2_23, .distilledLoRA_23, .dubItLoRA_23,
+             .pixelSpatialUpscalerX2_23, .pixelSpatialUpscalerX4_23:
             return .ltx23
         case .latentSpatialUpscalerX2_25, .latentTemporalUpscalerX2_25,
              .pixelSpatialUpscalerX2_25, .distilledLoRA_25:
@@ -334,6 +347,8 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
             // Renamed from `LTX-2.3-22b-IC-LoRA-LipDub` in August 2026; the old
             // repo id 307-redirects but its old filename is gone.
             return "Lightricks/LTX-2.3-22b-IC-LoRA-DubIt"
+        case .pixelSpatialUpscalerX2_23, .pixelSpatialUpscalerX4_23:
+            return "Lightricks/LTX-2.3-22b-IC-LoRA-Pixel-Spatial-Upscaler"
         case .latentSpatialUpscalerX2_25, .latentTemporalUpscalerX2_25, .distilledLoRA_25:
             return "Lightricks/LTX-2.5"
         case .pixelSpatialUpscalerX2_25:
@@ -351,6 +366,10 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
             return "ltx-2.3-22b-distilled-lora-384.safetensors"
         case .dubItLoRA_23:
             return "ltx-2.3-22b-ic-lora-dubit-0.9.safetensors"
+        case .pixelSpatialUpscalerX2_23:
+            return "ltx-2.3-22b-ic-lora-pixel-spatial-upscaler-x2-0.9.safetensors"
+        case .pixelSpatialUpscalerX4_23:
+            return "ltx-2.3-22b-ic-lora-pixel-spatial-upscaler-x4-0.9.safetensors"
         case .latentSpatialUpscalerX2_25:
             return "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
         case .latentTemporalUpscalerX2_25:
@@ -368,6 +387,8 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
     public var cacheDirectoryName: String {
         switch self {
         case .spatialUpscalerX2_23: return "ltx-upscaler"
+        case .pixelSpatialUpscalerX2_23: return "ltx23-lora-pixel-upscaler-x2"
+        case .pixelSpatialUpscalerX4_23: return "ltx23-lora-pixel-upscaler-x4"
         case .latentSpatialUpscalerX2_25: return "ltx25-latent-upscaler-spatial"
         case .latentTemporalUpscalerX2_25: return "ltx25-latent-upscaler-temporal"
         case .pixelSpatialUpscalerX2_25: return "ltx25-lora-pixel-upscaler"
@@ -380,6 +401,7 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
     public var approximateSizeGB: Float {
         switch self {
         case .spatialUpscalerX2_23, .latentSpatialUpscalerX2_25: return 1.0
+        case .pixelSpatialUpscalerX2_23, .pixelSpatialUpscalerX4_23: return 0.33
         case .latentTemporalUpscalerX2_25: return 0.26
         case .pixelSpatialUpscalerX2_25: return 0.33
         case .distilledLoRA_23: return 7.6
@@ -395,6 +417,7 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
         case .spatialUpscalerX2_23, .distilledLoRA_23:
             return .open
         case .dubItLoRA_23, .pixelSpatialUpscalerX2_25,
+             .pixelSpatialUpscalerX2_23, .pixelSpatialUpscalerX4_23,
              .latentSpatialUpscalerX2_25, .latentTemporalUpscalerX2_25, .distilledLoRA_25:
             return .licenseAcceptanceRequired
         }
@@ -404,10 +427,37 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
 
     public var huggingFaceURL: String { "https://huggingface.co/\(huggingFaceRepo)" }
 
+    /// Whether the artefact is an adapter to fuse into the transformer.
+    ///
+    /// The two upscaler families share a name and nothing else: the *latent* one
+    /// is a standalone convolutional model that runs between the two stages of a
+    /// generation, the *pixel* one is an IC-LoRA that re-renders from a reference
+    /// video. Handing one to the other's code path is a category error, so the
+    /// distinction is answerable rather than implied by the case name.
+    public var isAdapter: Bool {
+        switch self {
+        case .spatialUpscalerX2_23, .latentSpatialUpscalerX2_25, .latentTemporalUpscalerX2_25:
+            return false
+        case .pixelSpatialUpscalerX2_23, .pixelSpatialUpscalerX4_23, .pixelSpatialUpscalerX2_25,
+             .distilledLoRA_23, .distilledLoRA_25, .dubItLoRA_23:
+            return true
+        }
+    }
+
+    /// The pixel upscaler matching a generation, for callers that want to re-render
+    /// rather than refine.
+    public static func pixelSpatialUpscaler(for family: LTXModelFamily) -> LTXAuxiliaryModel {
+        switch family {
+        case .ltx23: return .pixelSpatialUpscalerX2_23
+        case .ltx25: return .pixelSpatialUpscalerX2_25
+        }
+    }
+
     /// Whether this package can use the artefact today.
     public var support: LTXModelSupport {
         switch self {
-        case .spatialUpscalerX2_23, .distilledLoRA_23, .dubItLoRA_23:
+        case .spatialUpscalerX2_23, .distilledLoRA_23, .dubItLoRA_23,
+             .pixelSpatialUpscalerX2_23, .pixelSpatialUpscalerX4_23:
             return .supported
         case .latentSpatialUpscalerX2_25, .latentTemporalUpscalerX2_25,
              .pixelSpatialUpscalerX2_25, .distilledLoRA_25:
