@@ -113,10 +113,13 @@ class LoRAAdapter {
                         groupSize: ql.groupSize, bits: ql.bits
                     ).asType(.float16)
 
-                    // Save original quantized state for unfusing
-                    originalWeights[swiftKey] = ql.weight
-                    originalWeights[layerPath + ".scales"] = ql.scales
-                    if let b = ql.biases { originalWeights[layerPath + ".biases"] = b }
+                    // Save original quantized state for unfusing — COPIED, not
+                    // referenced. Module.update mutates parameter arrays in place,
+                    // so a bare reference would silently become the fused value and
+                    // unfuse would restore exactly what it was meant to undo.
+                    originalWeights[swiftKey] = ql.weight + 0
+                    originalWeights[layerPath + ".scales"] = ql.scales + 0
+                    if let b = ql.biases { originalWeights[layerPath + ".biases"] = b + 0 }
 
                     // 2. Apply LoRA delta
                     let deltaConverted = delta.asType(mergedWeight.dtype)
@@ -141,8 +144,9 @@ class LoRAAdapter {
                         continue
                     }
 
-                    // Save original for unfusing
-                    originalWeights[swiftKey] = currentWeight
+                    // Save original for unfusing — COPIED (see the quantized branch:
+                    // Module.update mutates in place, a reference aliases the fused value).
+                    originalWeights[swiftKey] = currentWeight + 0
 
                     // Fuse: W' = W + delta (delta already includes scale)
                     let deltaConverted = delta.asType(currentWeight.dtype)
@@ -152,8 +156,11 @@ class LoRAAdapter {
                 }
             }
 
-            // Apply this batch and materialize to free intermediate arrays
+            // Materialize the captured originals BEFORE the update mutates their
+            // sources — a lazy `w + 0` must read w's buffer while it still holds
+            // the pre-fuse value.
             if !batchUpdates.isEmpty {
+                MLX.eval(Array(originalWeights.values))
                 let params = ModuleParameters.unflattened(batchUpdates)
                 model.update(parameters: params)
                 eval(model.parameters())
@@ -220,13 +227,14 @@ class LoRAAdapter {
     ///   - originalWeights: Dictionary returned by `fuseWeights(into:)`
     ///   - model: The transformer to restore
     static func unfuseWeights(from originalWeights: [String: MLXArray], into model: Module) {
-        var restoredCount = 0
-        for (keyPath, originalWeight) in originalWeights {
-            setParameterByPath(model: model, keyPath: keyPath, value: originalWeight)
-            restoredCount += 1
-        }
+        // One batched update, exactly like fuseWeights applies its deltas. The
+        // previous per-key path restored nothing — silently — and no caller ever
+        // noticed because unfuse was never exercised: LipDub forbids it and the
+        // CLI fuses for the life of the process.
+        let params = ModuleParameters.unflattened(Array(originalWeights))
+        model.update(parameters: params)
         MLX.eval(model.parameters())
-        LTXDebug.log("LoRA unfused: restored \(restoredCount) layers")
+        LTXDebug.log("LoRA unfused: restored \(originalWeights.count) tensors")
     }
 
     /// Count layers that would be modified by this LoRA
@@ -430,18 +438,3 @@ extension Module {
     }
 }
 
-// MARK: - Parameter Path Helper
-
-/// Set a parameter on a Module by dot-separated key path
-/// Navigates the Module tree using key components to find and update the target parameter.
-private func setParameterByPath(model: Module, keyPath: String, value: MLXArray) {
-    let components = keyPath.split(separator: ".").map(String.init)
-    guard !components.isEmpty else { return }
-
-    // Build a NestedDictionary update for Module.update()
-    // We need to build: {"component1": {"component2": {"leaf": value}}}
-    // Use NestedDictionary.unflattened to build from the flat key path
-    let flatKey = components.joined(separator: ".")
-    let params = ModuleParameters.unflattened([(flatKey, value)])
-    model.update(parameters: params)
-}

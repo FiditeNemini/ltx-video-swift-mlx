@@ -21,9 +21,15 @@ extension LTXPipeline {
     /// 1. a full 8-step denoise **at the reference's own resolution**, with the
     ///    reference appended in context;
     /// 2. the *latent* spatial upscaler applied to that result;
-    /// 3. a 3-step refinement at the target resolution, starting from the upscaled
-    ///    latent re-noised to σ ≈ 0.91 — **not** from pure noise, and **without**
-    ///    the reference in context: stage 2 refines what stage 1 composed.
+    /// 3. a 3-step refinement at the target resolution on the **base transformer**
+    ///    — adapter unfused, no reference in context — starting from the upscaled
+    ///    latent re-noised to σ ≈ 0.91 rather than from pure noise.
+    ///
+    /// Step 3's "no adapter" is not an optimisation. `ic_lora.py` builds its two
+    /// stages from the same checkpoint with `loras=(…)` and `loras=()`
+    /// respectively. The adapter is trained to always have a reference in context;
+    /// running it without one is out of distribution, and it reinvents the subject
+    /// — a different car comes out of stage 2 than went into it.
     ///
     /// The two upscalers are links in one chain rather than competing options: the
     /// latent one carries geometry across resolutions, the IC-LoRA supplies detail.
@@ -99,8 +105,8 @@ extension LTXPipeline {
         let encoded = try await encodeText(prompt)
         unloadGemmaIfConfigured()
 
-        // Fuse the adapter for this run only. Fusion is destructive, so the unfuse
-        // is deferred rather than left to the caller.
+        // Fuse for stage 1 only — see the note above. The defer is a safety net for
+        // the error paths; the normal flow unfuses before stage 2.
         let fusedLayers = try fuseLoRA(from: loraPath, scale: loraScale)
         defer { unfuseLoRA() }
         LTXDebug.log("[ic-lora] fused \(fusedLayers) layer-pairs at scale \(loraScale)")
@@ -156,6 +162,10 @@ extension LTXPipeline {
                 fps: 24, to: URL(fileURLWithPath: stageOneOutputPath))
             LTXDebug.log("[ic-lora] stage 1 written to \(stageOneOutputPath)")
         }
+
+        // ---- Back to the base transformer for the refinement ----
+        unfuseLoRA()
+        LTXDebug.log("[ic-lora] adapter unfused; stage 2 runs the base transformer")
 
         // ---- Latent upscale between the stages ----
         onProgress?(GenerationProgress(
