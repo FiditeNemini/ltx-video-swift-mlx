@@ -21,15 +21,16 @@ extension LTXPipeline {
     /// 1. a full 8-step denoise **at the reference's own resolution**, with the
     ///    reference appended in context;
     /// 2. the *latent* spatial upscaler applied to that result;
-    /// 3. a 3-step refinement at the target resolution on the **base transformer**
-    ///    — adapter unfused, no reference in context — starting from the upscaled
-    ///    latent re-noised to σ ≈ 0.91 rather than from pure noise.
+    /// 3. a 3-step refinement at the target resolution with the adapter still
+    ///    fused and the reference appended, starting from the upscaled latent
+    ///    re-noised to σ ≈ 0.91 rather than from pure noise.
     ///
-    /// Step 3's "no adapter" is not an optimisation. `ic_lora.py` builds its two
-    /// stages from the same checkpoint with `loras=(…)` and `loras=()`
-    /// respectively. The adapter is trained to always have a reference in context;
-    /// running it without one is out of distribution, and it reinvents the subject
-    /// — a different car comes out of stage 2 than went into it.
+    /// Step 3 deliberately diverges from `ic_lora.py`, which refines on the bare
+    /// transformer (`loras=()`) without the reference. Measured on this port, six
+    /// runs across both generations: subject identity survives the σ-0.909 renoise
+    /// **only** when adapter and reference are both active in the final stage —
+    /// the reference tokens anchor nothing on a model that was never trained to
+    /// read them, and either half alone swaps the subject.
     ///
     /// The two upscalers are links in one chain rather than competing options: the
     /// latent one carries geometry across resolutions, the IC-LoRA supplies detail.
@@ -163,10 +164,6 @@ extension LTXPipeline {
             LTXDebug.log("[ic-lora] stage 1 written to \(stageOneOutputPath)")
         }
 
-        // ---- Back to the base transformer for the refinement ----
-        unfuseLoRA()
-        LTXDebug.log("[ic-lora] adapter unfused; stage 2 runs the base transformer")
-
         // ---- Latent upscale between the stages ----
         onProgress?(GenerationProgress(
             currentStep: stage1Sigmas.count - 1, totalSteps: totalSteps,
@@ -182,6 +179,15 @@ extension LTXPipeline {
         let stage2Shape = VideoLatentShape.fromPixelDimensions(
             batch: 1, channels: 128,
             frames: config.numFrames, height: config.height, width: config.width)
+        // Reference appended at stage-2 scale; the adapter stays fused. See the
+        // doc comment — measured, both are required for identity to survive.
+        let stage2Reference = buildVideoReference(
+            referenceLatent: referenceLatent,
+            targetShape: stage2Shape,
+            downscaleFactor: downscaleFactor,
+            hasAudio: false,
+            refConfig: transformerConfig)
+
         // Re-noise rather than restart: the upscaled latent already carries the
         // composition, and stage 2 only has to add detail at the higher rate.
         let noiseScale = stage2Sigmas[0]
@@ -196,12 +202,7 @@ extension LTXPipeline {
                 sigma: sigma, phase: .refinement))
             let velocity = runDenoiseStep(
                 sigma: sigma, videoLatent: latent, audioLatentPacked: nil,
-                // No reference tokens here. `ic_lora.py` conditions stage 1 on the
-                // reference video and stage 2 on images only; the adapter stays fused
-                // either way. Appending it at both stages makes the model synthesise
-                // against the adapter *and* against reference tokens sitting at 2x
-                // positions, which measurably over-textures the result.
-                shape: stage2Shape, videoAppendCtx: nil, audioRefCtx: nil,
+                shape: stage2Shape, videoAppendCtx: stage2Reference, audioRefCtx: nil,
                 audioNumFrames: 0,
                 videoTextEmbeddings: encoded.embeddings,
                 audioTextEmbeddings: encoded.embeddings,

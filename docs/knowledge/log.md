@@ -2,6 +2,14 @@
 
 ## 2026-08-13
 
+* **Creation**: [IC-LoRA stage 2 keeps adapter and reference](/docs/knowledge/decisions/iclora-stage2-keeps-adapter-and-reference.md)
+  — the upscale pipeline's refinement stage deliberately diverges from
+  ic_lora.py: seven runs show subject identity surviving the σ-0.909 renoise
+  only when the adapter and the reference are both active in the final stage.
+  Also records that centroid/scale/HF metrics were all blind to the failure —
+  the discriminating check was "same car between stage 1 and final", one glance
+  at the `--stage-one` export.
+
 * **Creation**: [Module.update mutates in place](/docs/knowledge/pitfalls/module-update-mutates-in-place.md)
   — `unfuseLoRA` had never restored a single weight: the originals captured for
   restore were bare references into the module, and MLXNN's in-place update made
