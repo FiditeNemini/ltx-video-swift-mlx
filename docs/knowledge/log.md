@@ -1,5 +1,16 @@
 # Directory Update Log
 
+## 2026-08-13
+
+* **Creation**: [Module.update mutates in place](/docs/knowledge/pitfalls/module-update-mutates-in-place.md)
+  — `unfuseLoRA` had never restored a single weight: the originals captured for
+  restore were bare references into the module, and MLXNN's in-place update made
+  them track the fused values. Surfaced by a bit-identical output between an
+  unfused and a fused stage-2 run; pinned by a 2-layer round-trip test and a
+  capture-purity probe. Fix is copy-at-capture, materialised before the update.
+  Partially supersedes July's double-delta entry: unfuse restored contaminated
+  weights in *every* case, not just the LipDub-then-LoRA one.
+
 ## 2026-08-12
 
 * **Creation**: [LipDub overwrites anything crossing the mouth](/docs/knowledge/pitfalls/lipdub-overwrites-objects-crossing-the-mouth.md)

@@ -32,7 +32,8 @@ or re-litigated.
 
 * [swift build binaries crash at MLX runtime](pitfalls/spm-binary-no-metallib.md) - the metallib only resolves from xcodebuild products
 * [Release tests need ENABLE_TESTABILITY=YES](pitfalls/release-tests-need-testability.md) - plus a dedicated derived-data path and TEST_RUNNER_-prefixed env vars
-* [LipDub fusion is destructive — double-delta trap](pitfalls/lora-refusion-double-delta.md) - five silent-corruption paths, all guarded since PR #36
+* [LipDub fusion is destructive — double-delta trap](pitfalls/lora-refusion-double-delta.md) - five silent-corruption paths, all guarded since PR #36; superseded in part by the in-place-update pitfall below
+* [Module.update mutates in place — snapshots lie](pitfalls/module-update-mutates-in-place.md) - unfuseLoRA never restored anything: captured originals aliased the fused values; copy at capture, materialise before updating
 * [384 block-norm weights are absent by design](pitfalls/affine-free-norms-expected-missing.md) - affine-free RMSNorms; and how the suppression list could mask a future mapping bug
 * [Fake-stereo audio breaks the AudioVAE](pitfalls/audio-must-stay-stereo.md) - mono-downmixed references make mouths move in wrong directions
 * [LipDub prompts must contain the dialogue](pitfalls/lipdub-prompt-needs-dialogue.md) - the trained prompt format, and the VLM-enhancement repair
