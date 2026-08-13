@@ -2736,7 +2736,7 @@ public actor LTXPipeline {
         return EncodedKeyframe(latentIdx: 0, latent: tail, pixelFrameIndex: 0)
     }
 
-    private func encodeKeyframes(
+    internal func encodeKeyframes(
         _ keyframes: [KeyframeInput],
         width: Int,
         height: Int

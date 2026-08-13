@@ -71,6 +71,9 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Number of frames (8n+1, e.g. 9, 17, 25...), or 'auto' to predict it from the prompt (LTX-2.5 only)")
     var frames: String = "121"
 
+    @Option(name: .long, help: "Inference steps — dev models only (default 30); distilled models run their fixed 8-step schedule")
+    var steps: Int?
+
     @Option(name: .long, help: "Random seed for reproducibility")
     var seed: UInt64?
 
@@ -293,7 +296,15 @@ struct Generate: AsyncParsableCommand {
             print("Duration: \(String(format: "%.2f", Float(frameCount) / 24.0))s → \(frameCount) frames\(clampNote)")
         }
 
-        // Download upscaler (always needed for two-stage)
+        // A dev checkpoint with no LoRA fused runs the guided single-stage path;
+        // with a distilled LoRA fused it behaves as distilled and keeps two-stage.
+        let useDevPath = parsedModelVariant.isForTraining && lora == nil
+        if useDevPath {
+            print("Dev checkpoint, no LoRA: full-quality single-stage "
+                + "(\(steps ?? parsedModelVariant.defaultSteps) steps, CFG 3.0, STG)")
+        }
+
+        // Download upscaler (needed for the two-stage path)
         print("Downloading upscaler weights (if needed)...")
         fflush(stdout)
         let upscalerPath = try await pipeline.downloadUpscalerWeights()
@@ -304,7 +315,7 @@ struct Generate: AsyncParsableCommand {
             width: width,
             height: height,
             numFrames: frameCount,
-            numSteps: 8,
+            numSteps: useDevPath ? (steps ?? parsedModelVariant.defaultSteps) : 8,
             seed: seed,
             enhancePrompt: enhancePrompt,
             imagePath: parsedKeyframes.isEmpty ? image : nil,
@@ -316,14 +327,27 @@ struct Generate: AsyncParsableCommand {
         fflush(stdout)
         let startGen = Date()
 
-        let result = try await pipeline.generateVideo(
-            prompt: prompt,
-            config: config,
-            upscalerWeightsPath: upscalerPath,
-            onProgress: { progress in
-                print("  \(progress.status)")
-            },
-        )
+        let result: VideoGenerationResult
+        if useDevPath {
+            // Dev checkpoint without a distilled LoRA: the fixed 8-step two-stage
+            // schedule is a distilled-training property, so run the full-quality
+            // single-stage path (CFG 3.0 + STG + rescale) instead.
+            result = try await pipeline.generateVideoDev(
+                prompt: prompt,
+                config: config,
+                onProgress: { progress in
+                    print("  \(progress.status)")
+                })
+        } else {
+            result = try await pipeline.generateVideo(
+                prompt: prompt,
+                config: config,
+                upscalerWeightsPath: upscalerPath,
+                onProgress: { progress in
+                    print("  \(progress.status)")
+                },
+            )
+        }
 
         let genTime = Date().timeIntervalSince(startGen)
         print("Generation completed in \(String(format: "%.1f", genTime))s")
