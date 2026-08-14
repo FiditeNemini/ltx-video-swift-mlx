@@ -12,6 +12,7 @@ import MLXVLM
 import MLXHuggingFace
 import HuggingFace  // Required: #huggingFaceLoadModelContainer macro expands to HubClient references
 import Tokenizers
+import Gemma4Swift
 import Hub
 
 // MARK: - Pipeline Progress
@@ -3000,8 +3001,15 @@ public actor LTXPipeline {
         if let imagePath { LTXDebug.log("Input image: \(imagePath)") }
         let startTime = Date()
 
-        // Load the VLM model from local cache
-        LTXDebug.log("Loading VLM model...")
+        // Enhancer choice mirrors upstream: on 2.3 the (full-headed) Gemma 3
+        // self-enhances, so the shared Gemma 3 VLM plays that role; on 2.5 the
+        // bundled Gemma 4 encoder is encode-only (vestigial LM head, measured —
+        // docs/knowledge), so upstream mandates a separate small Gemma 4
+        // instruct enhancer (`--prompt-enhancer-gemma-root`, E2B-it).
+        if model.family == .ltx25 {
+            return try await enhancePromptWithGemma4(
+                prompt, imagePath: imagePath, startTime: startTime)
+        }
         let vlmLoadStart = Date()
 
         // Try loading from local vlm-gemma cache first, fall back to HF download
@@ -3014,6 +3022,8 @@ public actor LTXPipeline {
             config = ModelConfiguration(directory: resolvedURL, extraEOSTokens: ["<end_of_turn>"])
             LTXDebug.log("Loading VLM from local cache: \(resolvedURL.path)")
         } else {
+            print("Prompt enhancer: Gemma 3 12B (downloading if needed, ~7.5GB)...")
+            fflush(stdout)
             config = ModelConfiguration(id: Self.defaultVLMModelID, extraEOSTokens: ["<end_of_turn>"])
             LTXDebug.log("Loading VLM from HuggingFace: \(Self.defaultVLMModelID)")
         }
@@ -3090,13 +3100,79 @@ public actor LTXPipeline {
             return prompt
         }
 
-        LTXDebug.log("Enhanced prompt: \"\(cleaned)\"")
+        // Always shown: the enhanced text is what actually gets encoded, and
+        // hiding it behind --debug made runs impossible to audit.
+        print("Enhanced prompt (Gemma 3 12B):\n\(cleaned)")
+        fflush(stdout)
 
         // Unload VLM to free memory for the main pipeline
         LTXDebug.log("Unloading VLM...")
         Memory.clearCache()
         LTXMemoryManager.logMemoryState("after VLM unload")
 
+        return cleaned
+    }
+
+    /// LTX-2.5 prompt enhancement through our own `Gemma4Swift` stack.
+    ///
+    /// Mirrors upstream\'s design: the bundled 12B encoder is encode-only
+    /// (vestigial LM head, measured — docs/knowledge), so enhancement runs on a
+    /// separate small generative Gemma 4 E2B-it, greedy, 600 tokens
+    /// (`GEMMA4_ENHANCE_GENERATION_KWARGS`; `no_repeat_ngram_size` has no Swift
+    /// equivalent — the only deviation). The checkpoint downloads through our
+    /// `ModelDownloader` so `--models-dir` routes it like every other model.
+    private func enhancePromptWithGemma4(
+        _ prompt: String,
+        imagePath: String?,
+        startTime: Date
+    ) async throws -> String {
+        print("Prompt enhancer: Gemma 4 E2B-it via Gemma4Swift (downloading if needed, ~3GB)...")
+        fflush(stdout)
+        let dir = try await downloader.downloadGemma4Enhancer { p in
+            if let f = p.currentFile { print("  \(f)"); fflush(stdout) }
+        }
+
+        let g4 = await Gemma4Pipeline()
+        try await g4.load(from: dir.resolvingSymlinksInPath(), multimodal: true)
+        LTXDebug.log("Gemma 4 E2B enhancer loaded")
+
+        // Gemma folds the system role into the first user turn anyway, and the
+        // multimodal path takes a single prompt string — prepend explicitly.
+        MLXRandom.seed(42)
+        let isI2V = imagePath != nil
+        let stream: AsyncThrowingStream<String, Error>
+        if let imagePath {
+            let pixels = try Gemma4ImageProcessor.processImage(
+                url: URL(fileURLWithPath: imagePath))
+            stream = try await g4.chatStreamMultimodal(
+                prompt: Self.promptEnhancementI2VSystemPrompt
+                    + "\n\nUser Raw Input Prompt: \(prompt).",
+                pixelValues: pixels,
+                temperature: 0.0,
+                maxTokens: 600)
+        } else {
+            stream = try await g4.chatStream(
+                prompt: "user prompt: \(prompt)",
+                systemPrompt: Self.promptEnhancementSystemPrompt,
+                temperature: 0.0,
+                maxTokens: 600)
+        }
+
+        var generatedText = ""
+        for try await chunk in stream { generatedText += chunk }
+        let cleaned = cleanEnhancedPrompt(generatedText)
+
+        await g4.unload()
+        Memory.clearCache()
+
+        let elapsed = Date().timeIntervalSince(startTime)
+        LTXDebug.log("Gemma 4 enhancement (\(isI2V ? "I2V" : "T2V")) took \(String(format: "%.1f", elapsed))s")
+        guard !cleaned.isEmpty else {
+            print("Enhancement produced an empty result; keeping the original prompt")
+            return prompt
+        }
+        print("Enhanced prompt (Gemma 4 E2B-it):\n\(cleaned)")
+        fflush(stdout)
         return cleaned
     }
 

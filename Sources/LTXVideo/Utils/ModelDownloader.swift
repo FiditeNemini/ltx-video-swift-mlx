@@ -540,6 +540,60 @@ public actor ModelDownloader {
         return localDir
     }
 
+    // MARK: - Gemma 4 E2B prompt enhancer (LTX-2.5)
+
+    /// HuggingFace repo for the LTX-2.5 prompt enhancer — a small *generative*
+    /// Gemma 4 instruct model. The bundled 12B encoder cannot fill this role:
+    /// upstream declares `gemma4_unified` encode-only, and its LM head is
+    /// measurably vestigial (docs/knowledge). Mirrors upstream's
+    /// `--prompt-enhancer-gemma-root` pointing at a Gemma 4 E2B-it checkpoint.
+    /// Licence: Google Gemma Terms of Use; the mlx-community mirror is not gated.
+    private static let gemma4EnhancerRepoID = "mlx-community/gemma-4-e2b-it-4bit"
+
+    private static let gemma4EnhancerFiles = [
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "config.json",
+        "generation_config.json",
+        "chat_template.jinja",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
+
+    /// Cache directory for the Gemma 4 E2B enhancer (shared across variants,
+    /// under the models dir so `--models-dir` routes it like every other model).
+    internal var gemma4EnhancerCacheDir: URL {
+        cacheDirectory.appendingPathComponent("enhancer-gemma4-e2b")
+    }
+
+    /// Download the Gemma 4 E2B-it prompt enhancer (4-bit, ~3GB).
+    public func downloadGemma4Enhancer(
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> URL {
+        let localDir = gemma4EnhancerCacheDir
+        if FileManager.default.fileExists(atPath: localDir.appendingPathComponent("config.json").path) {
+            progress?(DownloadProgress(progress: 1.0, message: "Gemma 4 enhancer already downloaded"))
+            return localDir
+        }
+        try FileManager.default.createDirectory(at: localDir, withIntermediateDirectories: true)
+        let totalFiles = Self.gemma4EnhancerFiles.count
+        for (i, file) in Self.gemma4EnhancerFiles.enumerated() {
+            progress?(DownloadProgress(
+                progress: Double(i) / Double(totalFiles),
+                currentFile: file,
+                message: "Downloading enhancer-gemma4-e2b/\(file)..."
+            ))
+            try await downloadFile(
+                repoId: Self.gemma4EnhancerRepoID,
+                filename: file,
+                to: localDir.appendingPathComponent(file)
+            )
+        }
+        progress?(DownloadProgress(progress: 1.0, message: "Gemma 4 enhancer download complete"))
+        return localDir
+    }
+
     /// Download Gemma text encoder — uses shared VLM Gemma (4-bit QAT)
     ///
     /// Returns the VLM Gemma directory which contains both model weights and tokenizer.
