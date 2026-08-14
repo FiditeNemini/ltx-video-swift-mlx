@@ -286,11 +286,23 @@ struct Generate: AsyncParsableCommand {
             print("LoRA fused (\(fusedCount) layer-pairs)")
         }
 
+        // Upstream order (distilled.py): enhance FIRST, then the duration head
+        // reads the *enhanced* prompt's encoding. Predicting on the raw prompt
+        // over-estimated (16.0s vs 14.0s on this bench's prompt), stretching the
+        // choreography past its own timeline.
+        var effectivePrompt = prompt
+        if enhancePrompt {
+            print("Enhancing prompt (before duration prediction, as upstream)...")
+            fflush(stdout)
+            let promptImage = parsedKeyframes.first?.path ?? image
+            effectivePrompt = try await pipeline.enhancePromptWithVLM(prompt, imagePath: promptImage)
+        }
+
         // Auto duration: ask the duration head before committing to a frame count
         if autoDuration {
             print("Predicting duration from the prompt...")
             fflush(stdout)
-            let predicted = try await pipeline.predictFrameCount(for: prompt)
+            let predicted = try await pipeline.predictFrameCount(for: effectivePrompt)
             frameCount = predicted.frames
             let clampNote = predicted.wasClamped ? " (clamped from \(String(format: "%.1f", predicted.seconds))s)" : ""
             print("Duration: \(String(format: "%.2f", Float(frameCount) / 24.0))s → \(frameCount) frames\(clampNote)")
@@ -317,7 +329,7 @@ struct Generate: AsyncParsableCommand {
             numFrames: frameCount,
             numSteps: useDevPath ? (steps ?? parsedModelVariant.defaultSteps) : 8,
             seed: seed,
-            enhancePrompt: enhancePrompt,
+            enhancePrompt: false,   // already enhanced above, before duration prediction
             imagePath: parsedKeyframes.isEmpty ? image : nil,
             keyframes: parsedKeyframes
         )
@@ -333,7 +345,7 @@ struct Generate: AsyncParsableCommand {
             // schedule is a distilled-training property, so run the full-quality
             // single-stage path (CFG 3.0 + STG + rescale) instead.
             result = try await pipeline.generateVideoDev(
-                prompt: prompt,
+                prompt: effectivePrompt,
                 config: config,
                 onProgress: { progress in
                     print("  \(progress.status)")
@@ -341,7 +353,7 @@ struct Generate: AsyncParsableCommand {
                 })
         } else {
             result = try await pipeline.generateVideo(
-                prompt: prompt,
+                prompt: effectivePrompt,
                 config: config,
                 upscalerWeightsPath: upscalerPath,
                 onProgress: { progress in
