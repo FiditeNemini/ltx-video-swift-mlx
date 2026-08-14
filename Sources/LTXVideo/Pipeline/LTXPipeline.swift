@@ -3178,16 +3178,16 @@ AESTHETIC QUALITY (in addition to the above, without breaking the objective capt
     ///
     /// Mirrors upstream\'s design: the bundled 12B encoder is encode-only
     /// (vestigial LM head, measured — docs/knowledge), so enhancement runs on a
-    /// separate small generative Gemma 4 E2B-it, greedy, 600 tokens
-    /// (`GEMMA4_ENHANCE_GENERATION_KWARGS`; `no_repeat_ngram_size` has no Swift
-    /// equivalent — the only deviation). The checkpoint downloads through our
+    /// separate small generative Gemma 4 E2B-it (bf16, as the reference space
+    /// runs it), greedy, 600 tokens, no_repeat_ngram_size 5
+    /// (`GEMMA4_ENHANCE_GENERATION_KWARGS`). The checkpoint downloads through our
     /// `ModelDownloader` so `--models-dir` routes it like every other model.
     private func enhancePromptWithGemma4(
         _ prompt: String,
         imagePath: String?,
         startTime: Date
     ) async throws -> String {
-        print("Prompt enhancer: Gemma 4 E2B-it via Gemma4Swift (downloading if needed, ~3GB)...")
+        print("Prompt enhancer: Gemma 4 E2B-it bf16 via Gemma4Swift (downloading if needed, ~10GB)...")
         fflush(stdout)
         let dir = try await downloader.downloadGemma4Enhancer { p in
             if let f = p.currentFile { print("  \(f)"); fflush(stdout) }
@@ -3207,16 +3207,18 @@ AESTHETIC QUALITY (in addition to the above, without breaking the objective capt
                 url: URL(fileURLWithPath: imagePath))
             stream = try await g4.chatStreamMultimodal(
                 prompt: Self.promptEnhancementGemma4I2VSystemPrompt
-                    + "\n\nUser Raw Input Prompt: \(prompt).",
+                    + "\n\nuser prompt: \(prompt)",
                 pixelValues: pixels,
                 temperature: 0.0,
-                maxTokens: 600)
+                maxTokens: 600,
+                noRepeatNGramSize: 5)
         } else {
             stream = try await g4.chatStream(
                 prompt: "user prompt: \(prompt)",
                 systemPrompt: Self.promptEnhancementGemma4T2VSystemPrompt,
                 temperature: 0.0,
-                maxTokens: 600)
+                maxTokens: 600,
+                noRepeatNGramSize: 5)
         }
 
         var generatedText = ""

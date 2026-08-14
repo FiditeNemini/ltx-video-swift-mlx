@@ -548,10 +548,12 @@ public actor ModelDownloader {
     /// measurably vestigial (docs/knowledge). Mirrors upstream's
     /// `--prompt-enhancer-gemma-root` pointing at a Gemma 4 E2B-it checkpoint.
     /// Licence: Google Gemma Terms of Use; the mlx-community mirror is not gated.
-    private static let gemma4EnhancerRepoID = "mlx-community/gemma-4-e2b-it-4bit"
+    private static let gemma4EnhancerRepoID = "mlx-community/gemma-4-e2b-it-bf16"
 
     private static let gemma4EnhancerFiles = [
-        "model.safetensors",
+        "model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors",
         "model.safetensors.index.json",
         "config.json",
         "generation_config.json",
@@ -564,10 +566,11 @@ public actor ModelDownloader {
     /// Cache directory for the Gemma 4 E2B enhancer (shared across variants,
     /// under the models dir so `--models-dir` routes it like every other model).
     internal var gemma4EnhancerCacheDir: URL {
-        cacheDirectory.appendingPathComponent("enhancer-gemma4-e2b")
+        cacheDirectory.appendingPathComponent("enhancer-gemma4-e2b-bf16")
     }
 
-    /// Download the Gemma 4 E2B-it prompt enhancer (4-bit, ~3GB).
+    /// Download the Gemma 4 E2B-it prompt enhancer (bf16, ~10GB — the
+    /// reference space runs it unquantized; 4-bit degraded instruction following).
     public func downloadGemma4Enhancer(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {

@@ -33,7 +33,7 @@ let package = Package(
         // `forwardCollectingHiddenStates`; move to `from: "1.1.0"` once it ships.
         .package(
             url: "https://github.com/VincentGourbin/gemma-4-swift-mlx",
-            revision: "f99be61fbd82fe9eb55792d408da3702e9dfaa23"
+            from: "1.1.0"
         ),
     ],
     targets: [

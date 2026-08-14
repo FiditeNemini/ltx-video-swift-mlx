@@ -337,6 +337,7 @@ struct Generate: AsyncParsableCommand {
                 config: config,
                 onProgress: { progress in
                     print("  \(progress.status)")
+                    fflush(stdout)
                 })
         } else {
             result = try await pipeline.generateVideo(
@@ -345,6 +346,7 @@ struct Generate: AsyncParsableCommand {
                 upscalerWeightsPath: upscalerPath,
                 onProgress: { progress in
                     print("  \(progress.status)")
+                    fflush(stdout)
                 },
             )
         }
