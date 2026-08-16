@@ -21,6 +21,11 @@
 
 ## 2026-08-16
 
+* **Creation**: [no_repeat_ngram bans quoting the prompt](/docs/knowledge/pitfalls/ngram-blocking-mangles-prompt-quoting.md)
+  — ngram on/off A/B: verbatim timestamps and 14.04 s predicted without the ban,
+  mangled timestamps and 19.04 s with it; deviation ask handed to gemma-4-swift-mlx.
+
+
 * **Creation**: [CFG against an empty negative erases the prompt](/docs/knowledge/pitfalls/empty-cfg-negative-erases-the-prompt.md)
   — root-caused on the 2CV bench: dev single-stage (30 steps, cfg 3.0) lost the
   entire choreography with the port-inherited "" negative and recovered it with
