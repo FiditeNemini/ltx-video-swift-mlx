@@ -45,6 +45,7 @@ or re-litigated.
 * [LipDub segments cap at ~233 frames](pitfalls/lipdub-segment-bound-233.md) - the negative-position audio reference doubles the RoPE span; 481 is only for generate/retake
 * [Split-checkpoint lookups fail silently](pitfalls/split-checkpoint-silent-empty-load.md) - a wrong-file prefix returns zero keys, not an error; the VAE encoder ran randomly initialised through a whole generation
 * [LipDub overwrites anything crossing the mouth](pitfalls/lipdub-overwrites-objects-crossing-the-mouth.md) - no occlusion modelling: a headset band or hand in front of the lips is painted over; visible in the repo's own teaser
+* [CFG against an empty negative erases the prompt](pitfalls/empty-cfg-negative-erases-the-prompt.md) - the dev paths inherited "" from the MLX port; one A/B apart, the official negative restored a 14-second choreography
 * [The wrong vocoder cost the top octave](pitfalls/wrong-vocoder-lost-the-top-octave.md) - LTX-2's vocoder decoded 2.3/2.5 latents plausibly; +18 dB at 12-16 kHz once corrected, nothing below 8 kHz — and how a two-variable A/B first got this badly wrong
 * [Don't validate the LTX Gemma by generating text](pitfalls/ltx-gemma-head-is-vestigial.md) - its tied head is saturated by design; check parameter coverage, scale band and meaning instead
 * [The continuation-tail clip must be re-encoded](pitfalls/continuation-tail-clip-encoding.md) - an input seek leaves frame 0 off t=0 and the zero-tolerance extractor refuses it

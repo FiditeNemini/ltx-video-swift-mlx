@@ -19,6 +19,13 @@
   Partially supersedes July's double-delta entry: unfuse restored contaminated
   weights in *every* case, not just the LipDub-then-LoRA one.
 
+## 2026-08-16
+
+* **Creation**: [CFG against an empty negative erases the prompt](/docs/knowledge/pitfalls/empty-cfg-negative-erases-the-prompt.md)
+  — root-caused on the 2CV bench: dev single-stage (30 steps, cfg 3.0) lost the
+  entire choreography with the port-inherited "" negative and recovered it with
+  upstream's DEFAULT_NEGATIVE_PROMPT, single variable flipped (p5-d vs p5-d2).
+
 ## 2026-08-12
 
 * **Creation**: [LipDub overwrites anything crossing the mouth](/docs/knowledge/pitfalls/lipdub-overwrites-objects-crossing-the-mouth.md)
