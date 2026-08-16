@@ -1579,12 +1579,12 @@ public actor LTXPipeline {
             // actually unloaded above (with unloadAfterUse == false it is still
             // resident, and an unconditional loadModels() would rebuild the full
             // Gemma + transformer + VAE stack mid-run on top of the live one).
-            // Use empty string as negative prompt (matching Lightricks default for MLX)
             if gemmaEncoder == nil {
                 try await loadModels(progressCallback: nil)
             }
-            // Empty string as negative prompt, matching the Lightricks MLX default.
-            let (negStates, negAttentionMask) = try encodeHiddenStates("")
+            // The official DEFAULT_NEGATIVE_PROMPT — the CFG direction is part of
+            // the trained contract (docs/knowledge: empty-cfg-negative pitfall).
+            let (negStates, negAttentionMask) = try encodeHiddenStates(Self.defaultNegativePrompt)
             let negEncoderOutput = try textEncoder.encodeFromHiddenStates(
                 hiddenStates: negStates,
                 attentionMask: negAttentionMask,

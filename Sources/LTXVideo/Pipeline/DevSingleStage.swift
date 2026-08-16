@@ -17,7 +17,7 @@ has_subtitles, has_blurbox, transition from black, transition to black, speech_e
 
 
     /// Single-stage generation on a dev checkpoint at full quality: 30 steps by
-    /// default, classical CFG 3.0 against an empty negative prompt, STG on block
+    /// default, classical CFG 3.0 against the official negative prompt, STG on block
     /// 28, guidance rescale 0.7 — the parameters `retake` already uses for dev,
     /// which mirror upstream's `ti2vid_one_stage.py`.
     ///
@@ -42,7 +42,7 @@ has_subtitles, has_blurbox, transition from black, transition to black, speech_e
         let beacon = RuntimeBeacon.begin(task: "generate-dev", model: model.rawValue)
         defer { beacon?.end() }
 
-        // Text conditioning, positive and (for CFG) the empty negative.
+        // Text conditioning, positive and (for CFG) the official negative.
         let encoded = try await encodeText(prompt, enhance: config.enhancePrompt)
         let negative = try await encodeText(Self.defaultNegativePrompt)
         unloadGemmaIfConfigured()
