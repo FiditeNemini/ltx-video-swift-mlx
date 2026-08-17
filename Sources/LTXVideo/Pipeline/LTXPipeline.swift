@@ -3228,14 +3228,26 @@ AESTHETIC QUALITY (in addition to the above, without breaking the objective capt
                 pixelValues: pixels,
                 temperature: 0.0,
                 maxTokens: 600,
-                noRepeatNGramSize: 5)
+                noRepeatNGramSize: 5,
+                // Deliberate deviation from HF semantics (and from the reference
+                // space): ban only n-grams repeated within the GENERATED text, so
+                // the caption may quote the prompt's timeline verbatim. Measured:
+                // with the prompt in the window, timestamps come out mangled and
+                // the duration head over-predicts ~5 s (docs/knowledge pitfall).
+                noRepeatNGramIncludesPrompt: false)
         } else {
             stream = try await g4.chatStream(
                 prompt: "user prompt: \(prompt)",
                 systemPrompt: Self.promptEnhancementGemma4T2VSystemPrompt,
                 temperature: 0.0,
                 maxTokens: 600,
-                noRepeatNGramSize: 5)
+                noRepeatNGramSize: 5,
+                // Deliberate deviation from HF semantics (and from the reference
+                // space): ban only n-grams repeated within the GENERATED text, so
+                // the caption may quote the prompt's timeline verbatim. Measured:
+                // with the prompt in the window, timestamps come out mangled and
+                // the duration head over-predicts ~5 s (docs/knowledge pitfall).
+                noRepeatNGramIncludesPrompt: false)
         }
 
         var generatedText = ""

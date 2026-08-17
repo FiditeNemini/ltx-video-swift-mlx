@@ -19,6 +19,12 @@
   Partially supersedes July's double-delta entry: unfuse restored contaminated
   weights in *every* case, not just the LipDub-then-LoRA one.
 
+## 2026-08-17
+
+* **Update**: [no_repeat_ngram bans quoting the prompt](/docs/knowledge/pitfalls/ngram-blocking-mangles-prompt-quoting.md)
+  — fixed via gemma-4-swift-mlx 1.2.0 `includePromptInWindow: false`;
+  duration prediction on the enhanced 2CV prompt fell 19.04 s → 14.71 s.
+
 ## 2026-08-16
 
 * **Creation**: [no_repeat_ngram bans quoting the prompt](/docs/knowledge/pitfalls/ngram-blocking-mangles-prompt-quoting.md)
