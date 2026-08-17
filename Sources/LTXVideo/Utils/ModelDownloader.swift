@@ -1380,9 +1380,17 @@ class LTXWeightLoader {
 
         var filteredWeights: [String: MLXArray] = [:]
         for (rawKey, value) in raw {
-            // Split checkpoints (LTX-2.5) prefix their audio-VAE tensors.
-            let key = rawKey.hasPrefix("audio_vae.")
+            // Split checkpoints (LTX-2.5) prefix their audio-VAE tensors and name
+            // the latent statistics differently — and those statistics are NOT
+            // byte-identical to LTX-2's (measured ~2-5% off, retuned for 2.5),
+            // so mapping them here is a correctness requirement, not cosmetics.
+            var key = rawKey.hasPrefix("audio_vae.")
                 ? String(rawKey.dropFirst("audio_vae.".count)) : rawKey
+            switch key {
+            case "per_channel_statistics.mean-of-means": key = "latents_mean"
+            case "per_channel_statistics.std-of-means": key = "latents_std"
+            default: break
+            }
             if key.hasPrefix("decoder.") || key == "latents_mean" || key == "latents_std" {
                 filteredWeights[key] = value
             } else if includeEncoder && key.hasPrefix("encoder.") {
@@ -1392,6 +1400,11 @@ class LTXWeightLoader {
         guard !filteredWeights.isEmpty else {
             throw LTXError.weightLoadingFailed(
                 "No audio-VAE tensors in \((path as NSString).lastPathComponent) — wrong file for this component")
+        }
+        guard filteredWeights["latents_mean"] != nil, filteredWeights["latents_std"] != nil else {
+            throw LTXError.weightLoadingFailed(
+                "Audio-VAE latent statistics missing from \((path as NSString).lastPathComponent) — "
+                + "decoding would run un-normalised")
         }
 
         let encoderCount = filteredWeights.keys.filter { $0.hasPrefix("encoder.") }.count
