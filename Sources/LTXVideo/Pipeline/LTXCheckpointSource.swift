@@ -49,7 +49,8 @@ struct LTXCheckpointSource {
 
     /// Weights for the transformer, the video VAE decoder and the text-side stack.
     func loadComponents(
-        includeAudio: Bool = false
+        includeAudio: Bool = false,
+        textEncoderAssets: LTX25TextEncoderAssets? = nil
     ) throws -> (transformer: [String: MLXArray], vae: [String: MLXArray], connector: [String: MLXArray]) {
         switch model.weightsLayout {
         case .unified:
@@ -64,7 +65,7 @@ struct LTXCheckpointSource {
             let vae = try LTXWeightLoader.loadVAEWeights(from: paths.videoVAE.path)
 
             var textSide = connector
-            textSide.merge(try loadProjectionWeights()) { current, _ in current }
+            textSide.merge(try loadProjectionWeights(textEncoderAssets: textEncoderAssets)) { current, _ in current }
             return (transformer, vae, textSide)
         }
     }
@@ -80,7 +81,10 @@ struct LTXCheckpointSource {
     }
 
     /// LTX aggregate projections. Split layouts keep them with the text encoder.
-    private func loadProjectionWeights() throws -> [String: MLXArray] {
+    private func loadProjectionWeights(
+        textEncoderAssets: LTX25TextEncoderAssets? = nil
+    ) throws -> [String: MLXArray] {
+        if let textEncoderAssets { return textEncoderAssets.projectionWeights() }
         guard let textEncoder = paths.textEncoder else {
             throw LTXError.weightLoadingFailed(
                 "\(model.displayName) is a split checkpoint but no text-encoder path was resolved")
@@ -91,7 +95,6 @@ struct LTXCheckpointSource {
     /// The transformer file's safetensors metadata, used to check that the text
     /// encoder is the one this checkpoint was trained against.
     func transformerMetadata() throws -> [String: String] {
-        let (_, metadata) = try MLX.loadArraysAndMetadata(url: paths.transformer)
-        return metadata
+        try LoRALoader.loadMetadata(from: paths.transformer.path)
     }
 }
