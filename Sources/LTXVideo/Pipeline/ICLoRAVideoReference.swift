@@ -85,6 +85,16 @@ extension LTXPipeline {
         guard downscaleFactor >= 1 else {
             throw LTXError.invalidLoRA("reference_downscale_factor must be >= 1")
         }
+        // The inter-stage *latent* upscaler is a fixed x2: an x4 adapter would
+        // leave stage 2 with a half-sized latent and crash at the re-noise add
+        // after minutes of stage-1 compute. Refuse up front until a matching
+        // latent chain exists.
+        guard downscaleFactor <= 2 else {
+            throw LTXError.invalidConfiguration(
+                "This adapter's reference_downscale_factor is \(downscaleFactor), but the "
+                + "inter-stage latent upscaler is x2-only — x\(downscaleFactor) upscaling "
+                + "is not supported yet.")
+        }
         guard config.width % downscaleFactor == 0, config.height % downscaleFactor == 0 else {
             throw LTXError.invalidConfiguration(
                 "Output \(config.width)x\(config.height) must divide by the adapter's "

@@ -28,7 +28,13 @@ final class Gemma3Encoder: LTXGemmaEncoding {
     /// nothing is prepended here.
     func tokenize(_ prompt: String, maxLength: Int) -> (inputIds: MLXArray, attentionMask: MLXArray) {
         let encoded = tokenizer.encode(text: prompt)
-        var tokens = Array(encoded.suffix(maxLength)).map { Int32($0) }
+        if encoded.count > maxLength {
+            print("⚠️ Prompt exceeds \(maxLength) tokens (\(encoded.count)); truncating the tail")
+        }
+        // Keep the FIRST maxLength tokens (HF truncation_side default, and what
+        // the Gemma 4 path does) — the previous suffix-keep dropped the head
+        // and BOS, silently encoding the wrong half of long prompts.
+        var tokens = Array(encoded.prefix(maxLength)).map { Int32($0) }
 
         let paddingNeeded = maxLength - tokens.count
         let padTokenID: Int32 = 0

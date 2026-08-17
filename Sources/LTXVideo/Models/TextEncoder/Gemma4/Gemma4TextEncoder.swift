@@ -171,6 +171,7 @@ final class Gemma4TextEncoder: LTXGemmaEncoding {
             ids.insert(bosTokenID, at: 0)
         }
         if ids.count > maxLength {
+            print("⚠️ Prompt exceeds \(maxLength) tokens (\(ids.count)); truncating the tail")
             ids = Array(ids.prefix(maxLength))
         }
         return ids

@@ -497,8 +497,11 @@ public actor ModelDownloader {
     ) async throws -> URL {
         let localDir = vlmGemmaCacheDir
 
-        // Quick check: if config.json exists, assume already downloaded
-        if FileManager.default.fileExists(atPath: localDir.appendingPathComponent("config.json").path) {
+        // "Complete" means every listed file exists — same interrupted-download
+        // healing rationale as downloadGemma4Enhancer.
+        if Self.vlmGemmaFiles.allSatisfy({
+            FileManager.default.fileExists(atPath: localDir.appendingPathComponent($0).path)
+        }) {
             progress?(DownloadProgress(progress: 1.0, message: "VLM Gemma already downloaded"))
             return localDir
         }
@@ -575,7 +578,13 @@ public actor ModelDownloader {
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
         let localDir = gemma4EnhancerCacheDir
-        if FileManager.default.fileExists(atPath: localDir.appendingPathComponent("config.json").path) {
+        // "Complete" means every listed file exists — config.json alone is file 5
+        // of 10, and an interrupted download must heal on rerun, not early-return
+        // into a permanently poisoned cache (downloadFile skips existing files).
+        let allPresent = Self.gemma4EnhancerFiles.allSatisfy {
+            FileManager.default.fileExists(atPath: localDir.appendingPathComponent($0).path)
+        }
+        if allPresent {
             progress?(DownloadProgress(progress: 1.0, message: "Gemma 4 enhancer already downloaded"))
             return localDir
         }
@@ -1370,12 +1379,19 @@ class LTXWeightLoader {
         let raw = try loadArrays(url: URL(fileURLWithPath: path))
 
         var filteredWeights: [String: MLXArray] = [:]
-        for (key, value) in raw {
+        for (rawKey, value) in raw {
+            // Split checkpoints (LTX-2.5) prefix their audio-VAE tensors.
+            let key = rawKey.hasPrefix("audio_vae.")
+                ? String(rawKey.dropFirst("audio_vae.".count)) : rawKey
             if key.hasPrefix("decoder.") || key == "latents_mean" || key == "latents_std" {
                 filteredWeights[key] = value
             } else if includeEncoder && key.hasPrefix("encoder.") {
                 filteredWeights[key] = value
             }
+        }
+        guard !filteredWeights.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "No audio-VAE tensors in \((path as NSString).lastPathComponent) — wrong file for this component")
         }
 
         let encoderCount = filteredWeights.keys.filter { $0.hasPrefix("encoder.") }.count

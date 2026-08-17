@@ -47,8 +47,8 @@ MLX products used: `MLX`, `MLXNN`, `MLXRandom`, `Transformers`
 **Model variants** — see `ltx-video models`, backed by `LTXModelCatalog.swift`:
 - `distilled` / `dev` (LTX-2.3, ~46 GB, open repo, Gemma 3 encoder) — runnable
 - `2.5-distilled` / `2.5-dev` (LTX-2.5, ~70 GB, **gated** repo, Gemma 4 encoder) —
-  catalogued only; `validateRunnable()` refuses them until the Gemma 4 text
-  encoder lands. What 2.5 changes is measured in
+  fully runnable (t2v/i2v, audio, `--frames auto`, upscale chain, dev
+  single-stage). What 2.5 changes is measured in
   [docs/knowledge](docs/knowledge/investigations/ltx-2.5-checkpoint-diff-2026-08.md).
 
 Every checkpoint and auxiliary model (upscalers, LoRAs) carries its licence,

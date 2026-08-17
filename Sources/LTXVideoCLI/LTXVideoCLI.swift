@@ -157,7 +157,6 @@ struct Generate: AsyncParsableCommand {
             session.metadata["quant"] = mixedPrecision ? "mixed" : transformerQuant
             session.metadata["resolution"] = "\(width)x\(height)"
             session.metadata["frames"] = String(frames)
-            session.metadata["steps"] = String(8)
             profilingSession = session
             LTXVideoProfiler.shared.enable()
             LTXVideoProfiler.shared.activeSession = session
@@ -212,6 +211,11 @@ struct Generate: AsyncParsableCommand {
 
         // Validate frame count (must be 8n+1)
         let autoDuration = frames.lowercased() == "auto"
+        if autoDuration && parsedModelVariant.family == .ltx23 {
+            throw ValidationError(
+                "--frames auto needs a duration head, which ships from LTX-2.5 onward; "
+                + "\(parsedModelVariant.displayName) has none. Pass an explicit frame count (8n+1).")
+        }
         var frameCount = 121
         if !autoDuration {
             guard let parsed = Int(frames) else {
@@ -308,12 +312,28 @@ struct Generate: AsyncParsableCommand {
             print("Duration: \(String(format: "%.2f", Float(frameCount) / 24.0))s → \(frameCount) frames\(clampNote)")
         }
 
-        // A dev checkpoint with no LoRA fused runs the guided single-stage path;
-        // with a distilled LoRA fused it behaves as distilled and keeps two-stage.
-        let useDevPath = parsedModelVariant.isForTraining && lora == nil
+        // Routing a dev checkpoint:
+        //  - no LoRA                  → guided single-stage (the two-stage 8-step
+        //    schedule is a distilled-training property);
+        //  - LoRA + explicit --steps  → guided single-stage with the LoRA fused
+        //    (a style/camera adapter on dev);
+        //  - LoRA, no --steps         → two-stage 8 steps, ASSUMING the LoRA is
+        //    the distilled one — stated out loud, since a style LoRA here would
+        //    silently produce the degraded no-distillation result.
+        let useDevPath = parsedModelVariant.isForTraining && (lora == nil || steps != nil)
         if useDevPath {
-            print("Dev checkpoint, no LoRA: full-quality single-stage "
-                + "(\(steps ?? parsedModelVariant.defaultSteps) steps, CFG 3.0, STG)")
+            print("Dev checkpoint → full-quality single-stage "
+                + "(\(steps ?? parsedModelVariant.defaultSteps) steps, CFG 3.0, STG)"
+                + (lora != nil ? " with the LoRA fused" : ""))
+        } else if parsedModelVariant.isForTraining {
+            print("Dev checkpoint + LoRA, no --steps: assuming a distilled LoRA and "
+                + "running the two-stage 8-step schedule. For a style/camera LoRA, "
+                + "pass --steps to run the guided single-stage path instead.")
+        }
+        if let steps, !useDevPath {
+            throw ValidationError(
+                "--steps \(steps) only applies to dev checkpoints on the single-stage path; "
+                + "\(parsedModelVariant.displayName)'s two-stage schedule is fixed at 8 steps.")
         }
 
         // Download upscaler (needed for the two-stage path)
@@ -333,6 +353,8 @@ struct Generate: AsyncParsableCommand {
             imagePath: parsedKeyframes.isEmpty ? image : nil,
             keyframes: parsedKeyframes
         )
+
+        profilingSession?.metadata["steps"] = String(config.numSteps)
 
         // Generate — ONE API call
         print("\nGenerating video...")
@@ -838,7 +860,8 @@ struct LipDub: AsyncParsableCommand {
 
         RuntimeBeacon.isEnabled = beacon
 
-        print("\(try parseModelVariant(model).displayName) — LipDub")
+        let variant = try parseModelVariant(model)
+        print("\(variant.displayName) — LipDub")
         print("==============")
         if let tail = continuationTail {
             guard referenceVideo == nil else {
@@ -905,11 +928,10 @@ struct LipDub: AsyncParsableCommand {
             }
         }
 
-        // LipDub always uses distilled (8-step Stage 1) + audio
-        print("Creating pipeline (distilled, audio enabled)...")
+        print("Creating pipeline (\(variant.displayName), audio enabled)...")
         fflush(stdout)
         let pipeline = LTXPipeline(
-            model: .distilled,
+            model: variant,
             quantization: LTXQuantizationConfig(transformer: .bf16),
             hfToken: hfToken
         )

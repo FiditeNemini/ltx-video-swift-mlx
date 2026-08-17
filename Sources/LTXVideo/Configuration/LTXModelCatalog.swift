@@ -459,9 +459,13 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
         case .spatialUpscalerX2_23, .distilledLoRA_23, .dubItLoRA_23,
              .pixelSpatialUpscalerX2_23, .pixelSpatialUpscalerX4_23:
             return .supported
-        case .latentSpatialUpscalerX2_25, .latentTemporalUpscalerX2_25,
-             .pixelSpatialUpscalerX2_25, .distilledLoRA_25:
-            return .notImplemented("requires LTX-2.5 inference support")
+        case .latentSpatialUpscalerX2_25, .pixelSpatialUpscalerX2_25, .distilledLoRA_25:
+            // Exercised by the shipped pipelines: the latent upscaler runs
+            // between the two stages, the pixel IC-LoRA drives `upscale`, and
+            // the distilled LoRA fuses onto the dev checkpoint.
+            return .supported
+        case .latentTemporalUpscalerX2_25:
+            return .notImplemented("temporal upscaling is not implemented")
         }
     }
 }
@@ -504,11 +508,11 @@ extension LTXModel {
 
     /// Whether the pipeline can run this checkpoint today.
     ///
-    /// For LTX-2.5 this covers text- and image-to-video. Audio generation and the
-    /// Dub-It IC-LoRA have not been exercised against a 2.5 checkpoint, and the
-    /// diffusion video decoder, the duration head and the temporal upscaler are
-    /// not implemented at all — the conv decoder ships alongside the DiffVAE and
-    /// is what this package loads.
+    /// All four variants run: LTX-2.5 covers t2v/i2v, audio, auto-duration and
+    /// the two-stage upscale chain. Not implemented for any generation: the
+    /// diffusion video decoder (the conv decoder is loaded instead) and the
+    /// temporal upscaler. `validateRunnable()` is the API's stable refusal
+    /// point should a future catalogued-only checkpoint land.
     public var support: LTXModelSupport {
         .supported
     }

@@ -84,6 +84,17 @@ final class LTXDurationHead: Module {
         maxSeconds: Float = 20.0
     ) throws -> (frames: Int, rawSeconds: Float, wasClamped: Bool) {
         let seconds = try predictSeconds(videoTokens: videoTokens, audioTokens: audioTokens)
+        let frames = Self.snapToGrid(
+            seconds: seconds, frameRate: frameRate,
+            minSeconds: minSeconds, maxSeconds: maxSeconds)
+        let clamped = seconds > maxSeconds || seconds < minSeconds
+        return (frames, seconds, clamped)
+    }
+
+    /// Pure grid arithmetic behind ``predictFrameCount`` — always returns 8k+1.
+    static func snapToGrid(
+        seconds: Float, frameRate: Float, minSeconds: Float, maxSeconds: Float
+    ) -> Int {
         let minFrames = Int((minSeconds * frameRate).rounded())
         let maxFrames = Int((maxSeconds * frameRate).rounded())
 
@@ -96,11 +107,13 @@ final class LTXDurationHead: Module {
         var frames = ((raw - 1) / timeScale) * timeScale + 1
         if frames < minFrames {
             let rounded = ((minFrames - 1) + timeScale - 1) / timeScale * timeScale + 1
-            frames = min(rounded, maxFrames)
+            // A [min, max] window may contain no 8k+1 point at all; capping the
+            // snap-up at maxFrames would leave the grid. Prefer the grid — the
+            // whole contract is "safe to hand to LTXVideoGenerationConfig" —
+            // and exceed maxFrames by at most timeScale-1 frames in that case.
+            frames = rounded <= maxFrames ? rounded : frames + timeScale
         }
-
-        let clamped = seconds > maxSeconds || seconds < minSeconds
-        return (frames, seconds, clamped)
+        return frames
     }
 
     // MARK: - Loading

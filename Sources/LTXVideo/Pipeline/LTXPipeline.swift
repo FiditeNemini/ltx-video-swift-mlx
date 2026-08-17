@@ -345,10 +345,14 @@ public actor LTXPipeline {
                 progressCallback?(progress)
             }
             if let overrideTransformerPath {
+                // Keep the resolved audio bundle: the default init aliases it to
+                // the transformer path, which for an override is a file with no
+                // vocoder.* keys — the silent 24 kHz-fallback path.
                 paths = LTXCheckpointPaths(
                     transformer: URL(fileURLWithPath: overrideTransformerPath),
                     videoVAE: paths.videoVAE,
-                    textEncoder: paths.textEncoder)
+                    textEncoder: paths.textEncoder,
+                    audioBundle: paths.audioBundle)
             }
             unifiedWeightsPathCache.store(paths.transformer.path, for: model)
             return paths
@@ -626,23 +630,36 @@ public actor LTXPipeline {
         let beacon = RuntimeBeacon.begin(task: "load-audio-models", model: model.rawValue)
         defer { beacon?.end() }
 
-        // Step 1: Download and load Audio VAE
+        // Resolve the checkpoint up front: the audio bundle path and the audio
+        // VAE source both depend on it, and resolving late meant a standalone
+        // loadAudioModels() call fell back to the 24 kHz legacy vocoder.
+        let checkpointEarly = try await resolveCheckpoint(progressCallback: progressCallback)
+
+        // Step 1: Download and load Audio VAE. Split checkpoints (2.5) carry
+        // their own audio_vae.* tensors in the audio bundle; only unified-era
+        // checkpoints use the shared Lightricks/LTX-2 file.
         progressCallback?(DownloadProgress(progress: 0.1, message: "Downloading audio VAE..."))
-        let audioVAEPath = try await downloader.downloadAudioVAE { progress in
-            progressCallback?(progress)
+        let audioVAEPath: URL
+        if model.weightsLayout == .split {
+            audioVAEPath = checkpointEarly.audioBundle
+        } else {
+            audioVAEPath = try await downloader.downloadAudioVAE { progress in
+                progressCallback?(progress)
+            }
         }
         let audioVAEWeights = try LTXWeightLoader.loadAudioVAEWeights(from: audioVAEPath.path, includeEncoder: includeEncoder)
 
         audioVAE = AudioVAE(includeEncoder: includeEncoder)
         try LTXWeightLoader.applyAudioVAEWeights(audioVAEWeights, to: audioVAE!)
-        LTXDebug.log("Audio VAE loaded")
+        LTXDebug.log("Audio VAE loaded from \(audioVAEPath.lastPathComponent)")
 
         // Step 2: Download and load Vocoder
         progressCallback?(DownloadProgress(progress: 0.4, message: "Downloading vocoder..."))
         let vocoderPath = try await downloader.downloadVocoder { progress in
             progressCallback?(progress)
         }
-        vocoder = try loadVocoder(audioVAEPath: audioVAEPath, legacyPath: vocoderPath)
+        vocoder = try loadVocoder(
+            bundle: checkpointEarly.audioBundle, audioVAEPath: audioVAEPath, legacyPath: vocoderPath)
         LTXDebug.log("Vocoder loaded (\(vocoder!.outputSampleRate) Hz)")
 
         // Step 3: Create LTX2 dual transformer and load unified weights
@@ -653,7 +670,7 @@ public actor LTXPipeline {
         // Same source as loadModels: on a split checkpoint the aggregate projections
         // live with the text encoder, so resolving only the transformer file here
         // would rebuild the encoder below with randomly-initialised projections.
-        let checkpoint = try await resolveCheckpoint(progressCallback: progressCallback)
+        let checkpoint = checkpointEarly
         let source = LTXCheckpointSource(model: model, paths: checkpoint)
         let (transformerWeights, _, connectorWeightsFromUnified) =
             try source.loadComponents(includeAudio: true)
@@ -3321,9 +3338,9 @@ AESTHETIC QUALITY (in addition to the above, without breaking the objective capt
     /// it produces plausible audio, which is exactly why the mismatch went
     /// unnoticed; it is kept only as a fallback for checkpoints that ship nothing
     /// better.
-    private func loadVocoder(audioVAEPath: URL, legacyPath: URL) throws -> any LTXVocoding {
-        let bundle = (try? resolveCheckpointSync())?.audioBundle ?? audioVAEPath
-        for candidate in [bundle, audioVAEPath] {
+    private func loadVocoder(bundle: URL? = nil, audioVAEPath: URL, legacyPath: URL) throws -> any LTXVocoding {
+        let resolvedBundle = bundle ?? (try? resolveCheckpointSync())?.audioBundle ?? audioVAEPath
+        for candidate in [resolvedBundle, audioVAEPath] {
             do {
                 let vocoder = try BigVGANWeightLoader.load(from: candidate)
                 LTXDebug.log("Vocoder: BigVGAN + BWE from \(candidate.lastPathComponent)")
@@ -3333,7 +3350,10 @@ AESTHETIC QUALITY (in addition to the above, without breaking the objective capt
             }
         }
 
-        LTXDebug.log("Vocoder: falling back to the LTX-2 generator (24 kHz)")
+        // Loud on purpose: this fallback is the documented top-octave-loss
+        // pitfall, and a debug-only log let it regress unnoticed once already.
+        print("⚠️ BigVGAN vocoder unavailable for this checkpoint — falling back to the "
+            + "legacy 24 kHz vocoder (audio loses the 12-16 kHz octave)")
         let weights = try LTXWeightLoader.loadVocoderWeights(from: legacyPath.path)
         let legacy = LTX2Vocoder()
         try LTXWeightLoader.applyVocoderWeights(weights, to: legacy)

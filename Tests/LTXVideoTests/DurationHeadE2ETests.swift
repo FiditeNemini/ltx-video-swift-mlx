@@ -74,3 +74,24 @@ struct DurationHeadE2ETests {
         #expect((clamped.frames - 1) % 8 == 0)
     }
 }
+
+@Suite("Duration grid snapping (pure)")
+struct DurationGridSnapTests {
+
+    @Test func gridlessWindowStaysOnGrid() {
+        // min = max = 5 s @ 24 fps → [120, 120] contains no 8k+1 point.
+        // The old cap min(121, 120) returned 120 — off the grid, and the
+        // documented handoff to LTXVideoGenerationConfig would throw.
+        let f = LTXDurationHead.snapToGrid(seconds: 5.0, frameRate: 24, minSeconds: 5, maxSeconds: 5)
+        #expect((f - 1) % 8 == 0, "must stay on the 8k+1 grid, got \(f)")
+    }
+
+    @Test func normalWindowsRespectBounds() {
+        for (sec, minS, maxS) in [(Float(14.04), Float(1), Float(20)), (0.2, 1, 20), (99, 1, 20)] {
+            let f = LTXDurationHead.snapToGrid(seconds: sec, frameRate: 24, minSeconds: minS, maxSeconds: maxS)
+            #expect((f - 1) % 8 == 0)
+            #expect(f >= Int((minS * 24).rounded()))
+            #expect(f <= Int((maxS * 24).rounded()))
+        }
+    }
+}
