@@ -162,13 +162,53 @@ public actor ModelDownloader {
 
         let (tempURL, response) = try await session.download(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
+        guard let httpResponse = response as? HTTPURLResponse else {
             throw LTXError.downloadFailed("Failed to download \(filename)")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw Self.downloadError(
+                statusCode: httpResponse.statusCode,
+                repoId: repoId,
+                filename: filename,
+                hasToken: hfToken != nil)
         }
 
         // Move to destination
         try FileManager.default.moveItem(at: tempURL, to: destination)
+    }
+
+    /// Turn an HTTP failure into an actionable error.
+    ///
+    /// Gated repositories (every LTX-2.5 repo, and the IC-LoRA repos) answer 401
+    /// without a token and 403 when the token's account has not accepted the
+    /// licence. Both used to surface as a bare "Failed to download", which gives
+    /// the user nothing to act on.
+    private static func downloadError(
+        statusCode: Int,
+        repoId: String,
+        filename: String,
+        hasToken: Bool
+    ) -> LTXError {
+        let repoURL = "https://huggingface.co/\(repoId)"
+        switch statusCode {
+        case 401:
+            return .downloadFailed(
+                "\(repoId) requires authentication (HTTP 401). Accept the licence at \(repoURL), "
+                + "then provide a token via --hf-token, $HF_TOKEN, or `huggingface-cli login`.")
+        case 403:
+            let detail = hasToken
+                ? "the token's HuggingFace account has not accepted the licence"
+                : "no HuggingFace token was found"
+            return .downloadFailed(
+                "Access to \(repoId) is gated (HTTP 403) — \(detail). "
+                + "Click \"Agree and Access\" at \(repoURL), then retry.")
+        case 404:
+            return .downloadFailed(
+                "\(filename) was not found in \(repoId) (HTTP 404). The file may have been "
+                + "renamed or superseded upstream — check \(repoURL)/tree/main.")
+        default:
+            return .downloadFailed("Failed to download \(filename) from \(repoId) (HTTP \(statusCode))")
+        }
     }
 
     // MARK: - Per-Component Downloads
@@ -320,10 +360,12 @@ public actor ModelDownloader {
         let repoId = model.huggingFaceRepo
         let filename = model.unifiedWeightsFilename
         let localDir = componentCacheDir(model: model)
-        let destination = localDir.appendingPathComponent(filename)
+        // Split checkpoints (LTX-2.5) address files by repo-relative path; the cache
+        // stores them flat under the variant's directory.
+        let destination = localDir.appendingPathComponent((filename as NSString).lastPathComponent)
 
         if FileManager.default.fileExists(atPath: destination.path) {
-            progress?(DownloadProgress(progress: 1.0, message: "Unified weights already downloaded"))
+            progress?(DownloadProgress(progress: 1.0, message: "\(destination.lastPathComponent) already downloaded"))
             return destination
         }
 
@@ -331,7 +373,84 @@ public actor ModelDownloader {
 
         progress?(DownloadProgress(progress: 0.1, currentFile: filename, message: "Downloading \(filename)..."))
         try await downloadFile(repoId: repoId, filename: filename, to: destination)
-        progress?(DownloadProgress(progress: 1.0, message: "Unified weights download complete"))
+        progress?(DownloadProgress(progress: 1.0, message: "\(destination.lastPathComponent) download complete"))
+        return destination
+    }
+
+    // MARK: - Checkpoint resolution
+
+    /// Download whatever files `model` needs and return their locations.
+    ///
+    /// Unified checkpoints (LTX-2.3) resolve to a single file referenced several
+    /// times; split checkpoints (LTX-2.5) pull the transformer, the conv video VAE,
+    /// the text-encoder bundle and the audio bundle separately. The audio file is
+    /// small (~350 MB) and carries the vocoder, so it comes down with the rest. The
+    /// diffusion video decoder and the duration head are deliberately not fetched:
+    /// neither is implemented, and together they would add gigabytes a caller
+    /// cannot use.
+    public func downloadCheckpoint(
+        model: LTXModel,
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> LTXCheckpointPaths {
+        let unified = try await downloadUnifiedWeights(model: model, progress: progress)
+
+        switch model.weightsLayout {
+        case .unified:
+            return LTXCheckpointPaths(transformer: unified, videoVAE: unified)
+
+        case .split:
+            let localDir = componentCacheDir(model: model)
+            var resolved: [LTXComponentFile.Kind: URL] = [:]
+            let wanted: [LTXComponentFile.Kind] = [.videoVAE, .textEncoder, .audioVAE]
+            let files = model.family.sharedComponentFiles.filter { wanted.contains($0.kind) }
+
+            for (index, file) in files.enumerated() {
+                let destination = localDir.appendingPathComponent(file.filename)
+                if !FileManager.default.fileExists(atPath: destination.path) {
+                    progress?(DownloadProgress(
+                        progress: Double(index) / Double(files.count),
+                        currentFile: file.filename,
+                        message: "Downloading \(file.filename) (~\(String(format: "%.1f", file.sizeGB)) GB)..."))
+                    try await downloadFile(
+                        repoId: model.huggingFaceRepo, filename: file.path, to: destination)
+                }
+                resolved[file.kind] = destination
+            }
+
+            guard let videoVAE = resolved[.videoVAE], let textEncoder = resolved[.textEncoder],
+                  let audioBundle = resolved[.audioVAE] else {
+                throw LTXError.downloadFailed("Incomplete split checkpoint for \(model.displayName)")
+            }
+            progress?(DownloadProgress(progress: 1.0, message: "Checkpoint ready"))
+            return LTXCheckpointPaths(
+                transformer: unified, videoVAE: videoVAE,
+                textEncoder: textEncoder, audioBundle: audioBundle)
+        }
+    }
+
+    /// Download the LTX-2.5 duration head (~4 MB).
+    ///
+    /// Kept out of ``downloadCheckpoint`` because it is optional: a caller that
+    /// always passes an explicit frame count never needs it.
+    public func downloadDurationHead(
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> URL {
+        guard let file = LTXModelFamily.ltx25.sharedComponentFiles.first(where: { $0.kind == .durationHead })
+        else {
+            throw LTXError.downloadFailed("No duration head is published for this generation")
+        }
+        let destination = cacheDirectory
+            .appendingPathComponent("ltx-2.5-duration-head")
+            .appendingPathComponent(file.filename)
+
+        if FileManager.default.fileExists(atPath: destination.path) {
+            progress?(DownloadProgress(progress: 1.0, message: "Duration head already downloaded"))
+            return destination
+        }
+        progress?(DownloadProgress(progress: 0.1, message: "Downloading duration head..."))
+        try await downloadFile(
+            repoId: LTXModelFamily.ltx25.huggingFaceRepo, filename: file.path, to: destination)
+        progress?(DownloadProgress(progress: 1.0, message: "Duration head download complete"))
         return destination
     }
 
@@ -378,8 +497,11 @@ public actor ModelDownloader {
     ) async throws -> URL {
         let localDir = vlmGemmaCacheDir
 
-        // Quick check: if config.json exists, assume already downloaded
-        if FileManager.default.fileExists(atPath: localDir.appendingPathComponent("config.json").path) {
+        // "Complete" means every listed file exists — same interrupted-download
+        // healing rationale as downloadGemma4Enhancer.
+        if Self.vlmGemmaFiles.allSatisfy({
+            FileManager.default.fileExists(atPath: localDir.appendingPathComponent($0).path)
+        }) {
             progress?(DownloadProgress(progress: 1.0, message: "VLM Gemma already downloaded"))
             return localDir
         }
@@ -418,6 +540,69 @@ public actor ModelDownloader {
         }
 
         progress?(DownloadProgress(progress: 1.0, message: "VLM Gemma download complete"))
+        return localDir
+    }
+
+    // MARK: - Gemma 4 E2B prompt enhancer (LTX-2.5)
+
+    /// HuggingFace repo for the LTX-2.5 prompt enhancer — a small *generative*
+    /// Gemma 4 instruct model. The bundled 12B encoder cannot fill this role:
+    /// upstream declares `gemma4_unified` encode-only, and its LM head is
+    /// measurably vestigial (docs/knowledge). Mirrors upstream's
+    /// `--prompt-enhancer-gemma-root` pointing at a Gemma 4 E2B-it checkpoint.
+    /// Licence: Google Gemma Terms of Use; the mlx-community mirror is not gated.
+    private static let gemma4EnhancerRepoID = "mlx-community/gemma-4-e2b-it-bf16"
+
+    private static let gemma4EnhancerFiles = [
+        "model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors",
+        "model.safetensors.index.json",
+        "config.json",
+        "generation_config.json",
+        "chat_template.jinja",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
+
+    /// Cache directory for the Gemma 4 E2B enhancer (shared across variants,
+    /// under the models dir so `--models-dir` routes it like every other model).
+    internal var gemma4EnhancerCacheDir: URL {
+        cacheDirectory.appendingPathComponent("enhancer-gemma4-e2b-bf16")
+    }
+
+    /// Download the Gemma 4 E2B-it prompt enhancer (bf16, ~10GB — the
+    /// reference space runs it unquantized; 4-bit degraded instruction following).
+    public func downloadGemma4Enhancer(
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> URL {
+        let localDir = gemma4EnhancerCacheDir
+        // "Complete" means every listed file exists — config.json alone is file 5
+        // of 10, and an interrupted download must heal on rerun, not early-return
+        // into a permanently poisoned cache (downloadFile skips existing files).
+        let allPresent = Self.gemma4EnhancerFiles.allSatisfy {
+            FileManager.default.fileExists(atPath: localDir.appendingPathComponent($0).path)
+        }
+        if allPresent {
+            progress?(DownloadProgress(progress: 1.0, message: "Gemma 4 enhancer already downloaded"))
+            return localDir
+        }
+        try FileManager.default.createDirectory(at: localDir, withIntermediateDirectories: true)
+        let totalFiles = Self.gemma4EnhancerFiles.count
+        for (i, file) in Self.gemma4EnhancerFiles.enumerated() {
+            progress?(DownloadProgress(
+                progress: Double(i) / Double(totalFiles),
+                currentFile: file,
+                message: "Downloading enhancer-gemma4-e2b/\(file)..."
+            ))
+            try await downloadFile(
+                repoId: Self.gemma4EnhancerRepoID,
+                filename: file,
+                to: localDir.appendingPathComponent(file)
+            )
+        }
+        progress?(DownloadProgress(progress: 1.0, message: "Gemma 4 enhancer download complete"))
         return localDir
     }
 
@@ -484,96 +669,113 @@ public actor ModelDownloader {
 
     // MARK: - Upscaler & LoRA Downloads
 
+    /// Filenames that a given auxiliary model has shipped under, newest first.
+    ///
+    /// Upstream renames files in place (the LipDub IC-LoRA became Dub-It, the x2
+    /// spatial upscaler went 1.0 → 1.1 and the old revision was withdrawn), so a
+    /// cache populated by an earlier release holds a name the catalog no longer
+    /// knows. Downloads always use `filePath`; cache lookups accept any known name.
+    private static func knownFilenames(for aux: LTXAuxiliaryModel) -> [String] {
+        switch aux {
+        case .spatialUpscalerX2_23:
+            return [aux.filename, "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"]
+        case .dubItLoRA_23:
+            return [aux.filename, "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"]
+        default:
+            return [aux.filename]
+        }
+    }
+
+    /// Local path of an already-downloaded auxiliary model, if any.
+    public func cachedPath(for aux: LTXAuxiliaryModel) -> URL? {
+        let dir = cacheDirectory.appendingPathComponent(aux.cacheDirectoryName)
+        for name in Self.knownFilenames(for: aux) {
+            let candidate = dir.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// Download an auxiliary model (upscaler, LoRA, model patch) described by the catalog.
+    ///
+    /// Gated artefacts require a token whose HuggingFace account accepted the licence
+    /// on `aux.huggingFaceURL`; a missing or unauthorised token surfaces as a
+    /// descriptive `LTXError.downloadFailed` rather than a bare failure.
+    public func downloadAuxiliaryModel(
+        _ aux: LTXAuxiliaryModel,
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> URL {
+        if let cached = cachedPath(for: aux) {
+            progress?(DownloadProgress(progress: 1.0, message: "\(aux.displayName) already downloaded"))
+            return cached
+        }
+
+        let destination = cacheDirectory
+            .appendingPathComponent(aux.cacheDirectoryName)
+            .appendingPathComponent(aux.filename)
+
+        progress?(DownloadProgress(
+            progress: 0.1,
+            currentFile: aux.filename,
+            message: "Downloading \(aux.displayName)..."))
+        try await downloadFile(repoId: aux.huggingFaceRepo, filename: aux.filePath, to: destination)
+        progress?(DownloadProgress(progress: 1.0, message: "\(aux.displayName) download complete"))
+        return destination
+    }
+
+    /// Whether an auxiliary model is present in the cache.
+    public func isDownloaded(_ aux: LTXAuxiliaryModel) -> Bool {
+        cachedPath(for: aux) != nil
+    }
+
     /// Spatial upscaler filename on HuggingFace (LTX-2.3 x2 upscaler)
-    public static let spatialUpscalerFilename = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+    public static var spatialUpscalerFilename: String { LTXAuxiliaryModel.spatialUpscalerX2_23.filename }
 
     /// Distilled LoRA filename on HuggingFace
-    public static let distilledLoRAFilename = "ltx-2.3-22b-distilled-lora-384.safetensors"
+    public static var distilledLoRAFilename: String { LTXAuxiliaryModel.distilledLoRA_23.filename }
 
     /// Download spatial upscaler weights
     public func downloadUpscalerWeights(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
-        let repoId = "Lightricks/LTX-2.3"
-        let filename = Self.spatialUpscalerFilename
-
-        let weightsDir = cacheDirectory.appendingPathComponent("ltx-upscaler")
-        let destination = weightsDir.appendingPathComponent(filename)
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            progress?(DownloadProgress(progress: 1.0, message: "Upscaler weights already downloaded"))
-            return destination
-        }
-
-        progress?(DownloadProgress(progress: 0.1, message: "Downloading spatial upscaler weights..."))
-        try await downloadFile(repoId: repoId, filename: filename, to: destination)
-        progress?(DownloadProgress(progress: 1.0, message: "Upscaler download complete"))
-        return destination
+        try await downloadAuxiliaryModel(.spatialUpscalerX2_23, progress: progress)
     }
 
     /// Check if spatial upscaler weights are downloaded
     public func isUpscalerDownloaded() -> Bool {
-        let destination = cacheDirectory.appendingPathComponent("ltx-upscaler/\(Self.spatialUpscalerFilename)")
-        return FileManager.default.fileExists(atPath: destination.path)
+        isDownloaded(.spatialUpscalerX2_23)
     }
 
     /// Download distilled LoRA weights
     public func downloadDistilledLoRA(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
-        let repoId = "Lightricks/LTX-2.3"
-        let filename = Self.distilledLoRAFilename
-
-        let weightsDir = cacheDirectory.appendingPathComponent("ltx-lora")
-        let destination = weightsDir.appendingPathComponent(filename)
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            progress?(DownloadProgress(progress: 1.0, message: "Distilled LoRA already downloaded"))
-            return destination
-        }
-
-        progress?(DownloadProgress(progress: 0.1, message: "Downloading distilled LoRA weights..."))
-        try await downloadFile(repoId: repoId, filename: filename, to: destination)
-        progress?(DownloadProgress(progress: 1.0, message: "Distilled LoRA download complete"))
-        return destination
+        try await downloadAuxiliaryModel(.distilledLoRA_23, progress: progress)
     }
 
     /// Check if distilled LoRA weights are downloaded
     public func isDistilledLoRADownloaded() -> Bool {
-        let destination = cacheDirectory.appendingPathComponent("ltx-lora/\(Self.distilledLoRAFilename)")
-        return FileManager.default.fileExists(atPath: destination.path)
+        isDownloaded(.distilledLoRA_23)
     }
 
-    /// LipDub IC-LoRA filename on HuggingFace
-    public static let lipDubLoRAFilename = "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+    /// Dub-It (formerly LipDub) IC-LoRA filename on HuggingFace
+    public static var lipDubLoRAFilename: String { LTXAuxiliaryModel.dubItLoRA_23.filename }
 
-    /// Download the LipDub IC-LoRA from `Lightricks/LTX-2.3-22b-IC-LoRA-LipDub`.
+    /// Download the Dub-It IC-LoRA from `Lightricks/LTX-2.3-22b-IC-LoRA-DubIt`
+    /// (published as "LipDub" until August 2026).
     /// Repo is gated; the user must have accepted the license on HF and provided
     /// `hfToken` at downloader construction time.
     public func downloadLipDubLoRA(
         progress: DownloadProgressCallback? = nil
     ) async throws -> URL {
-        let repoId = "Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
-        let filename = Self.lipDubLoRAFilename
-
-        let weightsDir = cacheDirectory.appendingPathComponent("ltx-lora-lipdub")
-        let destination = weightsDir.appendingPathComponent(filename)
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            progress?(DownloadProgress(progress: 1.0, message: "LipDub IC-LoRA already downloaded"))
-            return destination
-        }
-
-        progress?(DownloadProgress(progress: 0.1, message: "Downloading LipDub IC-LoRA weights..."))
-        try await downloadFile(repoId: repoId, filename: filename, to: destination)
-        progress?(DownloadProgress(progress: 1.0, message: "LipDub IC-LoRA download complete"))
-        return destination
+        try await downloadAuxiliaryModel(.dubItLoRA_23, progress: progress)
     }
 
-    /// Check if LipDub IC-LoRA weights are downloaded
+    /// Check if Dub-It / LipDub IC-LoRA weights are downloaded
     public func isLipDubLoRADownloaded() -> Bool {
-        let destination = cacheDirectory.appendingPathComponent("ltx-lora-lipdub/\(Self.lipDubLoRAFilename)")
-        return FileManager.default.fileExists(atPath: destination.path)
+        isDownloaded(.dubItLoRA_23)
     }
 
     /// Clear downloaded models
@@ -1142,6 +1344,22 @@ class LTXWeightLoader {
             }
         }
 
+        // Every declared parameter must be fed. An unfed aggregate projection is not
+        // a degraded encoder, it is a random one: the prompt embedding becomes noise
+        // and generation silently produces a plausible video of the wrong thing.
+        // This bit twice on LTX-2.5 — the split checkpoint keeps `text_embedding_projection.*`
+        // in the text-encoder bundle, so any path that reloads the encoder from the
+        // transformer file alone leaves the projections at their random initialisation.
+        let declared = Set(flatParameters.keys)
+        let unfed = declared.subtracting(updates.keys).sorted()
+        guard unfed.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "Text encoder: \(unfed.count) parameters were not fed by the checkpoint "
+                + "(\(unfed.prefix(5).joined(separator: ", "))\(unfed.count > 5 ? ", …" : "")). "
+                + "A split checkpoint keeps the aggregate projections with the text encoder, "
+                + "not with the transformer — load both.")
+        }
+
         _ = model.update(parameters: ModuleParameters.unflattened(updates))
         if skippedAudio > 0 {
             LTXDebug.log("Applied \(updates.count) weights to TextEncoder (skipped \(skippedAudio) audio connector keys)")
@@ -1161,12 +1379,32 @@ class LTXWeightLoader {
         let raw = try loadArrays(url: URL(fileURLWithPath: path))
 
         var filteredWeights: [String: MLXArray] = [:]
-        for (key, value) in raw {
+        for (rawKey, value) in raw {
+            // Split checkpoints (LTX-2.5) prefix their audio-VAE tensors and name
+            // the latent statistics differently — and those statistics are NOT
+            // byte-identical to LTX-2's (measured ~2-5% off, retuned for 2.5),
+            // so mapping them here is a correctness requirement, not cosmetics.
+            var key = rawKey.hasPrefix("audio_vae.")
+                ? String(rawKey.dropFirst("audio_vae.".count)) : rawKey
+            switch key {
+            case "per_channel_statistics.mean-of-means": key = "latents_mean"
+            case "per_channel_statistics.std-of-means": key = "latents_std"
+            default: break
+            }
             if key.hasPrefix("decoder.") || key == "latents_mean" || key == "latents_std" {
                 filteredWeights[key] = value
             } else if includeEncoder && key.hasPrefix("encoder.") {
                 filteredWeights[key] = value
             }
+        }
+        guard !filteredWeights.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "No audio-VAE tensors in \((path as NSString).lastPathComponent) — wrong file for this component")
+        }
+        guard filteredWeights["latents_mean"] != nil, filteredWeights["latents_std"] != nil else {
+            throw LTXError.weightLoadingFailed(
+                "Audio-VAE latent statistics missing from \((path as NSString).lastPathComponent) — "
+                + "decoding would run un-normalised")
         }
 
         let encoderCount = filteredWeights.keys.filter { $0.hasPrefix("encoder.") }.count

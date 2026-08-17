@@ -23,6 +23,23 @@ anchors with ±30% noise (thermal state matters, see below).
 | `lipdub` 384×256×121 (video ref + target audio) | 335 s and 829 s observed |
 | `lipdub` 384×256×33 (E2E, back-to-back pair) | 67 s → 131 s and 234 s → 522 s |
 
+# LTX-2.5 anchors (August 2026)
+
+Same machine, `2.5-distilled`, i2v, two-stage, weights on an external SSD.
+
+| Operation | Measured |
+|---|---|
+| Model load (transformer + Gemma 4 encoder), qint8 | 69 s |
+| `generate` 768×512×121, qint8 | 330 s |
+| `generate` 1280×832×121, bf16 | 1332 s |
+
+Two things to expect when reading these against 2.3. The load number covers a
+**24 GB bf16 text encoder** that 2.3 does not pay for — its Gemma 3 arrives
+pre-quantized from `mlx-community`, while 2.5's derivative exists in bf16 only,
+so `--transformer-quant` has to carry the encoder too. And the 1280×832 stage 2
+runs ~42 000 latent tokens, roughly 4× the 768×512 stage 2, which is most of the
+gap between those two rows — quantization accounts for far less of it.
+
 # Known variance sources
 
 - **Back-to-back runs**: the second of two consecutive LipDub runs measured

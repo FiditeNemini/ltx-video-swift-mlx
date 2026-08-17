@@ -32,6 +32,16 @@ are those where prompt and audio provably agree.
 
 # 3. The LTX audio decoder — innocent (measured)
 
+> **August 2026 note.** LTX-2.3 bundles a BigVGAN v2 + bandwidth-extension
+> vocoder this package was not running; it loaded LTX-2's instead. A same-seed
+> A/B shows the mismatch costs the top octave (+18 dB at 12–16 kHz once fixed)
+> and nothing below 8 kHz, so **the conclusions below stand unchanged**. An
+> earlier version of this note claimed the probes had missed a 1–4 kHz hole —
+> that claim came from comparing two different generations and has been
+> withdrawn. See
+> [the vocoder pitfall](/docs/knowledge/pitfalls/wrong-vocoder-lost-the-top-octave.md).
+
+
 Three independent measurements clear the AudioVAE + vocoder chain:
 
 | Probe | Input → generated |

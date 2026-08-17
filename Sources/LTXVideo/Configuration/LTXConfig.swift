@@ -5,14 +5,22 @@ import Foundation
 
 // MARK: - Model Selection
 
-/// LTX-2.3 model variants
+/// LTX model variants across the 2.3 and 2.5 generations.
 ///
-/// Uses unified safetensors format from `Lightricks/LTX-2.3`:
+/// **LTX-2.3** (`Lightricks/LTX-2.3`, open repo) uses a unified safetensors file:
 /// - `ltx-2.3-22b-distilled.safetensors` — Distilled model (transformer + VAE + connector)
 /// - `ltx-2.3-22b-dev.safetensors` — Dev model (transformer + VAE + connector)
 ///
 /// Audio VAE and vocoder are downloaded from `Lightricks/LTX-2` (shared components).
-/// VLM Gemma is shared across all variants (`mlx-community/gemma-3-12b-it-qat-4bit`).
+/// The text encoder is stock Gemma 3 12B (`mlx-community/gemma-3-12b-it-qat-4bit`).
+///
+/// **LTX-2.5** (`Lightricks/LTX-2.5`, gated) ships one file per component and swaps
+/// the text encoder for an LTX-specific Gemma 4 12B derivative bundled with the
+/// checkpoint. Text- and image-to-video run; the diffusion decoder, the temporal
+/// upscaler and the pixel upscaler IC-LoRA are not implemented — see
+/// ``LTXModel/support``.
+///
+/// Licensing, gating and packaging live in `LTXModelCatalog.swift`.
 public enum LTXModel: String, CaseIterable, Sendable {
     /// LTX-2.3 Distilled - 8 steps, no CFG, two-stage pipeline
     case distilled = "distilled"
@@ -20,42 +28,66 @@ public enum LTXModel: String, CaseIterable, Sendable {
     /// LTX-2.3 Dev - 30 steps, CFG 3.0, required for LoRA training
     case dev = "dev"
 
+    /// LTX-2.5 Distilled - 8 steps, no CFG, gated repo, Gemma 4 text encoder
+    case v25Distilled = "2.5-distilled"
+
+    /// LTX-2.5 Dev - 30 steps, CFG 3.0, gated repo, Gemma 4 text encoder
+    case v25Dev = "2.5-dev"
+
     public var displayName: String {
         switch self {
         case .distilled: return "LTX-2.3 Distilled (~46GB)"
         case .dev: return "LTX-2.3 Dev (~46GB)"
+        case .v25Distilled: return "LTX-2.5 Distilled (~70GB)"
+        case .v25Dev: return "LTX-2.5 Dev (~70GB)"
         }
     }
 
     /// Default number of inference steps
     public var defaultSteps: Int {
         switch self {
-        case .distilled: return 8
-        case .dev: return 30
+        case .distilled, .v25Distilled: return 8
+        case .dev, .v25Dev: return 30
         }
     }
 
     /// Estimated VRAM usage in GB (with 3-phase loading)
     public var estimatedVRAM: Int {
-        return 46
+        switch self {
+        case .distilled, .dev: return 46
+        // 2.5 is split: 42 GB transformer + 26 GB bf16 Gemma 4 encoder, and unlike
+        // 2.3 there is no community 4-bit encoder to fall back on.
+        case .v25Distilled, .v25Dev: return 70
+        }
     }
 
     /// HuggingFace repository for this model
     public var huggingFaceRepo: String {
-        return "Lightricks/LTX-2.3"
+        family.huggingFaceRepo
     }
 
-    /// Unified weights filename (single file containing transformer, VAE, connector)
+    /// Main weights filename.
+    ///
+    /// For LTX-2.3 (``LTXWeightsLayout/unified``) this single file holds transformer,
+    /// VAE and connector. For LTX-2.5 (``LTXWeightsLayout/split``) it is the transformer
+    /// shard only — the other components are listed in ``componentFiles``.
     public var unifiedWeightsFilename: String {
         switch self {
         case .distilled: return "ltx-2.3-22b-distilled.safetensors"
         case .dev: return "ltx-2.3-22b-dev.safetensors"
+        case .v25Distilled:
+            return "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+        case .v25Dev:
+            return "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
         }
     }
 
     /// Get the transformer configuration for this model
     public var transformerConfig: LTXTransformerConfig {
-        return .ltx23
+        switch family {
+        case .ltx23: return .ltx23
+        case .ltx25: return .ltx25
+        }
     }
 
     // MARK: - Model Capabilities
@@ -66,36 +98,42 @@ public enum LTXModel: String, CaseIterable, Sendable {
     /// Whether this model can be used for LoRA training
     public var isForTraining: Bool {
         switch self {
-        case .dev: return true
-        case .distilled: return false
+        case .dev, .v25Dev: return true
+        case .distilled, .v25Distilled: return false
         }
     }
 
-    /// Whether the model requires authentication to download
-    public var isGated: Bool { false }
+    /// Whether the model requires accepting a licence on HuggingFace (and a token) to download
+    public var isGated: Bool { gating.requiresToken }
 
     /// License identifier
-    public var license: String { "lightricks-ltx-2.3" }
+    public var license: String { licenseInfo.id }
 
-    /// Whether commercial use is allowed
-    public var isCommercialUseAllowed: Bool { true }
+    /// Whether commercial use is allowed — under the conditions in ``commercialUseSummary``
+    public var isCommercialUseAllowed: Bool { licenseInfo.allowsCommercialUse }
 
     /// Estimated model size on disk in GB
-    public var estimatedSizeGB: Float { 46.1 }
+    public var estimatedSizeGB: Float {
+        switch self {
+        case .distilled, .dev: return 46.1
+        // Transformer 42.0 + Gemma 4 encoder 26.3 + video VAE 1.45 + audio VAE 0.36.
+        case .v25Distilled, .v25Dev: return 70.1
+        }
+    }
 
     /// Default CFG guidance scale
     public var defaultGuidance: Float {
         switch self {
-        case .dev: return 3.0
-        case .distilled: return 1.0
+        case .dev, .v25Dev: return 3.0
+        case .distilled, .v25Distilled: return 1.0
         }
     }
 
     /// Default STG scale
     public var defaultSTGScale: Float {
         switch self {
-        case .dev: return 1.0
-        case .distilled: return 0.0
+        case .dev, .v25Dev: return 1.0
+        case .distilled, .v25Distilled: return 0.0
         }
     }
 
@@ -104,34 +142,71 @@ public enum LTXModel: String, CaseIterable, Sendable {
         switch self {
         case .distilled: return "Fast inference (8 steps), two-stage pipeline"
         case .dev: return "Full quality (30 steps), CFG 3.0, LoRA training"
+        case .v25Distilled: return "LTX-2.5 fast inference (8 steps), multishot, Gemma 4"
+        case .v25Dev: return "LTX-2.5 full quality (30 steps), CFG 3.0, LoRA training"
         }
     }
 
-    /// Print a summary of all available models
+    /// Print a summary of all available models, their licensing and their status.
     public static func printModelList() {
-        print("Available LTX-2.3 Models:")
-        print(String(repeating: "-", count: 80))
-        let header = "Variant".padding(toLength: 12, withPad: " ", startingAt: 0)
-            + "Inference".padding(toLength: 10, withPad: " ", startingAt: 0)
-            + "Training".padding(toLength: 10, withPad: " ", startingAt: 0)
-            + "Steps".padding(toLength: 8, withPad: " ", startingAt: 0)
-            + "Size".padding(toLength: 10, withPad: " ", startingAt: 0)
-            + "Gated".padding(toLength: 8, withPad: " ", startingAt: 0)
+        print("Available LTX models:")
+        print(String(repeating: "-", count: 104))
+        let header = "Variant".padding(toLength: 16, withPad: " ", startingAt: 0)
+            + "Status".padding(toLength: 9, withPad: " ", startingAt: 0)
+            + "Infer".padding(toLength: 7, withPad: " ", startingAt: 0)
+            + "Train".padding(toLength: 7, withPad: " ", startingAt: 0)
+            + "Steps".padding(toLength: 7, withPad: " ", startingAt: 0)
+            + "Size".padding(toLength: 9, withPad: " ", startingAt: 0)
+            + "Gated".padding(toLength: 7, withPad: " ", startingAt: 0)
+            + "Text encoder".padding(toLength: 20, withPad: " ", startingAt: 0)
             + "License"
         print(header)
-        print(String(repeating: "-", count: 80))
+        print(String(repeating: "-", count: 104))
         for model in LTXModel.allCases {
-            let line = model.rawValue.padding(toLength: 12, withPad: " ", startingAt: 0)
-                + (model.isForInference ? "yes" : "no").padding(toLength: 10, withPad: " ", startingAt: 0)
-                + (model.isForTraining ? "yes" : "no").padding(toLength: 10, withPad: " ", startingAt: 0)
-                + "\(model.defaultSteps)".padding(toLength: 8, withPad: " ", startingAt: 0)
-                + "\(String(format: "%.1f", model.estimatedSizeGB))GB".padding(toLength: 10, withPad: " ", startingAt: 0)
-                + (model.isGated ? "yes" : "no").padding(toLength: 8, withPad: " ", startingAt: 0)
-                + model.license
+            let line = model.rawValue.padding(toLength: 16, withPad: " ", startingAt: 0)
+                + model.support.label.padding(toLength: 9, withPad: " ", startingAt: 0)
+                + (model.isForInference ? "yes" : "no").padding(toLength: 7, withPad: " ", startingAt: 0)
+                + (model.isForTraining ? "yes" : "no").padding(toLength: 7, withPad: " ", startingAt: 0)
+                + "\(model.defaultSteps)".padding(toLength: 7, withPad: " ", startingAt: 0)
+                + "\(String(format: "%.0f", model.estimatedSizeGB))GB".padding(toLength: 9, withPad: " ", startingAt: 0)
+                + (model.isGated ? "yes" : "no").padding(toLength: 7, withPad: " ", startingAt: 0)
+                + model.textEncoder.rawValue.padding(toLength: 20, withPad: " ", startingAt: 0)
+                + model.licenseName
             print(line)
         }
-        print(String(repeating: "-", count: 80))
-        print("Shared components: VLM Gemma (~7.5GB), Audio VAE (~100MB), Vocoder (~106MB)")
+        print(String(repeating: "-", count: 104))
+        print("Status: ready = runnable today; catalog = published weights, not implemented here yet.")
+        for model in LTXModel.allCases {
+            if case .notImplemented(let reason) = model.support {
+                print("  \(model.rawValue): \(reason)")
+            }
+        }
+        print()
+
+        print("Auxiliary models (upscalers, LoRAs):")
+        print(String(repeating: "-", count: 104))
+        let auxHeader = "Name".padding(toLength: 34, withPad: " ", startingAt: 0)
+            + "Status".padding(toLength: 9, withPad: " ", startingAt: 0)
+            + "Size".padding(toLength: 9, withPad: " ", startingAt: 0)
+            + "Gated".padding(toLength: 7, withPad: " ", startingAt: 0)
+            + "Repository"
+        print(auxHeader)
+        print(String(repeating: "-", count: 104))
+        for aux in LTXAuxiliaryModel.allCases {
+            let line = aux.rawValue.padding(toLength: 34, withPad: " ", startingAt: 0)
+                + aux.support.label.padding(toLength: 9, withPad: " ", startingAt: 0)
+                + "\(String(format: "%.1f", aux.approximateSizeGB))GB".padding(toLength: 9, withPad: " ", startingAt: 0)
+                + (aux.gating.requiresToken ? "yes" : "no").padding(toLength: 7, withPad: " ", startingAt: 0)
+                + aux.huggingFaceRepo
+            print(line)
+        }
+        print(String(repeating: "-", count: 104))
+        print()
+        print("Gated repositories require accepting the licence on the model page, then a")
+        print("HuggingFace token (--hf-token, $HF_TOKEN, or ~/.cache/huggingface/token).")
+        print("License: \(LTXLicense.ltx2Community.name) — \(LTXLicense.ltx2Community.url)")
+        print("  \(LTXLicense.ltx2Community.summary)")
+        print("Shared components (LTX-2.3): VLM Gemma (~7.5GB), Audio VAE (~100MB), Vocoder (~106MB)")
     }
 }
 
@@ -187,6 +262,29 @@ public struct LTXTransformerConfig: Codable, Sendable {
     /// When true, both `captionProjection` and `audioCaptionProjection` are skipped.
     public var captionProjBeforeConnector: Bool
 
+    /// Whether the **video** block feed-forward layers carry biases.
+    ///
+    /// LTX-2.3 checkpoints ship `ff.net.0.proj.bias` and `ff.net.2.bias` for every
+    /// block; LTX-2.5 sets `ff_bias: false` and ships neither. Building bias-carrying
+    /// Linears for a 2.5 checkpoint would leave 96 randomly-initialised bias vectors
+    /// in the forward pass, so this must track the checkpoint.
+    /// (Connector blocks keep their FFN biases in both generations.)
+    public var ffBias: Bool
+
+    /// Whether the **audio** block feed-forward layers carry biases.
+    ///
+    /// Separate from ``ffBias`` because LTX-2.5 diverges between the two streams:
+    /// it sets `ff_bias: false` but leaves `audio_ff_bias` unset, and the audio
+    /// blocks do ship `audio_ff.net.{0.proj,2}.bias`. Tying the two together drops
+    /// 96 trained audio biases — which the video path never notices.
+    public var audioFfBias: Bool
+
+    /// LTX-2.5 `use_keyframes_abs_pos_embedding`: the checkpoint carries a learned
+    /// `keyframes_abs_pos_embedding` marker added to *generated* keyframe slots
+    /// (the DFR pipeline's interior keyframes). Ordinary image / first-and-last-frame
+    /// conditioning is never marked, so this stays unused by the standard paths.
+    public var keyframesAbsPosEmbedding: Bool
+
     public init(
         numLayers: Int = 48,
         numAttentionHeads: Int = 32,
@@ -206,7 +304,10 @@ public struct LTXTransformerConfig: Codable, Sendable {
         audioMaxPos: [Int] = [20],
         gatedAttention: Bool = false,
         crossAttentionAdaLN: Bool = false,
-        captionProjBeforeConnector: Bool = false
+        captionProjBeforeConnector: Bool = false,
+        ffBias: Bool = true,
+        audioFfBias: Bool = true,
+        keyframesAbsPosEmbedding: Bool = false
     ) {
         self.numLayers = numLayers
         self.numAttentionHeads = numAttentionHeads
@@ -227,6 +328,9 @@ public struct LTXTransformerConfig: Codable, Sendable {
         self.gatedAttention = gatedAttention
         self.crossAttentionAdaLN = crossAttentionAdaLN
         self.captionProjBeforeConnector = captionProjBeforeConnector
+        self.ffBias = ffBias
+        self.audioFfBias = audioFfBias
+        self.keyframesAbsPosEmbedding = keyframesAbsPosEmbedding
     }
 
     // MARK: - Audio Configuration
@@ -258,6 +362,27 @@ public struct LTXTransformerConfig: Codable, Sendable {
         gatedAttention: true,
         crossAttentionAdaLN: true,
         captionProjBeforeConnector: true
+    )
+
+    /// LTX-2.5 configuration.
+    ///
+    /// Measured against `ltx-2.5-22b-distilled-transformer-bf16.safetensors`: the
+    /// transformer config embedded in the checkpoint metadata is byte-identical to
+    /// LTX-2.3's apart from two added keys, `ff_bias: false` and
+    /// `use_keyframes_abs_pos_embedding: true`. Layer count, head geometry, RoPE
+    /// parameters, connector shape and every tensor shape are unchanged; the only
+    /// tensor-level differences are the 96 dropped **video** FFN biases and the new
+    /// `keyframes_abs_pos_embedding` marker. The audio blocks keep their FFN biases:
+    /// the checkpoint sets `ff_bias: false` and leaves `audio_ff_bias` unset, and
+    /// `audio_ff.net.{0.proj,2}.bias` is present for all 48 blocks.
+    public static let ltx25 = LTXTransformerConfig(
+        captionChannels: 4096,
+        gatedAttention: true,
+        crossAttentionAdaLN: true,
+        captionProjBeforeConnector: true,
+        ffBias: false,
+        audioFfBias: true,
+        keyframesAbsPosEmbedding: true
     )
 }
 

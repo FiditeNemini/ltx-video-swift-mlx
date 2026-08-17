@@ -1,5 +1,82 @@
 # Directory Update Log
 
+## 2026-08-13
+
+* **Creation**: [IC-LoRA stage 2 keeps adapter and reference](/docs/knowledge/decisions/iclora-stage2-keeps-adapter-and-reference.md)
+  — the upscale pipeline's refinement stage deliberately diverges from
+  ic_lora.py: seven runs show subject identity surviving the σ-0.909 renoise
+  only when the adapter and the reference are both active in the final stage.
+  Also records that centroid/scale/HF metrics were all blind to the failure —
+  the discriminating check was "same car between stage 1 and final", one glance
+  at the `--stage-one` export.
+
+* **Creation**: [Module.update mutates in place](/docs/knowledge/pitfalls/module-update-mutates-in-place.md)
+  — `unfuseLoRA` had never restored a single weight: the originals captured for
+  restore were bare references into the module, and MLXNN's in-place update made
+  them track the fused values. Surfaced by a bit-identical output between an
+  unfused and a fused stage-2 run; pinned by a 2-layer round-trip test and a
+  capture-purity probe. Fix is copy-at-capture, materialised before the update.
+  Partially supersedes July's double-delta entry: unfuse restored contaminated
+  weights in *every* case, not just the LipDub-then-LoRA one.
+
+## 2026-08-16
+
+* **Creation**: [no_repeat_ngram bans quoting the prompt](/docs/knowledge/pitfalls/ngram-blocking-mangles-prompt-quoting.md)
+  — ngram on/off A/B: verbatim timestamps and 14.04 s predicted without the ban,
+  mangled timestamps and 19.04 s with it; deviation ask handed to gemma-4-swift-mlx.
+
+
+* **Creation**: [CFG against an empty negative erases the prompt](/docs/knowledge/pitfalls/empty-cfg-negative-erases-the-prompt.md)
+  — root-caused on the 2CV bench: dev single-stage (30 steps, cfg 3.0) lost the
+  entire choreography with the port-inherited "" negative and recovered it with
+  upstream's DEFAULT_NEGATIVE_PROMPT, single variable flipped (p5-d vs p5-d2).
+
+## 2026-08-12
+
+* **Creation**: [LipDub overwrites anything crossing the mouth](/docs/knowledge/pitfalls/lipdub-overwrites-objects-crossing-the-mouth.md)
+  — the IC-LoRA repaints the mouth region without modelling occlusion, so a
+  headset band, hand or microphone in front of the lips is painted over.
+  Demonstrated on the repo's own teaser (frames 52–64), which predates the
+  vocoder work, so it is a property of the method rather than a regression. Also
+  records the attribution lesson: colour and occlusion differences between two
+  LipDub outputs were both blamed on a vocoder that only runs after video
+  decoding.
+
+* **Update**: The audio decode stage was running the wrong vocoder — recorded in
+  [the vocoder pitfall](/docs/knowledge/pitfalls/wrong-vocoder-lost-the-top-octave.md).
+  LTX-2.3 and LTX-2.5 bundle a BigVGAN v2 + bandwidth-extension pair (667+557
+  tensors, byte-identical between generations, 48 kHz); this package loaded
+  LTX-2's 194-tensor 24 kHz vocoder, which shares no key with them. A same-seed
+  A/B puts the cost at **+18 dB in 12–16 kHz** once corrected, plus a 16–24 kHz
+  band that did not exist, and **nothing below 8 kHz** — the top octave, not the
+  midrange. Confirmed on speech via a 2.3 LipDub run. The entry also records the
+  measurement trap that first produced a wrong 40 dB claim: the initial A/B
+  compared generations of different lengths, so content differences were read as
+  vocoder differences. The July timbre investigation's conclusions therefore
+  **stand**; the caveat added to it earlier that day has been withdrawn.
+
+* **Update**: LTX-2.5 now runs (text/image-to-video). Two pitfalls recorded from
+  the port: [split-checkpoint lookups fail silently](/docs/knowledge/pitfalls/split-checkpoint-silent-empty-load.md)
+  — the VAE encoder was read from the transformer file, matched zero keys, kept
+  its random initialisation and encoded every conditioning image to noise, while
+  the run still produced coherent video of the wrong car — and
+  [the LTX Gemma head is vestigial](/docs/knowledge/pitfalls/ltx-gemma-head-is-vestigial.md)
+  — greedy decoding emits single capital letters on any prompt because the
+  encoder fine-tune let the final-norm scale drift 2.5x above stock, saturating
+  the logit softcap; norm statistics compared against
+  mlx-community/gemma-4-e4b-it-4bit confirm the conventions match.
+
+* **Creation**: [What LTX-2.5 actually changes](/docs/knowledge/investigations/ltx-2.5-checkpoint-diff-2026-08.md)
+  — every 2.5 component's safetensors header read by HTTP range request and
+  diffed against 2.3. The DiT differs by two config keys (`ff_bias: false`,
+  `use_keyframes_abs_pos_embedding: true`), 96 dropped FFN biases and one new
+  `[1, 4096]` marker; the conv video VAE, the audio VAE + vocoder and the
+  latent spatial upscaler are tensor-for-tensor identical; the sigma schedules
+  are unchanged. The port cost is the `gemma4-12b-ltx-v1` text encoder, which
+  exists only inside the 26 GB LTX file. Also records two dead download URLs
+  found live (LipDub → DubIt rename, spatial upscaler 1.0 withdrawn) and the
+  new `reference_spatial_scale_factor` IC-LoRA metadata key.
+
 ## 2026-07-27
 
 * **Update**: Voxtral closed out the custom-voice loose ends, and two of their

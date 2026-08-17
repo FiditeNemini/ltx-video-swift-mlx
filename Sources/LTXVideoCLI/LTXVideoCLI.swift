@@ -1,4 +1,4 @@
-// LTXVideoCLI.swift - Command-line interface for LTX-2.3 video generation
+// LTXVideoCLI.swift - Command-line interface for LTX-2 video generation
 // Copyright 2025
 
 import ArgumentParser
@@ -9,9 +9,9 @@ import LTXVideo
 struct LTXVideoCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ltx-video",
-        abstract: "LTX-2.3 video generation on Mac with MLX",
+        abstract: "LTX-2 video generation on Mac with MLX (LTX-2.3 and LTX-2.5)",
         version: "0.1.0",
-        subcommands: [Generate.self, Retake.self, LipDub.self, Profile.self, ExportQuantized.self, Download.self, Train.self, TrainingControl.self, Models.self, Info.self],
+        subcommands: [Generate.self, Retake.self, LipDub.self, Upscale.self, Profile.self, ExportQuantized.self, Download.self, Train.self, TrainingControl.self, Models.self, Info.self],
         defaultSubcommand: Info.self
     )
 }
@@ -68,8 +68,11 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Video height in pixels (must be divisible by 64 for two-stage)")
     var height: Int = 512
 
-    @Option(name: .shortAndLong, help: "Number of frames (must be 8n+1, e.g., 9, 17, 25, 33...)")
-    var frames: Int = 121
+    @Option(name: .shortAndLong, help: "Number of frames (8n+1, e.g. 9, 17, 25...), or 'auto' to predict it from the prompt (LTX-2.5 only)")
+    var frames: String = "121"
+
+    @Option(name: .long, help: "Inference steps — dev models only (default 30); distilled models run their fixed 8-step schedule")
+    var steps: Int?
 
     @Option(name: .long, help: "Random seed for reproducibility")
     var seed: UInt64?
@@ -126,7 +129,13 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "Path to local LTX unified weights file")
     var ltxWeights: String?
 
+    @Option(name: .long, help: "Model variant: distilled, dev, 2.5-distilled, 2.5-dev (default: distilled)")
+    var model: String = "distilled"
+
     mutating func run() async throws {
+        // Resolved up front so every message names the variant actually running.
+        let parsedModelVariant = try parseModelVariant(model)
+
         // Configure custom models directory if specified
         if let dir = modelsDir {
             LTXModelRegistry.customModelsDirectory = URL(fileURLWithPath: dir)
@@ -143,12 +152,11 @@ struct Generate: AsyncParsableCommand {
         var profilingSession: ProfilingSession? = nil
         if profile {
             let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
-            session.title = "LTX-2.3 PROFILING REPORT"
-            session.metadata["model"] = "distilled"
+            session.title = "\(parsedModelVariant.displayName) PROFILING REPORT"
+            session.metadata["model"] = parsedModelVariant.rawValue
             session.metadata["quant"] = mixedPrecision ? "mixed" : transformerQuant
             session.metadata["resolution"] = "\(width)x\(height)"
             session.metadata["frames"] = String(frames)
-            session.metadata["steps"] = String(8)
             profilingSession = session
             LTXVideoProfiler.shared.enable()
             LTXVideoProfiler.shared.activeSession = session
@@ -167,7 +175,7 @@ struct Generate: AsyncParsableCommand {
         }
         let isI2V = image != nil || !parsedKeyframes.isEmpty
 
-        print("LTX-2.3 Video Generation (Two-Stage Distilled)")
+        print("\(parsedModelVariant.displayName) — Video Generation (Two-Stage Distilled)")
         print("================================================")
         if !parsedKeyframes.isEmpty {
             print("Mode: keyframe interpolation (\(parsedKeyframes.count) keyframe\(parsedKeyframes.count == 1 ? "" : "s"))")
@@ -202,8 +210,21 @@ struct Generate: AsyncParsableCommand {
         print()
 
         // Validate frame count (must be 8n+1)
-        guard (frames - 1) % 8 == 0 else {
-            throw ValidationError("Frame count must be 8n+1 (e.g., 9, 17, 25, 33, ...). Got \(frames)")
+        let autoDuration = frames.lowercased() == "auto"
+        if autoDuration && parsedModelVariant.family == .ltx23 {
+            throw ValidationError(
+                "--frames auto needs a duration head, which ships from LTX-2.5 onward; "
+                + "\(parsedModelVariant.displayName) has none. Pass an explicit frame count (8n+1).")
+        }
+        var frameCount = 121
+        if !autoDuration {
+            guard let parsed = Int(frames) else {
+                throw ValidationError("Frames must be a number or 'auto'. Got \(frames)")
+            }
+            guard (parsed - 1) % 8 == 0 else {
+                throw ValidationError("Frame count must be 8n+1 (e.g., 9, 17, 25, 33, ...). Got \(parsed)")
+            }
+            frameCount = parsed
         }
 
         // Validate dimensions (must be divisible by 64 for two-stage)
@@ -220,14 +241,17 @@ struct Generate: AsyncParsableCommand {
             guard let quantOption = TransformerQuantization(rawValue: transformerQuant) else {
                 throw ValidationError("Invalid transformer quantization: \(transformerQuant). Use: bf16, qint8, or int4")
             }
-            quantConfig = LTXQuantizationConfig(transformer: quantOption)
+            // The 2.5 text encoder ships in bf16 only (~24 GB), so it follows the
+            // transformer's level rather than staying at full precision.
+            quantConfig = LTXQuantizationConfig(transformer: quantOption, textEncoder: quantOption)
         }
 
-        // Create pipeline (always distilled)
+        let modelVariant = parsedModelVariant
+
         print("Creating pipeline...")
         fflush(stdout)
         let pipeline = LTXPipeline(
-            model: .distilled,
+            model: modelVariant,
             quantization: quantConfig,
             hfToken: hfToken
         )
@@ -266,7 +290,53 @@ struct Generate: AsyncParsableCommand {
             print("LoRA fused (\(fusedCount) layer-pairs)")
         }
 
-        // Download upscaler (always needed for two-stage)
+        // Upstream order (distilled.py): enhance FIRST, then the duration head
+        // reads the *enhanced* prompt's encoding. Predicting on the raw prompt
+        // over-estimated (16.0s vs 14.0s on this bench's prompt), stretching the
+        // choreography past its own timeline.
+        var effectivePrompt = prompt
+        if enhancePrompt {
+            print("Enhancing prompt (before duration prediction, as upstream)...")
+            fflush(stdout)
+            let promptImage = parsedKeyframes.first?.path ?? image
+            effectivePrompt = try await pipeline.enhancePromptWithVLM(prompt, imagePath: promptImage)
+        }
+
+        // Auto duration: ask the duration head before committing to a frame count
+        if autoDuration {
+            print("Predicting duration from the prompt...")
+            fflush(stdout)
+            let predicted = try await pipeline.predictFrameCount(for: effectivePrompt)
+            frameCount = predicted.frames
+            let clampNote = predicted.wasClamped ? " (clamped from \(String(format: "%.1f", predicted.seconds))s)" : ""
+            print("Duration: \(String(format: "%.2f", Float(frameCount) / 24.0))s → \(frameCount) frames\(clampNote)")
+        }
+
+        // Routing a dev checkpoint:
+        //  - no LoRA                  → guided single-stage (the two-stage 8-step
+        //    schedule is a distilled-training property);
+        //  - LoRA + explicit --steps  → guided single-stage with the LoRA fused
+        //    (a style/camera adapter on dev);
+        //  - LoRA, no --steps         → two-stage 8 steps, ASSUMING the LoRA is
+        //    the distilled one — stated out loud, since a style LoRA here would
+        //    silently produce the degraded no-distillation result.
+        let useDevPath = parsedModelVariant.isForTraining && (lora == nil || steps != nil)
+        if useDevPath {
+            print("Dev checkpoint → full-quality single-stage "
+                + "(\(steps ?? parsedModelVariant.defaultSteps) steps, CFG 3.0, STG)"
+                + (lora != nil ? " with the LoRA fused" : ""))
+        } else if parsedModelVariant.isForTraining {
+            print("Dev checkpoint + LoRA, no --steps: assuming a distilled LoRA and "
+                + "running the two-stage 8-step schedule. For a style/camera LoRA, "
+                + "pass --steps to run the guided single-stage path instead.")
+        }
+        if let steps, !useDevPath {
+            throw ValidationError(
+                "--steps \(steps) only applies to dev checkpoints on the single-stage path; "
+                + "\(parsedModelVariant.displayName)'s two-stage schedule is fixed at 8 steps.")
+        }
+
+        // Download upscaler (needed for the two-stage path)
         print("Downloading upscaler weights (if needed)...")
         fflush(stdout)
         let upscalerPath = try await pipeline.downloadUpscalerWeights()
@@ -276,27 +346,44 @@ struct Generate: AsyncParsableCommand {
         let config = LTXVideoGenerationConfig(
             width: width,
             height: height,
-            numFrames: frames,
-            numSteps: 8,
+            numFrames: frameCount,
+            numSteps: useDevPath ? (steps ?? parsedModelVariant.defaultSteps) : 8,
             seed: seed,
-            enhancePrompt: enhancePrompt,
+            enhancePrompt: false,   // already enhanced above, before duration prediction
             imagePath: parsedKeyframes.isEmpty ? image : nil,
             keyframes: parsedKeyframes
         )
+
+        profilingSession?.metadata["steps"] = String(config.numSteps)
 
         // Generate — ONE API call
         print("\nGenerating video...")
         fflush(stdout)
         let startGen = Date()
 
-        let result = try await pipeline.generateVideo(
-            prompt: prompt,
-            config: config,
-            upscalerWeightsPath: upscalerPath,
-            onProgress: { progress in
-                print("  \(progress.status)")
-            },
-        )
+        let result: VideoGenerationResult
+        if useDevPath {
+            // Dev checkpoint without a distilled LoRA: the fixed 8-step two-stage
+            // schedule is a distilled-training property, so run the full-quality
+            // single-stage path (CFG 3.0 + STG + rescale) instead.
+            result = try await pipeline.generateVideoDev(
+                prompt: effectivePrompt,
+                config: config,
+                onProgress: { progress in
+                    print("  \(progress.status)")
+                    fflush(stdout)
+                })
+        } else {
+            result = try await pipeline.generateVideo(
+                prompt: effectivePrompt,
+                config: config,
+                upscalerWeightsPath: upscalerPath,
+                onProgress: { progress in
+                    print("  \(progress.status)")
+                    fflush(stdout)
+                },
+            )
+        }
 
         let genTime = Date().timeIntervalSince(startGen)
         print("Generation completed in \(String(format: "%.1f", genTime))s")
@@ -750,7 +837,7 @@ struct LipDub: AsyncParsableCommand {
     @Flag(name: .long, help: "Enhance the prompt via the VLM (Gemma) by analyzing --reference-image. Generates a richer scene description while preserving the `speaking in <LANG> saying: \"...\"` LipDub signature. Image mode only.")
     var enhancePrompt: Bool = false
 
-    @Option(name: .long, help: "HuggingFace token for gated models (LipDub LoRA + LTX-2.3 are gated)")
+    @Option(name: .long, help: "HuggingFace token for gated models (the IC-LoRAs and every LTX-2.5 repo are gated)")
     var hfToken: String?
 
     @Option(name: .long, help: "Custom directory for model storage")
@@ -762,6 +849,9 @@ struct LipDub: AsyncParsableCommand {
     @Option(name: .long, help: "Path to local LTX unified weights file")
     var ltxWeights: String?
 
+    @Option(name: .long, help: "Model variant: distilled or 2.5-distilled (default: distilled)")
+    var model: String = "distilled"
+
     mutating func run() async throws {
         if let dir = modelsDir {
             LTXModelRegistry.customModelsDirectory = URL(fileURLWithPath: dir)
@@ -770,7 +860,8 @@ struct LipDub: AsyncParsableCommand {
 
         RuntimeBeacon.isEnabled = beacon
 
-        print("LTX-2.3 LipDub")
+        let variant = try parseModelVariant(model)
+        print("\(variant.displayName) — LipDub")
         print("==============")
         if let tail = continuationTail {
             guard referenceVideo == nil else {
@@ -837,11 +928,10 @@ struct LipDub: AsyncParsableCommand {
             }
         }
 
-        // LipDub always uses distilled (8-step Stage 1) + audio
-        print("Creating pipeline (distilled, audio enabled)...")
+        print("Creating pipeline (\(variant.displayName), audio enabled)...")
         fflush(stdout)
         let pipeline = LTXPipeline(
-            model: .distilled,
+            model: variant,
             quantization: LTXQuantizationConfig(transformer: .bf16),
             hfToken: hfToken
         )
@@ -1085,13 +1175,13 @@ struct Models: ParsableCommand {
 
 struct Info: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Show information about LTX-2.3 implementation"
+        abstract: "Show information about this LTX implementation"
     )
 
     mutating func run() throws {
         print(
             """
-            LTX-2.3 Video Generation for Apple Silicon
+            LTX-2 Video Generation for Apple Silicon (LTX-2.3 + LTX-2.5)
             =========================================
 
             Version: \(LTXVideo.version)

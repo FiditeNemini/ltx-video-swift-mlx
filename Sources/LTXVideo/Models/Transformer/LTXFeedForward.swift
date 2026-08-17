@@ -18,8 +18,8 @@ func geluApprox(_ x: MLXArray) -> MLXArray {
 class GELUApprox: Module, UnaryLayer {
     @ModuleInfo var proj: Linear
 
-    init(dimIn: Int, dimOut: Int) {
-        self._proj.wrappedValue = Linear(dimIn, dimOut)
+    init(dimIn: Int, dimOut: Int, bias: Bool = true) {
+        self._proj.wrappedValue = Linear(dimIn, dimOut, bias: bias)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -32,16 +32,20 @@ class GELUApprox: Module, UnaryLayer {
 /// Feed-forward network with GELU activation
 ///
 /// Architecture: Linear -> GELU -> Linear
+///
+/// `bias` follows the checkpoint: LTX-2.3 blocks ship FFN biases, LTX-2.5 blocks
+/// are bias-free (`ff_bias: false`). Building biases the checkpoint does not carry
+/// would leave them at MLX's random initialisation.
 class LTXFeedForward: Module, UnaryLayer {
     @ModuleInfo(key: "project_in") var projectIn: GELUApprox
     @ModuleInfo(key: "project_out") var projectOut: Linear
 
-    init(dim: Int, dimOut: Int? = nil, mult: Int = 4) {
+    init(dim: Int, dimOut: Int? = nil, mult: Int = 4, bias: Bool = true) {
         let innerDim = dim * mult
         let outputDim = dimOut ?? dim
 
-        self._projectIn.wrappedValue = GELUApprox(dimIn: dim, dimOut: innerDim)
-        self._projectOut.wrappedValue = Linear(innerDim, outputDim)
+        self._projectIn.wrappedValue = GELUApprox(dimIn: dim, dimOut: innerDim, bias: bias)
+        self._projectOut.wrappedValue = Linear(innerDim, outputDim, bias: bias)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {

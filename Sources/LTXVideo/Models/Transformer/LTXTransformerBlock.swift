@@ -148,7 +148,8 @@ class BasicTransformerBlock: Module {
         ropeType: LTXRopeType = .split,
         normEps: Float = 1e-6,
         gatedAttention: Bool = false,
-        crossAttentionAdaLN: Bool = false
+        crossAttentionAdaLN: Bool = false,
+        ffBias: Bool = true
     ) {
         self.normEps = normEps
         self.numSSTValues = crossAttentionAdaLN ? 9 : 6
@@ -176,7 +177,7 @@ class BasicTransformerBlock: Module {
         )
 
         // Feed-forward
-        self._ff.wrappedValue = LTXFeedForward(dim: dim, dimOut: dim)
+        self._ff.wrappedValue = LTXFeedForward(dim: dim, dimOut: dim, bias: ffBias)
 
         // AdaLN scale-shift table (kept as float32 for numerical stability)
         self._scaleShiftTable.wrappedValue = MLXArray.zeros([numSSTValues, dim])

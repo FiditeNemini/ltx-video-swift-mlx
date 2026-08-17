@@ -12,6 +12,7 @@ import MLXVLM
 import MLXHuggingFace
 import HuggingFace  // Required: #huggingFaceLoadModelContainer macro expands to HubClient references
 import Tokenizers
+import Gemma4Swift
 import Hub
 
 // MARK: - Pipeline Progress
@@ -154,32 +155,31 @@ public actor LTXPipeline {
     /// Flow-matching scheduler
     private let scheduler: LTXScheduler
 
-    /// Gemma 3 language model for text encoding
-    private var gemmaModel: Gemma3TextModel?
-
-    /// Tokenizer for Gemma
-    private var tokenizer: Tokenizers.Tokenizer?
+    /// Prompt encoder: Gemma 3 for LTX-2.3, Gemma 4 for LTX-2.5. Both produce the
+    /// 49 hidden states the feature extractor consumes, so every downstream stage
+    /// is generation-agnostic.
+    private var gemmaEncoder: (any LTXGemmaEncoding)?
 
     /// Text encoder (feature extractor + connector)
     private var textEncoder: VideoGemmaTextEncoderModel?
 
     /// Diffusion transformer
-    private var transformer: LTXTransformer?
+    internal var transformer: LTXTransformer?
 
     /// VAE decoder
-    private var vaeDecoder: VideoDecoder?
+    internal var vaeDecoder: VideoDecoder?
 
     /// VAE encoder (loaded only for image-to-video)
     private var vaeEncoder: VideoEncoder?
 
     /// Audio: dual video/audio transformer (alternative to video-only transformer)
-    private var ltx2Transformer: LTX2Transformer?
+    internal var ltx2Transformer: LTX2Transformer?
 
     /// Audio VAE decoder
     private var audioVAE: AudioVAE?
 
     /// Audio vocoder (mel → waveform)
-    private var vocoder: LTX2Vocoder?
+    private var vocoder: (any LTXVocoding)?
 
     /// Whether audio models are loaded
     public var isAudioLoaded: Bool {
@@ -279,10 +279,9 @@ public actor LTXPipeline {
     /// Unload Gemma + tokenizer (~7.5 GB) when the memory config asks for it.
     /// Kept resident with `unloadAfterUse == false` so consecutive runs can
     /// re-encode text without reloading models.
-    private func unloadGemmaIfConfigured() {
+    internal func unloadGemmaIfConfigured() {
         guard memoryOptimization.unloadAfterUse else { return }
-        gemmaModel = nil
-        tokenizer = nil
+        gemmaEncoder = nil
         Memory.clearCache()
     }
 
@@ -293,7 +292,7 @@ public actor LTXPipeline {
 
     /// Whether Gemma model is available for text encoding
     public var isGemmaLoaded: Bool {
-        gemmaModel != nil && tokenizer != nil
+        gemmaEncoder != nil
     }
 
     // MARK: - Initialization
@@ -323,11 +322,95 @@ public actor LTXPipeline {
     /// Resolution order is: explicit caller override, cached path for the model
     /// if it still exists, then downloader/cache lookup. Explicit overrides are
     /// cached as-is so later lazy component loads use the same caller-supplied file.
+    /// Resolve every file the current model needs, downloading what is missing.
+    ///
+    /// `overrideTransformerPath` names the transformer file (the whole checkpoint
+    /// for unified layouts); the other components still resolve through the cache.
+    private func resolveCheckpoint(
+        overrideTransformerPath: String? = nil,
+        progressCallback: DownloadProgressCallback? = nil
+    ) async throws -> LTXCheckpointPaths {
+        try model.validateRunnable()
+
+        switch model.weightsLayout {
+        case .unified:
+            let path = try await resolveUnifiedWeightsPath(
+                for: model, overridePath: overrideTransformerPath,
+                progressCallback: progressCallback)
+            let url = URL(fileURLWithPath: path)
+            return LTXCheckpointPaths(transformer: url, videoVAE: url)
+
+        case .split:
+            var paths = try await downloader.downloadCheckpoint(model: model) { progress in
+                progressCallback?(progress)
+            }
+            if let overrideTransformerPath {
+                // Keep the resolved audio bundle: the default init aliases it to
+                // the transformer path, which for an override is a file with no
+                // vocoder.* keys — the silent 24 kHz-fallback path.
+                paths = LTXCheckpointPaths(
+                    transformer: URL(fileURLWithPath: overrideTransformerPath),
+                    videoVAE: paths.videoVAE,
+                    textEncoder: paths.textEncoder,
+                    audioBundle: paths.audioBundle)
+            }
+            unifiedWeightsPathCache.store(paths.transformer.path, for: model)
+            return paths
+        }
+    }
+
+    /// Build the prompt encoder this checkpoint was trained with.
+    private func loadGemmaEncoder(
+        checkpoint: LTXCheckpointPaths,
+        source: LTXCheckpointSource,
+        gemmaModelPath: String?,
+        tokenizerPath: String?,
+        progressCallback: DownloadProgressCallback?
+    ) async throws -> any LTXGemmaEncoding {
+        switch model.textEncoder {
+        case .gemma4_12bLTX:
+            guard let textEncoderPath = checkpoint.textEncoder else {
+                throw LTXError.modelNotLoaded(
+                    "\(model.displayName) needs its bundled Gemma 4 encoder, which was not resolved")
+            }
+            LTXDebug.log("Loading Gemma 4 encoder from \(textEncoderPath.lastPathComponent)...")
+            return try await Gemma4TextEncoder.load(
+                fileURL: textEncoderPath,
+                tokenizerCacheDirectory: LTXModelRegistry.modelsDirectory
+                    .appendingPathComponent("ltx25-gemma4-tokenizer", isDirectory: true),
+                transformerMetadata: try source.transformerMetadata(),
+                quantization: quantization.textEncoder)
+
+        case .gemma3_12b:
+            let gemmaURL: URL
+            let tokenizerURL: URL
+            if let gemmaModelPath {
+                gemmaURL = URL(fileURLWithPath: gemmaModelPath)
+                tokenizerURL = tokenizerPath.map { URL(fileURLWithPath: $0) } ?? gemmaURL
+            } else {
+                LTXDebug.log("Downloading Gemma text encoder for \(model.displayName) (if needed)...")
+                let paths = try await downloader.downloadGemma(model: model) { progress in
+                    progressCallback?(progress)
+                }
+                gemmaURL = paths.modelDir
+                tokenizerURL = paths.tokenizerDir
+            }
+            LTXDebug.log("Loading Gemma3 model from \(gemmaURL.path)...")
+            return Gemma3Encoder(
+                model: try Gemma3WeightLoader.loadModel(from: gemmaURL),
+                tokenizer: try await AutoTokenizer.from(modelFolder: tokenizerURL))
+        }
+    }
+
     private func resolveUnifiedWeightsPath(
         for model: LTXModel,
         overridePath: String? = nil,
         progressCallback: DownloadProgressCallback? = nil
     ) async throws -> String {
+        // Fail here rather than after a 40 GB download or with a wall of unmatched
+        // weight keys: catalogued-but-unimplemented variants have no runnable path.
+        try model.validateRunnable()
+
         if let overridePath {
             unifiedWeightsPathCache.store(overridePath, for: model)
             return overridePath
@@ -371,58 +454,32 @@ public actor LTXPipeline {
         defer { beacon?.end() }
         var stepStart = Date()
 
-        // Step 1: Load Gemma model and tokenizer
-        progressCallback?(DownloadProgress(progress: 0.1, message: "Loading Gemma model..."))
+        // Step 1: Resolve the checkpoint's files (one for 2.3, several for 2.5)
+        progressCallback?(DownloadProgress(progress: 0.1, message: "Resolving checkpoint..."))
+        let checkpoint = try await resolveCheckpoint(
+            overrideTransformerPath: ltxWeightsPath, progressCallback: progressCallback)
+        let source = LTXCheckpointSource(model: model, paths: checkpoint)
 
-        let gemmaURL: URL
-        let tokenizerURL: URL
-        if let gemmaPath = gemmaModelPath {
-            gemmaURL = URL(fileURLWithPath: gemmaPath)
-            tokenizerURL = tokenizerPath.map { URL(fileURLWithPath: $0) } ?? gemmaURL
-        } else {
-            LTXDebug.log("Downloading Gemma text encoder for \(model.displayName) (if needed)...")
-            let paths = try await downloader.downloadGemma(model: model) { progress in
-                progressCallback?(progress)
-            }
-            gemmaURL = paths.modelDir
-            tokenizerURL = paths.tokenizerDir
-        }
-        LTXDebug.log("[TIME] Gemma download check: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
-
+        // Step 2: Load the prompt encoder — Gemma 4 ships inside 2.5 checkpoints,
+        // Gemma 3 is an external download for 2.3.
+        progressCallback?(DownloadProgress(progress: 0.2, message: "Loading text encoder..."))
         stepStart = Date()
-        LTXDebug.log("Loading Gemma3 model from \(gemmaURL.path)...")
-        gemmaModel = try Gemma3WeightLoader.loadModel(from: gemmaURL)
-        LTXDebug.log("[TIME] Gemma load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s — \(gemmaModel!.config.hiddenLayers) layers")
+        gemmaEncoder = try await loadGemmaEncoder(
+            checkpoint: checkpoint,
+            source: source,
+            gemmaModelPath: gemmaModelPath,
+            tokenizerPath: tokenizerPath,
+            progressCallback: progressCallback)
+        LTXDebug.log("[TIME] Text encoder load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
+        // Step 3: Load LTX component weights
+        progressCallback?(DownloadProgress(progress: 0.3, message: "Loading \(model.family.displayName) weights..."))
         stepStart = Date()
-        progressCallback?(DownloadProgress(progress: 0.2, message: "Loading tokenizer..."))
-        LTXDebug.log("Loading tokenizer from \(tokenizerURL.path)...")
-        tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
-        LTXDebug.log("[TIME] Tokenizer load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
-
-        // Step 2: Download/load LTX component weights
-        progressCallback?(DownloadProgress(progress: 0.3, message: "Loading LTX-2.3 weights..."))
-
-        let transformerWeights: [String: MLXArray]
-        let vaeWeights: [String: MLXArray]
-        let connectorWeights: [String: MLXArray]
-
-        stepStart = Date()
-        if ltxWeightsPath == nil {
-            progressCallback?(DownloadProgress(progress: 0.35, message: "Downloading unified weights..."))
-        }
-        let unifiedPath = try await resolveUnifiedWeightsPath(
-            for: model,
-            overridePath: ltxWeightsPath,
-            progressCallback: progressCallback
-        )
-
-        LTXDebug.log("Splitting unified weights from \(unifiedPath)...")
-        let split = try LTXWeightLoader.splitUnifiedWeightsFile(path: unifiedPath)
-        transformerWeights = split.transformer
-        vaeWeights = split.vae
-        connectorWeights = split.connector
-        LTXDebug.log("[TIME] Download + split unified weights: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
+        let split = try source.loadComponents()
+        let transformerWeights = split.transformer
+        let vaeWeights = split.vae
+        let connectorWeights = split.connector
+        LTXDebug.log("[TIME] Load checkpoint components: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
         // Step 3: Create and load transformer
         progressCallback?(DownloadProgress(progress: 0.5, message: "Loading transformer..."))
@@ -519,12 +576,14 @@ public actor LTXPipeline {
 
         stepStart = Date()
         LTXDebug.log("Loading Gemma3 model from \(gemmaURL.path)...")
-        gemmaModel = try Gemma3WeightLoader.loadModel(from: gemmaURL)
+        let gemma3Model = try Gemma3WeightLoader.loadModel(from: gemmaURL)
         LTXDebug.log("[TIME] Gemma load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
         stepStart = Date()
         progressCallback?(DownloadProgress(progress: 0.5, message: "Loading tokenizer..."))
-        tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
+        gemmaEncoder = Gemma3Encoder(
+            model: gemma3Model,
+            tokenizer: try await AutoTokenizer.from(modelFolder: tokenizerURL))
         LTXDebug.log("[TIME] Tokenizer load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
         // Step 2: Download unified file and extract connector weights
@@ -571,40 +630,50 @@ public actor LTXPipeline {
         let beacon = RuntimeBeacon.begin(task: "load-audio-models", model: model.rawValue)
         defer { beacon?.end() }
 
-        // Step 1: Download and load Audio VAE
+        // Resolve the checkpoint up front: the audio bundle path and the audio
+        // VAE source both depend on it, and resolving late meant a standalone
+        // loadAudioModels() call fell back to the 24 kHz legacy vocoder.
+        let checkpointEarly = try await resolveCheckpoint(progressCallback: progressCallback)
+
+        // Step 1: Download and load Audio VAE. Split checkpoints (2.5) carry
+        // their own audio_vae.* tensors in the audio bundle; only unified-era
+        // checkpoints use the shared Lightricks/LTX-2 file.
         progressCallback?(DownloadProgress(progress: 0.1, message: "Downloading audio VAE..."))
-        let audioVAEPath = try await downloader.downloadAudioVAE { progress in
-            progressCallback?(progress)
+        let audioVAEPath: URL
+        if model.weightsLayout == .split {
+            audioVAEPath = checkpointEarly.audioBundle
+        } else {
+            audioVAEPath = try await downloader.downloadAudioVAE { progress in
+                progressCallback?(progress)
+            }
         }
         let audioVAEWeights = try LTXWeightLoader.loadAudioVAEWeights(from: audioVAEPath.path, includeEncoder: includeEncoder)
 
         audioVAE = AudioVAE(includeEncoder: includeEncoder)
         try LTXWeightLoader.applyAudioVAEWeights(audioVAEWeights, to: audioVAE!)
-        LTXDebug.log("Audio VAE loaded")
+        LTXDebug.log("Audio VAE loaded from \(audioVAEPath.lastPathComponent)")
 
         // Step 2: Download and load Vocoder
         progressCallback?(DownloadProgress(progress: 0.4, message: "Downloading vocoder..."))
         let vocoderPath = try await downloader.downloadVocoder { progress in
             progressCallback?(progress)
         }
-        let vocoderWeights = try LTXWeightLoader.loadVocoderWeights(from: vocoderPath.path)
-
-        vocoder = LTX2Vocoder()
-        try LTXWeightLoader.applyVocoderWeights(vocoderWeights, to: vocoder!)
-        LTXDebug.log("Vocoder loaded")
+        vocoder = try loadVocoder(
+            bundle: checkpointEarly.audioBundle, audioVAEPath: audioVAEPath, legacyPath: vocoderPath)
+        LTXDebug.log("Vocoder loaded (\(vocoder!.outputSampleRate) Hz)")
 
         // Step 3: Create LTX2 dual transformer and load unified weights
         // The LTX2 transformer uses the same weight keys as the video-only transformer
         // plus additional audio-specific keys. We reload from the unified file.
         progressCallback?(DownloadProgress(progress: 0.6, message: "Loading dual audio/video transformer..."))
 
-        let unifiedPath = try await resolveUnifiedWeightsPath(for: model, progressCallback: progressCallback)
-
-        // Load and split unified weights (includeAudio: true to keep audio transformer keys)
-        let (transformerWeights, _, connectorWeightsFromUnified) = try LTXWeightLoader.splitUnifiedWeightsFile(
-            path: unifiedPath,
-            includeAudio: true
-        )
+        // Same source as loadModels: on a split checkpoint the aggregate projections
+        // live with the text encoder, so resolving only the transformer file here
+        // would rebuild the encoder below with randomly-initialised projections.
+        let checkpoint = checkpointEarly
+        let source = LTXCheckpointSource(model: model, paths: checkpoint)
+        let (transformerWeights, _, connectorWeightsFromUnified) =
+            try source.loadComponents(includeAudio: true)
 
         // Create LTX2 dual transformer
         let ltx2 = LTX2Transformer(
@@ -695,7 +764,7 @@ public actor LTXPipeline {
     /// dual-stream `LTX2Transformer`). Both are unpatchified and float32 — ready
     /// for the scheduler step. Velocities are already cropped back to the
     /// original token counts when their respective `*AppendCtx` was provided.
-    private struct StepVelocity {
+    internal struct StepVelocity {
         let video: MLXArray
         let audio: MLXArray?
     }
@@ -717,7 +786,7 @@ public actor LTXPipeline {
     /// Caller is responsible for the scheduler step and post-step `MLX.eval`.
     /// This split keeps the Stage 1 (Euler scheduler) and Stage 2 (manual Euler)
     /// integration code untouched, since their numerical contracts differ.
-    private func runDenoiseStep(
+    internal func runDenoiseStep(
         sigma: Float,
         videoLatent: MLXArray,
         audioLatentPacked: MLXArray?,
@@ -932,20 +1001,8 @@ public actor LTXPipeline {
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
 
-        profiler.start("Tokenization")
-        let (inputIds, attentionMask) = try tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
-        MLX.eval(inputIds, attentionMask)
-        profiler.end("Tokenization")
-
-        guard let gemma = gemmaModel else {
-            throw LTXError.modelNotLoaded("Gemma model not loaded")
-        }
-
         profiler.start("Gemma Forward")
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            throw LTXError.generationFailed("Failed to extract Gemma hidden states")
-        }
+        let (states, attentionMask) = try encodeHiddenStates(effectivePrompt)
         MLX.eval(states[states.count - 1])
         profiler.end("Gemma Forward")
 
@@ -1423,16 +1480,7 @@ public actor LTXPipeline {
         // Phase 1: Text encoding
         let profiler = LTXVideoProfiler.shared
         profiler.start("Text Encoding")
-        let (inputIds, attentionMask) = try tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
-
-        guard let gemma = gemmaModel else {
-            throw LTXError.modelNotLoaded("Gemma model not loaded")
-        }
-
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            throw LTXError.generationFailed("Failed to extract Gemma hidden states")
-        }
+        let (states, attentionMask) = try encodeHiddenStates(effectivePrompt)
 
         let encoderOutput = try textEncoder.encodeFromHiddenStates(
             hiddenStates: states,
@@ -1548,19 +1596,12 @@ public actor LTXPipeline {
             // actually unloaded above (with unloadAfterUse == false it is still
             // resident, and an unconditional loadModels() would rebuild the full
             // Gemma + transformer + VAE stack mid-run on top of the live one).
-            // Use empty string as negative prompt (matching Lightricks default for MLX)
-            if gemmaModel == nil || tokenizer == nil {
+            if gemmaEncoder == nil {
                 try await loadModels(progressCallback: nil)
             }
-            guard let gemma2 = gemmaModel else {
-                throw LTXError.modelNotLoaded("Failed to reload Gemma for negative prompt")
-            }
-            let negPrompt = ""
-            let (negInputIds, negAttentionMask) = try tokenizePrompt(negPrompt, maxLength: textMaxLength)
-            let (_, negAllHidden) = gemma2(negInputIds, attentionMask: negAttentionMask, outputHiddenStates: true)
-            guard let negStates = negAllHidden, negStates.count == gemma2.config.hiddenLayers + 1 else {
-                throw LTXError.generationFailed("Failed to extract Gemma hidden states for negative prompt")
-            }
+            // The official DEFAULT_NEGATIVE_PROMPT — the CFG direction is part of
+            // the trained contract (docs/knowledge: empty-cfg-negative pitfall).
+            let (negStates, negAttentionMask) = try encodeHiddenStates(Self.defaultNegativePrompt)
             let negEncoderOutput = try textEncoder.encodeFromHiddenStates(
                 hiddenStates: negStates,
                 attentionMask: negAttentionMask,
@@ -2120,15 +2161,7 @@ public actor LTXPipeline {
         LTXDebug.log("[lipdub] target frames=\(numFrames), Stage1 latent=\(stage1Shape.frames)x\(stage1Shape.height)x\(stage1Shape.width), audio frames=\(audioNumFrames)")
 
         // 3. Text encode the prompt.
-        let (inputIds, attentionMask) = try tokenizePrompt(effectivePrompt, maxLength: textMaxLength)
-        MLX.eval(inputIds, attentionMask)
-        guard let gemma = gemmaModel else {
-            throw LTXError.modelNotLoaded("Gemma model not loaded")
-        }
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            throw LTXError.generationFailed("Failed to extract Gemma hidden states")
-        }
+        let (states, attentionMask) = try encodeHiddenStates(effectivePrompt)
         let encoderOutput = try textEncoder.encodeFromHiddenStates(
             hiddenStates: states,
             attentionMask: attentionMask,
@@ -2626,7 +2659,7 @@ public actor LTXPipeline {
     ///   - height: Target video height
     ///   - numFrames: Number of frames to extract
     /// - Returns: Video latent tensor (1, 128, latent_F, latent_H, latent_W)
-    private func encodeVideo(
+    internal func encodeVideo(
         path: String, width: Int, height: Int, numFrames: Int, tail: Bool = false
     ) async throws -> MLXArray {
         let videoTensor = try await loadVideo(
@@ -2661,13 +2694,23 @@ public actor LTXPipeline {
 
     // MARK: - Image-to-Video Helpers
 
-    /// Load VAE encoder weights from the unified safetensors file
+    /// Load VAE encoder weights from wherever this checkpoint keeps them.
+    ///
+    /// Unified checkpoints hold them under `vae.encoder.*`; split ones put them in
+    /// the VAE file. Reading the wrong file yields *zero* matching keys and leaves
+    /// the encoder at its random initialisation, which does not fail loudly — it
+    /// silently encodes every conditioning image to noise. Hence the guard below.
     private func loadVAEEncoder() async throws {
         if vaeEncoder != nil { return }  // Already loaded
 
         LTXDebug.log("Loading VAE encoder...")
-        let resolvedUnifiedPath = try await resolveUnifiedWeightsPath(for: model)
-        let encoderWeights = try LTXWeightLoader.loadVAEEncoderWeightsFromUnified(from: resolvedUnifiedPath)
+        let checkpoint = try await resolveCheckpoint()
+        let source = LTXCheckpointSource(model: model, paths: checkpoint)
+        let encoderWeights = try source.loadVAEEncoderWeights()
+        guard !encoderWeights.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "No VAE encoder weights found in \(checkpoint.videoVAE.lastPathComponent)")
+        }
 
         let encoder = VideoEncoder()
         try LTXWeightLoader.applyVAEEncoderWeights(encoderWeights, to: encoder)
@@ -2711,7 +2754,7 @@ public actor LTXPipeline {
         return EncodedKeyframe(latentIdx: 0, latent: tail, pixelFrameIndex: 0)
     }
 
-    private func encodeKeyframes(
+    internal func encodeKeyframes(
         _ keyframes: [KeyframeInput],
         width: Int,
         height: Int
@@ -2975,8 +3018,15 @@ public actor LTXPipeline {
         if let imagePath { LTXDebug.log("Input image: \(imagePath)") }
         let startTime = Date()
 
-        // Load the VLM model from local cache
-        LTXDebug.log("Loading VLM model...")
+        // Enhancer choice mirrors upstream: on 2.3 the (full-headed) Gemma 3
+        // self-enhances, so the shared Gemma 3 VLM plays that role; on 2.5 the
+        // bundled Gemma 4 encoder is encode-only (vestigial LM head, measured —
+        // docs/knowledge), so upstream mandates a separate small Gemma 4
+        // instruct enhancer (`--prompt-enhancer-gemma-root`, E2B-it).
+        if model.family == .ltx25 {
+            return try await enhancePromptWithGemma4(
+                prompt, imagePath: imagePath, startTime: startTime)
+        }
         let vlmLoadStart = Date()
 
         // Try loading from local vlm-gemma cache first, fall back to HF download
@@ -2989,6 +3039,8 @@ public actor LTXPipeline {
             config = ModelConfiguration(directory: resolvedURL, extraEOSTokens: ["<end_of_turn>"])
             LTXDebug.log("Loading VLM from local cache: \(resolvedURL.path)")
         } else {
+            print("Prompt enhancer: Gemma 3 12B (downloading if needed, ~7.5GB)...")
+            fflush(stdout)
             config = ModelConfiguration(id: Self.defaultVLMModelID, extraEOSTokens: ["<end_of_turn>"])
             LTXDebug.log("Loading VLM from HuggingFace: \(Self.defaultVLMModelID)")
         }
@@ -3065,13 +3117,142 @@ public actor LTXPipeline {
             return prompt
         }
 
-        LTXDebug.log("Enhanced prompt: \"\(cleaned)\"")
+        // Always shown: the enhanced text is what actually gets encoded, and
+        // hiding it behind --debug made runs impossible to audit.
+        print("Enhanced prompt (Gemma 3 12B):\n\(cleaned)")
+        fflush(stdout)
 
         // Unload VLM to free memory for the main pipeline
         LTXDebug.log("Unloading VLM...")
         Memory.clearCache()
         LTXMemoryManager.logMemoryState("after VLM unload")
 
+        return cleaned
+    }
+
+    /// Upstream's dedicated Gemma 4 enhancer prompts (gemma4_i2v/t2v_system_prompt.txt)
+    /// — caption-style output, image grounding, framing triple; distinct from the
+    /// Gemma 3 self-enhance prompts above, which stay on the 2.3 path.
+    private static let promptEnhancementGemma4I2VSystemPrompt = """
+You are given a REFERENCE IMAGE (the exact first frame of the video) and a user's short image-to-video request. Write a single, highly detailed audio-visual caption describing the video that BEGINS from this exact reference image and best fulfills that request, in the EXACT style of the training captions used for this video model. The generated video is scored against the user's ORIGINAL request, so preserve every element the user stated; expand faithfully into the full caption style without contradicting or dropping anything they asked for.
+
+FIRST-FRAME / IMAGE GROUNDING (do this first): the opening of your caption must match the reference image exactly — same subject(s), identity, appearance, clothing, setting, lighting, and composition as shown. The video starts on this frame; describe it faithfully, then narrate chronologically as the user's requested action unfolds from it. Never contradict, replace, or invent things not consistent with the image. Single continuous take — no hard cuts.
+
+Match this captioning style precisely:
+
+1. Begin immediately with the action or visual detail. Do NOT use "The scene opens…", "We see…", "There is…".
+
+2. Objective, observable description only. Do not infer emotions or intentions — describe what is visible and audible (e.g. not "he looks sad" but "his eyebrows angle downward and his lips are pressed together").
+
+3. Full visual detail: environment (materials, textures, lighting, colors), character appearance (clothing, posture, facial details), and the spatial positioning of all elements — grounded in and consistent with the reference image. When a human appears, identify them specifically (gendered terms when clearly implied; differentiate multiple people consistently) and describe visible physical attributes — apparent gender presentation, skin tone, estimated age group, hair color/length/style, build, clothing and accessories. Do not infer ethnicity, nationality, religion, or culture.
+
+4. Precise motion and cinematic description. For every shot you MUST include, woven naturally into the prose (never as tags or labels):
+   - Shot type (exactly one: extreme wide shot / wide shot / medium shot / medium close-up / close-up / extreme close-up) — consistent with how the reference image is framed at the start.
+   - Camera motion (always stated; if none, explicitly say the camera remains static). Camera movement is expected and good — match the user if they specified it, otherwise choose the treatment that best presents the requested scene starting from this frame.
+   - Camera viewpoint relative to subject (front-facing / back-facing / side view / over-the-shoulder / top-down / low-angle / high-angle) — matching the reference image's viewpoint at the opening.
+   Express these as flowing prose: "a medium shot frames…, captured from a front-facing angle as the camera slowly pans…". Never as "medium shot, static camera —".
+
+5. Complete soundscape, integrated naturally: any dialogue (quote it exactly, in the original language), tone of voice, background music (type, mood, volume changes), and environmental sounds (footsteps, wind, traffic, animals). If the request implies sound, describe it plausibly.
+
+6. Strict chronological, real-time flow using transitions like "Initially…", "A moment later…", "Simultaneously…". Keep the user's requested motion/action central and in motion throughout.
+
+7. One single continuous paragraph. No bullet points, no section headers, no labels like "Audio:" or "Visual:". Exhaustive and lossless — include background elements, subtle movements, lighting, secondary sounds — detailed enough to reconstruct the scene. Aim for a rich, complete paragraph (roughly 150–220 words).
+
+If the user wrote in another language, produce the English caption of the same content. Output ONLY the caption text — no JSON, no preamble.
+
+AESTHETIC QUALITY (in addition to the above, without breaking the objective caption style or contradicting the reference image): render the described scene with strong visual production value — cinematic, film-grade color and contrast, beautiful natural lighting, crisp fine detail and texture, pleasing composition and depth. Weave these quality descriptors naturally into the same observable prose (e.g. "warm cinematic lighting", "richly saturated film-grade color", "crisp high-resolution detail") — describe how the exact requested scene, starting from this frame, LOOKS at its most visually striking, never adding new objects or actions and never contradicting the first frame. Keep everything else (first-frame grounding, framing triple, soundscape, chronological single paragraph, faithfulness) exactly as specified.
+"""
+
+    private static let promptEnhancementGemma4T2VSystemPrompt = """
+You are given a user's short text-to-video request. Write a single, highly detailed audio-visual caption describing the video that best fulfills that request, in the EXACT style of the training captions used for this video model. The generated video is scored against the user's ORIGINAL request, so preserve every element the user stated; expand faithfully into the full caption style without contradicting or dropping anything they asked for.
+
+Match this captioning style precisely:
+
+1. Begin immediately with the action or visual detail. Do NOT use "The scene opens…", "We see…", "There is…".
+
+2. Objective, observable description only. Do not infer emotions or intentions — describe what is visible and audible (e.g. not "he looks sad" but "his eyebrows angle downward and his lips are pressed together").
+
+3. Full visual detail: environment (materials, textures, lighting, colors), character appearance (clothing, posture, facial details), and the spatial positioning of all elements. When a human appears, identify them specifically (gendered terms when clearly implied; differentiate multiple people consistently) and describe visible physical attributes — apparent gender presentation, skin tone, estimated age group, hair color/length/style, build, clothing and accessories. Do not infer ethnicity, nationality, religion, or culture.
+
+4. Precise motion and cinematic description. For every shot you MUST include, woven naturally into the prose (never as tags or labels):
+   - Shot type (exactly one: extreme wide shot / wide shot / medium shot / medium close-up / close-up / extreme close-up)
+   - Camera motion (always stated; if none, explicitly say the camera remains static). Camera movement is expected and good — match the user if they specified it, otherwise choose the treatment that best presents the requested scene.
+   - Camera viewpoint relative to subject (front-facing / back-facing / side view / over-the-shoulder / top-down / low-angle / high-angle).
+   Express these as flowing prose: "a medium shot frames…, captured from a front-facing angle as the camera slowly pans…". Never as "medium shot, static camera —".
+
+5. Complete soundscape, integrated naturally: any dialogue (quote it exactly, in the original language), tone of voice, background music (type, mood, volume changes), and environmental sounds (footsteps, wind, traffic, animals). If the request implies sound, describe it plausibly.
+
+6. Strict chronological, real-time flow using transitions like "Initially…", "A moment later…", "Simultaneously…". Keep every stated action in motion.
+
+7. One single continuous paragraph. No bullet points, no section headers, no labels like "Audio:" or "Visual:". Exhaustive and lossless — include background elements, subtle movements, lighting, secondary sounds — detailed enough to reconstruct the scene. Aim for a rich, complete paragraph (roughly 150–220 words).
+
+If the user wrote in another language, produce the English caption of the same content. Output ONLY the caption text — no JSON, no preamble.
+
+AESTHETIC QUALITY (in addition to the above, without breaking the objective caption style): render the described scene with strong visual production value — cinematic, film-grade color and contrast, beautiful natural lighting, crisp fine detail and texture, pleasing composition and depth. Weave these quality descriptors naturally into the same observable prose (e.g. "warm cinematic lighting", "richly saturated film-grade color", "crisp high-resolution detail") — describe how the exact requested scene LOOKS at its most visually striking, never adding new objects or actions. Keep everything else (framing triple, soundscape, chronological single paragraph, faithfulness) exactly as specified.
+"""
+
+    /// LTX-2.5 prompt enhancement through our own `Gemma4Swift` stack.
+    ///
+    /// Mirrors upstream\'s design: the bundled 12B encoder is encode-only
+    /// (vestigial LM head, measured — docs/knowledge), so enhancement runs on a
+    /// separate small generative Gemma 4 E2B-it (bf16, as the reference space
+    /// runs it), greedy, 600 tokens, no_repeat_ngram_size 5
+    /// (`GEMMA4_ENHANCE_GENERATION_KWARGS`). The checkpoint downloads through our
+    /// `ModelDownloader` so `--models-dir` routes it like every other model.
+    private func enhancePromptWithGemma4(
+        _ prompt: String,
+        imagePath: String?,
+        startTime: Date
+    ) async throws -> String {
+        print("Prompt enhancer: Gemma 4 E2B-it bf16 via Gemma4Swift (downloading if needed, ~10GB)...")
+        fflush(stdout)
+        let dir = try await downloader.downloadGemma4Enhancer { p in
+            if let f = p.currentFile { print("  \(f)"); fflush(stdout) }
+        }
+
+        let g4 = await Gemma4Pipeline()
+        try await g4.load(from: dir.resolvingSymlinksInPath(), multimodal: true)
+        LTXDebug.log("Gemma 4 E2B enhancer loaded")
+
+        // Gemma folds the system role into the first user turn anyway, and the
+        // multimodal path takes a single prompt string — prepend explicitly.
+        MLXRandom.seed(42)
+        let isI2V = imagePath != nil
+        let stream: AsyncThrowingStream<String, Error>
+        if let imagePath {
+            let pixels = try Gemma4ImageProcessor.processImage(
+                url: URL(fileURLWithPath: imagePath))
+            stream = try await g4.chatStreamMultimodal(
+                prompt: Self.promptEnhancementGemma4I2VSystemPrompt
+                    + "\n\nuser prompt: \(prompt)",
+                pixelValues: pixels,
+                temperature: 0.0,
+                maxTokens: 600,
+                noRepeatNGramSize: 5)
+        } else {
+            stream = try await g4.chatStream(
+                prompt: "user prompt: \(prompt)",
+                systemPrompt: Self.promptEnhancementGemma4T2VSystemPrompt,
+                temperature: 0.0,
+                maxTokens: 600,
+                noRepeatNGramSize: 5)
+        }
+
+        var generatedText = ""
+        for try await chunk in stream { generatedText += chunk }
+        let cleaned = cleanEnhancedPrompt(generatedText)
+
+        await g4.unload()
+        Memory.clearCache()
+
+        let elapsed = Date().timeIntervalSince(startTime)
+        LTXDebug.log("Gemma 4 enhancement (\(isI2V ? "I2V" : "T2V")) took \(String(format: "%.1f", elapsed))s")
+        guard !cleaned.isEmpty else {
+            print("Enhancement produced an empty result; keeping the original prompt")
+            return prompt
+        }
+        print("Enhanced prompt (Gemma 4 E2B-it):\n\(cleaned)")
+        fflush(stdout)
         return cleaned
     }
 
@@ -3145,12 +3326,118 @@ public actor LTXPipeline {
         )
     }
 
+    // MARK: - Vocoder selection
+
+    /// Build the vocoder this checkpoint ships, falling back to the LTX-2 one.
+    ///
+    /// LTX-2.3 and LTX-2.5 both bundle a BigVGAN v2 generator plus a
+    /// bandwidth-extension stage (667 + 557 tensors, byte-identical between the two
+    /// generations) that outputs 48 kHz. The `Lightricks/LTX-2` standalone vocoder
+    /// this package used to load is a different architecture entirely — it shares
+    /// no key with them and stops at 24 kHz. It decodes the same latent space, so
+    /// it produces plausible audio, which is exactly why the mismatch went
+    /// unnoticed; it is kept only as a fallback for checkpoints that ship nothing
+    /// better.
+    private func loadVocoder(bundle: URL? = nil, audioVAEPath: URL, legacyPath: URL) throws -> any LTXVocoding {
+        let resolvedBundle = bundle ?? (try? resolveCheckpointSync())?.audioBundle ?? audioVAEPath
+        for candidate in [resolvedBundle, audioVAEPath] {
+            do {
+                let vocoder = try BigVGANWeightLoader.load(from: candidate)
+                LTXDebug.log("Vocoder: BigVGAN + BWE from \(candidate.lastPathComponent)")
+                return vocoder
+            } catch {
+                LTXDebug.log("Vocoder: \(candidate.lastPathComponent) has no BigVGAN (\(error))")
+            }
+        }
+
+        // Loud on purpose: this fallback is the documented top-octave-loss
+        // pitfall, and a debug-only log let it regress unnoticed once already.
+        print("⚠️ BigVGAN vocoder unavailable for this checkpoint — falling back to the "
+            + "legacy 24 kHz vocoder (audio loses the 12-16 kHz octave)")
+        let weights = try LTXWeightLoader.loadVocoderWeights(from: legacyPath.path)
+        let legacy = LTX2Vocoder()
+        try LTXWeightLoader.applyVocoderWeights(weights, to: legacy)
+        return legacy
+    }
+
+    /// The checkpoint paths resolved earlier in this load, without re-downloading.
+    private func resolveCheckpointSync() throws -> LTXCheckpointPaths? {
+        guard let cached = unifiedWeightsPathCache.cachedPath(for: model) else { return nil }
+        let transformer = URL(fileURLWithPath: cached)
+        switch model.weightsLayout {
+        case .unified:
+            return LTXCheckpointPaths(transformer: transformer, videoVAE: transformer)
+        case .split:
+            let directory = transformer.deletingLastPathComponent()
+            guard let audio = model.family.sharedComponentFiles.first(where: { $0.kind == .audioVAE })
+            else { return nil }
+            return LTXCheckpointPaths(
+                transformer: transformer,
+                videoVAE: transformer,
+                audioBundle: directory.appendingPathComponent(audio.filename))
+        }
+    }
+
+    // MARK: - Auto Duration (LTX-2.5)
+
+    /// Predict a clip length from the prompt, as LTX-2.5's `--auto-duration` does.
+    ///
+    /// Runs the text encoder and the 3.8 MB duration head — no diffusion — and
+    /// returns a frame count already snapped to the `8k + 1` grid, so the result
+    /// can be handed straight to ``LTXVideoGenerationConfig``.
+    ///
+    /// The clamp is a safety rail: an outlier prediction would otherwise request a
+    /// degenerate or OOM-sized generation. `wasClamped` reports when it bit, so a
+    /// caller can tell "the model asked for 3 s" from "the model asked for 90 s".
+    ///
+    /// - Throws: when the checkpoint predates LTX-2.5 — no earlier generation
+    ///   ships a duration head, and guessing a length would defeat the purpose.
+    public func predictFrameCount(
+        for prompt: String,
+        frameRate: Float = 24.0,
+        minSeconds: Float = 1.0,
+        maxSeconds: Float = 20.0
+    ) async throws -> (frames: Int, seconds: Float, wasClamped: Bool) {
+        guard model.family == .ltx25 else {
+            throw LTXError.invalidConfiguration(
+                "Auto duration needs a duration head, which ships from LTX-2.5 onward — "
+                + "\(model.displayName) has none. Pass an explicit frame count.")
+        }
+        if !isGemmaLoaded || textEncoder == nil {
+            try await loadModels(progressCallback: nil)
+        }
+        guard let textEncoder else {
+            throw LTXError.modelNotLoaded("Text encoder not loaded")
+        }
+
+        let headPath = try await downloader.downloadDurationHead()
+        let head = try LTXDurationHead.load(from: headPath)
+
+        let (states, attentionMask) = try encodeHiddenStates(prompt)
+        let encoded = try textEncoder.encodeFromHiddenStates(
+            hiddenStates: states, attentionMask: attentionMask, paddingSide: "left")
+
+        let result = try head.predictFrameCount(
+            videoTokens: encoded.videoEncoding,
+            audioTokens: encoded.audioEncoding,
+            frameRate: frameRate,
+            minSeconds: minSeconds,
+            maxSeconds: maxSeconds)
+        LTXDebug.log("Duration head: \(result.rawSeconds)s → \(result.frames) frames"
+            + (result.wasClamped ? " (clamped)" : ""))
+        return (result.frames, result.rawSeconds, result.wasClamped)
+    }
+
     // MARK: - Download Helpers
 
-    /// Download spatial upscaler weights (if not already cached)
+    /// Download the spatial upscaler matching this pipeline's checkpoint generation.
+    ///
+    /// The module is architecturally identical across 2.3 and 2.5 — same 24 tensor
+    /// patterns, same shapes — but the weights are not: a 2.5 latent is not a 2.3
+    /// latent, so the two-stage pass must use its own generation's upscaler.
     /// - Returns: Path to the upscaler safetensors file
     public func downloadUpscalerWeights() async throws -> String {
-        let url = try await downloader.downloadUpscalerWeights()
+        let url = try await downloader.downloadAuxiliaryModel(model.defaultSpatialUpscaler)
         return url.path
     }
 
@@ -3245,6 +3532,8 @@ public actor LTXPipeline {
         // would capture LipDub-contaminated weights as the "originals" — a later
         // unfuseLoRA() would then restore corrupted weights as if pristine.
         try ensureNoLipDubLoRAFused(wouldCorrupt: "fuseLoRA (its unfuse originals)")
+        LoRALoader.warnOnGenerationMismatch(
+            loraPath: loraPath, checkpointVersion: model.family.checkpointModelVersion)
         let target = try getTransformerModule()
         let (originals, result) = try target.fuseLoRA(from: loraPath, scale: scale)
         // Store state for unfusing
@@ -3367,8 +3656,7 @@ public actor LTXPipeline {
     /// model references.
     public func clearAll() {
         // Release all model references
-        gemmaModel = nil
-        tokenizer = nil
+        gemmaEncoder = nil
         textEncoder = nil
         transformer = nil
         vaeDecoder = nil
@@ -3391,7 +3679,7 @@ public actor LTXPipeline {
 
     /// Clear only Gemma model (to save memory after encoding)
     public func clearGemma() {
-        gemmaModel = nil
+        gemmaEncoder = nil
         LTXDebug.log("Gemma model cleared")
     }
 
@@ -3422,37 +3710,8 @@ public actor LTXPipeline {
 
     /// 4. Return video encoding [1, textMaxLength, 3840] and attention mask [1, textMaxLength]
     private func encodePrompt(_ prompt: String, encoder: VideoGemmaTextEncoderModel) throws -> (encoding: MLXArray, mask: MLXArray) {
-        guard let gemma = gemmaModel else {
-            LTXDebug.log("Warning: Gemma model not loaded, using placeholder embeddings")
-            let placeholder = createPlaceholderEmbeddings(prompt: prompt)
-            let mask = MLXArray.ones([1, textMaxLength]).asType(.int32)
-            return (placeholder, mask)
-        }
-
-        // Step 1: Tokenize with left-padding
-        let (inputIds, attentionMask) = try tokenizePrompt(prompt, maxLength: textMaxLength)
-        let activeTokens = Int(attentionMask.sum().item(Int32.self))
-        LTXDebug.log("Tokenized: \(inputIds.shape), padding=\(textMaxLength - activeTokens), active=\(activeTokens)")
-        // Debug: show first and last tokens for comparison with Python
-        MLX.eval(inputIds)
-        let idsFlat = inputIds.reshaped([-1])
-        var firstTokens: [Int32] = []
-        var lastTokens: [Int32] = []
-        for i in 0..<min(5, textMaxLength) { firstTokens.append(idsFlat[i].item(Int32.self)) }
-        for i in max(0, textMaxLength-10)..<textMaxLength { lastTokens.append(idsFlat[i].item(Int32.self)) }
-        LTXDebug.log("  First 5 tokens: \(firstTokens)")
-        LTXDebug.log("  Last 10 tokens: \(lastTokens)")
-
-        // Step 2: Run Gemma forward pass to extract all 49 hidden states
-        LTXDebug.log("Running Gemma forward pass...")
-        let (_, allHiddenStates) = gemma(inputIds, attentionMask: attentionMask, outputHiddenStates: true)
-
-        guard let states = allHiddenStates, states.count == gemma.config.hiddenLayers + 1 else {
-            LTXDebug.log("Warning: Expected \(gemma.config.hiddenLayers + 1) hidden states, using placeholder")
-            let placeholder = createPlaceholderEmbeddings(prompt: prompt)
-            let mask = MLXArray.ones([1, textMaxLength]).asType(.int32)
-            return (placeholder, mask)
-        }
+        // Step 1 & 2: Tokenize and run the Gemma forward pass for all 49 hidden states
+        let (states, attentionMask) = try encodeHiddenStates(prompt)
         LTXDebug.log("Got \(states.count) hidden states from Gemma")
 
         // Step 3: Pass through text encoder (feature extractor + connector)
@@ -3471,36 +3730,18 @@ public actor LTXPipeline {
     }
 
     /// Tokenize prompt with left-padding (matching Python mlx-video max_length=1024)
-    private func tokenizePrompt(_ prompt: String, maxLength: Int = 1024) throws -> (inputIds: MLXArray, attentionMask: MLXArray) {
-        guard let tokenizer = tokenizer else {
-            throw LTXError.modelNotLoaded("Tokenizer not loaded. Call loadModels() first.")
+    /// Run the prompt through the loaded Gemma stack.
+    ///
+    /// The single funnel every generation path goes through: five call sites used
+    /// to repeat tokenize → forward → count-check inline, which meant Gemma 4
+    /// support would have had to be written five times.
+    private func encodeHiddenStates(
+        _ prompt: String
+    ) throws -> (states: [MLXArray], attentionMask: MLXArray) {
+        guard let encoder = gemmaEncoder else {
+            throw LTXError.modelNotLoaded("Gemma model not loaded. Call loadModels() first.")
         }
-
-        // Tokenize (Gemma tokenizer adds BOS=2 automatically)
-        let encoded = tokenizer.encode(text: prompt)
-        var tokens = Array(encoded.suffix(maxLength)).map { Int32($0) }
-
-        // Left-pad with pad_token_id=0 (matching Python tokenizer)
-        let paddingNeeded = maxLength - tokens.count
-        let padTokenId: Int32 = 0  // Gemma pad_token_id=0 (NOT eos=1)
-        if paddingNeeded > 0 {
-            tokens = [Int32](repeating: padTokenId, count: paddingNeeded) + tokens
-        }
-
-        // Attention mask: 0 for padding, 1 for real tokens
-        let mask = [Float](repeating: 0, count: paddingNeeded)
-            + [Float](repeating: 1, count: maxLength - paddingNeeded)
-
-        let inputIds = MLXArray(tokens).reshaped([1, maxLength])
-        let attentionMask = MLXArray(mask).reshaped([1, maxLength])
-
-        return (inputIds, attentionMask)
-    }
-
-    /// Create placeholder embeddings when Gemma is not available
-    private func createPlaceholderEmbeddings(prompt: String) -> MLXArray {
-        let hiddenDim = 3840
-        return MLXArray.zeros([1, textMaxLength, hiddenDim]).asType(.float32)
+        return try encoder.encode(prompt: prompt, maxLength: textMaxLength)
     }
 
     /// Create position indices for RoPE
