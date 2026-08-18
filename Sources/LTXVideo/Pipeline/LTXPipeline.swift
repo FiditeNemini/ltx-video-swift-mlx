@@ -3198,6 +3198,25 @@ If the user wrote in another language, produce the English caption of the same c
 AESTHETIC QUALITY (in addition to the above, without breaking the objective caption style): render the described scene with strong visual production value — cinematic, film-grade color and contrast, beautiful natural lighting, crisp fine detail and texture, pleasing composition and depth. Weave these quality descriptors naturally into the same observable prose (e.g. "warm cinematic lighting", "richly saturated film-grade color", "crisp high-resolution detail") — describe how the exact requested scene LOOKS at its most visually striking, never adding new objects or actions. Keep everything else (framing triple, soundscape, chronological single paragraph, faithfulness) exactly as specified.
 """
 
+    /// Enhancement decoding policy, measured on the 2CV bench (E2B bf16, same
+    /// prompt/image/seed, one variable at a time):
+    ///
+    /// | thinking | ngram 5 | timeline produced                        |
+    /// |----------|---------|------------------------------------------|
+    /// | off      | on      | hover spans the launch; 3 marker formats |
+    /// | **on**   | **off** | **hover bounded, launch at 07:500, one format** |
+    /// | on       | on      | *no* timestamps at all                   |
+    ///
+    /// Reasoning is what fixes the timeline arithmetic; the n-gram ban then
+    /// forbids the caption from repeating what the reasoning just wrote, which
+    /// erases the markers entirely. So thinking is on and n-gram blocking is
+    /// off until the window can skip the thought channel (asked upstream);
+    /// loop protection is what we trade away meanwhile, measured harmless on
+    /// the bench prompts. Reasoning costs ~350 tokens before the answer, hence
+    /// the raised budget.
+    private let enhancerThinking = true
+    private let enhancerNGram = false
+
     /// LTX-2.5 prompt enhancement through our own `Gemma4Swift` stack.
     ///
     /// Mirrors upstream\'s design: the bundled 12B encoder is encode-only
@@ -3230,19 +3249,37 @@ AESTHETIC QUALITY (in addition to the above, without breaking the objective capt
             let pixels = try Gemma4ImageProcessor.processImage(
                 url: URL(fileURLWithPath: imagePath))
             stream = try await g4.chatStreamMultimodal(
-                prompt: Self.promptEnhancementGemma4I2VSystemPrompt
-                    + "\n\nuser prompt: \(prompt)",
+                prompt: "user prompt: \(prompt)",
                 pixelValues: pixels,
+                // A real system turn, as the reference space sends it — the
+                // Gemma 4 template renders it as a distinct turn rather than
+                // folding it into the user message (gemma-4-swift-mlx 1.3.0).
+                systemPrompt: Self.promptEnhancementGemma4I2VSystemPrompt,
                 temperature: 0.0,
-                maxTokens: 600,
-                noRepeatNGramSize: 5)
+                // Reasoning costs ~350 tokens before the answer starts; at 600 a
+                // long caption gets truncated mid-sentence (measured upstream).
+                maxTokens: enhancerThinking ? 1200 : 600,
+                noRepeatNGramSize: enhancerNGram ? 5 : nil,
+                // Deliberate deviation from HF semantics (and from the reference
+                // space): ban only n-grams repeated within the GENERATED text, so
+                // the caption may quote the prompt's timeline verbatim. Measured:
+                // with the prompt in the window, timestamps come out mangled and
+                // the duration head over-predicts ~5 s (docs/knowledge pitfall).
+                noRepeatNGramIncludesPrompt: false,
+                templateVariables: enhancerThinking ? ["enable_thinking": true] : nil)
         } else {
             stream = try await g4.chatStream(
                 prompt: "user prompt: \(prompt)",
                 systemPrompt: Self.promptEnhancementGemma4T2VSystemPrompt,
                 temperature: 0.0,
                 maxTokens: 600,
-                noRepeatNGramSize: 5)
+                noRepeatNGramSize: 5,
+                // Deliberate deviation from HF semantics (and from the reference
+                // space): ban only n-grams repeated within the GENERATED text, so
+                // the caption may quote the prompt's timeline verbatim. Measured:
+                // with the prompt in the window, timestamps come out mangled and
+                // the duration head over-predicts ~5 s (docs/knowledge pitfall).
+                noRepeatNGramIncludesPrompt: false)
         }
 
         var generatedText = ""
@@ -3266,6 +3303,13 @@ AESTHETIC QUALITY (in addition to the above, without breaking the objective capt
     /// Clean up a Gemma-enhanced prompt: strip control tokens and trailing noise
     private func cleanEnhancedPrompt(_ raw: String) -> String {
         var text = raw
+        // Thinking mode streams reasoning in a channel before the answer; the
+        // template's own strip_thinking macro does the same for prior turns.
+        if let close = text.range(of: "<channel|>", options: .backwards) {
+            text = String(text[close.upperBound...])
+        }
+        text = text.replacingOccurrences(of: "<|channel>thought", with: "")
+        text = text.replacingOccurrences(of: "<|think|>", with: "")
         text = text.replacingOccurrences(of: "<end_of_turn>", with: "")
         text = text.replacingOccurrences(of: "<start_of_turn>", with: "")
         text = text.replacingOccurrences(of: "<eos>", with: "")

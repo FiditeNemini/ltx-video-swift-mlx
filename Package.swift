@@ -30,7 +30,7 @@ let package = Package(
         // Pinned by revision, not by branch: SwiftPM refuses a transitive branch
         // requirement under a semver-tagged package, which would make this package
         // unconsumable from its first tagged release. The last tag (1.0.0) predates
-        // `forwardCollectingHiddenStates`; move to `from: "1.1.0"` once it ships.
+        // `forwardCollectingHiddenStates`; move to `from: "1.4.0"` once it ships.
         .package(
             url: "https://github.com/VincentGourbin/gemma-4-swift-mlx",
             from: "1.1.0"

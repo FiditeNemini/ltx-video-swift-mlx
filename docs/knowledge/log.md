@@ -27,6 +27,10 @@
   dev+LoRA450, no-LoRA control, and the 30-step dev ceiling; wall times and
   memory peaks recorded in the README table.
 
+* **Update**: [no_repeat_ngram bans quoting the prompt](/docs/knowledge/pitfalls/ngram-blocking-mangles-prompt-quoting.md)
+  — fixed via gemma-4-swift-mlx 1.2.0 `includePromptInWindow: false`;
+  duration prediction on the enhanced 2CV prompt fell 19.04 s → 14.71 s.
+
 ## 2026-08-16
 
 * **Creation**: [no_repeat_ngram bans quoting the prompt](/docs/knowledge/pitfalls/ngram-blocking-mangles-prompt-quoting.md)

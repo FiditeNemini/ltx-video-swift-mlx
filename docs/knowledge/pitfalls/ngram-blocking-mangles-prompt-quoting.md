@@ -29,13 +29,29 @@ so parity is preserved by keeping ngram 5 — this pitfall documents a
 - Known consequence chain: timeline-style prompts → mangled timestamps →
   duration over-prediction → choreography stretched past its own end (the
   "car drifts backward" symptom class).
-- Candidate fix (deliberate deviation, needs gemma-4-swift-mlx support):
-  exempt prompt tokens from the ban window — ban only n-grams repeated
-  *within the generated text*, which still kills loops (the feature's actual
-  purpose) while allowing faithful quoting. Instructions handed to the
-  package team 2026-08-16.
-- Workaround available today: pass the enhanced text yourself (`generate`
-  without `--enhance-prompt`) or pin `--frames` when the prompt is timed.
+- Fixed 2026-08-17: gemma-4-swift-mlx 1.2.0 ships `includePromptInWindow`;
+  the enhancer passes `noRepeatNGramIncludesPrompt: false` — a deliberate
+  deviation from HF semantics and from the reference space. Measured on the
+  same raw prompt: duration prediction fell from 19.04 s to 14.71 s (14 s
+  choreography) and the timeline reads intact end to end; loop protection
+  stays active within the generated text.
+- If parity with the reference space's exact captions ever matters more
+  than fidelity, flip the flag back — one argument per call site.
+
+# Sequel: the same trap via the reasoning channel
+
+Enabling Gemma 4's thinking mode (gemma-4-swift-mlx 1.4.0) *fixes* the timeline
+arithmetic — bounded hover, single marker format — but only with n-gram
+blocking **off**. With both on, the model reasons using the timestamps, is then
+forbidden from repeating them verbatim, and emits a caption with *zero*
+markers ("at the start of the sequence", "at the peak of the hover"). Measured
+three-branch matrix, 2026-08-18. Shipped config is therefore thinking on,
+n-gram off, until the window can skip the thought channel (asked upstream).
+
+Two defects survive and are accepted as an E2B limitation: the caption can
+contradict its own viewpoint ("medium side profile shot … from a front-facing
+angle") and detaches the motion adverb from its verb. The reference service
+does neither.
 
 # Citations
 
