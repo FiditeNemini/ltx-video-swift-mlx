@@ -38,6 +38,21 @@ so parity is preserved by keeping ngram 5 — this pitfall documents a
 - If parity with the reference space's exact captions ever matters more
   than fidelity, flip the flag back — one argument per call site.
 
+# Sequel: the same trap via the reasoning channel
+
+Enabling Gemma 4's thinking mode (gemma-4-swift-mlx 1.4.0) *fixes* the timeline
+arithmetic — bounded hover, single marker format — but only with n-gram
+blocking **off**. With both on, the model reasons using the timestamps, is then
+forbidden from repeating them verbatim, and emits a caption with *zero*
+markers ("at the start of the sequence", "at the peak of the hover"). Measured
+three-branch matrix, 2026-08-18. Shipped config is therefore thinking on,
+n-gram off, until the window can skip the thought channel (asked upstream).
+
+Two defects survive and are accepted as an E2B limitation: the caption can
+contradict its own viewpoint ("medium side profile shot … from a front-facing
+angle") and detaches the motion adverb from its verb. The reference service
+does neither.
+
 # Citations
 
 [1] A/B smoke runs 2026-08-16, seed 42, prompt_2cv_raw: ngram 5 vs nil.

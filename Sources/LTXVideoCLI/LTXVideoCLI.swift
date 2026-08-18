@@ -258,6 +258,19 @@ struct Generate: AsyncParsableCommand {
         print("Pipeline created")
         fflush(stdout)
 
+        // Enhance before anything heavy is resident. The enhancer needs no LTX
+        // model, and sharing unified memory with a loaded checkpoint is brutal:
+        // measured 3 min standalone vs ~85 min with the video+audio stack
+        // (~48 GB) already in memory — same prompt, same settings. Upstream
+        // ordering is also enhance-then-duration, so this satisfies both.
+        var effectivePrompt = prompt
+        if enhancePrompt {
+            print("Enhancing prompt...")
+            fflush(stdout)
+            let promptImage = parsedKeyframes.first?.path ?? image
+            effectivePrompt = try await pipeline.enhancePromptWithVLM(prompt, imagePath: promptImage)
+        }
+
         // Load models
         print("Loading models (this may take a while)...")
         fflush(stdout)
@@ -288,18 +301,6 @@ struct Generate: AsyncParsableCommand {
             fflush(stdout)
             let fusedCount = try await pipeline.fuseLoRA(from: loraPath, scale: loraScale)
             print("LoRA fused (\(fusedCount) layer-pairs)")
-        }
-
-        // Upstream order (distilled.py): enhance FIRST, then the duration head
-        // reads the *enhanced* prompt's encoding. Predicting on the raw prompt
-        // over-estimated (16.0s vs 14.0s on this bench's prompt), stretching the
-        // choreography past its own timeline.
-        var effectivePrompt = prompt
-        if enhancePrompt {
-            print("Enhancing prompt (before duration prediction, as upstream)...")
-            fflush(stdout)
-            let promptImage = parsedKeyframes.first?.path ?? image
-            effectivePrompt = try await pipeline.enhancePromptWithVLM(prompt, imagePath: promptImage)
         }
 
         // Auto duration: ask the duration head before committing to a frame count
