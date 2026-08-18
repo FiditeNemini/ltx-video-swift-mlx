@@ -21,6 +21,12 @@
 
 ## 2026-08-17
 
+* **Update**: archived the distilled-vs-dev quality series as the LTX-2.5
+  benchmark anchors ([docs/examples/ltx-2.5](/docs/examples/ltx-2.5/README.md),
+  `series-25-*`) — same seed/prompt/337 frames across distilled two-stage,
+  dev+LoRA450, no-LoRA control, and the 30-step dev ceiling; wall times and
+  memory peaks recorded in the README table.
+
 * **Update**: [no_repeat_ngram bans quoting the prompt](/docs/knowledge/pitfalls/ngram-blocking-mangles-prompt-quoting.md)
   — fixed via gemma-4-swift-mlx 1.2.0 `includePromptInWindow: false`;
   duration prediction on the enhanced 2CV prompt fell 19.04 s → 14.71 s.

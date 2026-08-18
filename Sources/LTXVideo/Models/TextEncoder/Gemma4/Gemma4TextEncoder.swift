@@ -83,7 +83,21 @@ final class Gemma4TextEncoder: LTXGemmaEncoding {
         transformerMetadata: [String: String]? = nil,
         quantization: TransformerQuantization? = nil
     ) async throws -> Gemma4TextEncoder {
-        let assets = try LTX25TextEncoderAssets(fileURL: fileURL)
+        try await load(
+            assets: LTX25TextEncoderAssets(fileURL: fileURL),
+            tokenizerCacheDirectory: tokenizerCacheDirectory,
+            transformerMetadata: transformerMetadata,
+            quantization: quantization)
+    }
+
+    /// Same, from an already-parsed bundle — the pipeline parses the ~24 GB
+    /// file once and shares it between the encoder and the projections.
+    static func load(
+        assets: LTX25TextEncoderAssets,
+        tokenizerCacheDirectory: URL,
+        transformerMetadata: [String: String]? = nil,
+        quantization: TransformerQuantization? = nil
+    ) async throws -> Gemma4TextEncoder {
         if let transformerMetadata {
             try assets.verifyPairing(withTransformerMetadata: transformerMetadata)
         }
