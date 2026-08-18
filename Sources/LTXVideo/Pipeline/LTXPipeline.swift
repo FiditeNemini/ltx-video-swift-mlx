@@ -359,10 +359,37 @@ public actor LTXPipeline {
         }
     }
 
+    /// x₀-space guidance combination shared by every dev-guided loop (retake,
+    /// dev single-stage): CFG toward `neg`, STG toward `stg`, then variance
+    /// rescale toward `cond` — matching the Lightricks order, all on x₀.
+    nonisolated static func combineGuidance(
+        cond: MLXArray, neg: MLXArray?, stg: MLXArray?,
+        cfgScale: Float, stgScale: Float, guidanceRescale: Float
+    ) -> MLXArray {
+        var combined = cond
+        if cfgScale != 1.0, let neg {
+            // CFG: pred = cond + (cfg_scale - 1) * (cond - uncond)
+            combined = combined + MLXArray(cfgScale - 1.0) * (cond - neg)
+        }
+        if stgScale != 0.0, let stg {
+            // STG: pred += stg_scale * (cond - perturbed)
+            combined = combined + MLXArray(stgScale) * (cond - stg)
+        }
+        if guidanceRescale > 0 {
+            let condStd = cond.asType(.float32).variance().sqrt()
+            let predStd = combined.asType(.float32).variance().sqrt()
+            let factor = MLXArray(guidanceRescale) * (condStd / predStd)
+                + MLXArray(1.0 - guidanceRescale)
+            combined = combined * factor
+        }
+        return combined
+    }
+
     /// Build the prompt encoder this checkpoint was trained with.
     private func loadGemmaEncoder(
         checkpoint: LTXCheckpointPaths,
         source: LTXCheckpointSource,
+        textEncoderAssets: LTX25TextEncoderAssets? = nil,
         gemmaModelPath: String?,
         tokenizerPath: String?,
         progressCallback: DownloadProgressCallback?
@@ -375,7 +402,7 @@ public actor LTXPipeline {
             }
             LTXDebug.log("Loading Gemma 4 encoder from \(textEncoderPath.lastPathComponent)...")
             return try await Gemma4TextEncoder.load(
-                fileURL: textEncoderPath,
+                assets: textEncoderAssets ?? LTX25TextEncoderAssets(fileURL: textEncoderPath),
                 tokenizerCacheDirectory: LTXModelRegistry.modelsDirectory
                     .appendingPathComponent("ltx25-gemma4-tokenizer", isDirectory: true),
                 transformerMetadata: try source.transformerMetadata(),
@@ -464,9 +491,13 @@ public actor LTXPipeline {
         // Gemma 3 is an external download for 2.3.
         progressCallback?(DownloadProgress(progress: 0.2, message: "Loading text encoder..."))
         stepStart = Date()
+        // Parse the (mmap'd) text-encoder bundle once: both the Gemma encoder
+        // and the aggregate projections read from it.
+        let textEncoderAssets = try checkpoint.textEncoder.map { try LTX25TextEncoderAssets(fileURL: $0) }
         gemmaEncoder = try await loadGemmaEncoder(
             checkpoint: checkpoint,
             source: source,
+            textEncoderAssets: textEncoderAssets,
             gemmaModelPath: gemmaModelPath,
             tokenizerPath: tokenizerPath,
             progressCallback: progressCallback)
@@ -475,7 +506,7 @@ public actor LTXPipeline {
         // Step 3: Load LTX component weights
         progressCallback?(DownloadProgress(progress: 0.3, message: "Loading \(model.family.displayName) weights..."))
         stepStart = Date()
-        let split = try source.loadComponents()
+        let split = try source.loadComponents(textEncoderAssets: textEncoderAssets)
         let transformerWeights = split.transformer
         let vaeWeights = split.vae
         let connectorWeights = split.connector
@@ -549,6 +580,10 @@ public actor LTXPipeline {
 
     /// Load only the text encoding models (Gemma + tokenizer + connector).
     /// Use this for standalone text encoding without loading the heavy transformer and VAE.
+    ///
+    /// Family-aware: 2.5 checkpoints load their bundled Gemma 4, 2.3 the external
+    /// Gemma 3 — the same routing as `loadModels()`. Component dicts are lazily
+    /// mmap'd, so resolving the checkpoint here does not read transformer bytes.
     public func loadTextEncoderModels(
         progressCallback: DownloadProgressCallback? = nil,
         gemmaModelPath: String? = nil,
@@ -557,41 +592,24 @@ public actor LTXPipeline {
         LTXDebug.log("Loading text encoder models for \(model.displayName)...")
         var stepStart = Date()
 
-        // Step 1: Load Gemma model and tokenizer
-        progressCallback?(DownloadProgress(progress: 0.1, message: "Loading Gemma model..."))
+        progressCallback?(DownloadProgress(progress: 0.1, message: "Resolving checkpoint..."))
+        let checkpoint = try await resolveCheckpoint(progressCallback: progressCallback)
+        let source = LTXCheckpointSource(model: model, paths: checkpoint)
+        let textEncoderAssets = try checkpoint.textEncoder.map { try LTX25TextEncoderAssets(fileURL: $0) }
 
-        let gemmaURL: URL
-        let tokenizerURL: URL
-        if let gemmaPath = gemmaModelPath {
-            gemmaURL = URL(fileURLWithPath: gemmaPath)
-            tokenizerURL = tokenizerPath.map { URL(fileURLWithPath: $0) } ?? gemmaURL
-        } else {
-            LTXDebug.log("Downloading Gemma text encoder (if needed)...")
-            let paths = try await downloader.downloadGemma(model: model) { progress in
-                progressCallback?(progress)
-            }
-            gemmaURL = paths.modelDir
-            tokenizerURL = paths.tokenizerDir
-        }
-
-        stepStart = Date()
-        LTXDebug.log("Loading Gemma3 model from \(gemmaURL.path)...")
-        let gemma3Model = try Gemma3WeightLoader.loadModel(from: gemmaURL)
+        progressCallback?(DownloadProgress(progress: 0.3, message: "Loading Gemma model..."))
+        gemmaEncoder = try await loadGemmaEncoder(
+            checkpoint: checkpoint,
+            source: source,
+            textEncoderAssets: textEncoderAssets,
+            gemmaModelPath: gemmaModelPath,
+            tokenizerPath: tokenizerPath,
+            progressCallback: progressCallback)
         LTXDebug.log("[TIME] Gemma load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
 
-        stepStart = Date()
-        progressCallback?(DownloadProgress(progress: 0.5, message: "Loading tokenizer..."))
-        gemmaEncoder = Gemma3Encoder(
-            model: gemma3Model,
-            tokenizer: try await AutoTokenizer.from(modelFolder: tokenizerURL))
-        LTXDebug.log("[TIME] Tokenizer load: \(String(format: "%.1f", Date().timeIntervalSince(stepStart)))s")
-
-        // Step 2: Download unified file and extract connector weights
         progressCallback?(DownloadProgress(progress: 0.7, message: "Loading connector weights..."))
         stepStart = Date()
-        let unifiedPath = try await resolveUnifiedWeightsPath(for: model, progressCallback: progressCallback)
-        let split = try LTXWeightLoader.splitUnifiedWeightsFile(path: unifiedPath)
-        let connectorWeights = split.connector
+        let connectorWeights = try source.loadComponents(textEncoderAssets: textEncoderAssets).connector
 
         textEncoder = createTextEncoder(
             gatedAttention: model.transformerConfig.gatedAttention
@@ -1722,38 +1740,27 @@ public actor LTXPipeline {
             // Positive pass (conditioned)
             let audioCtx = (audioTextEmbeddings ?? MLXArray.zeros([videoPatchified.dim(0), 1, ltx2Transformer?.config.audioInnerDim ?? 2048])).asType(.bfloat16)
             let condDenoised = try runTransformer(context: videoTextEmbeddings, audioContext: audioCtx)
-            var denoisedVideo = condDenoised
 
-            // CFG: negative pass + guidance (dev model only)
+            // CFG negative pass (dev model only)
+            var negDenoised: MLXArray? = nil
             if cfgScale != 1.0, let negCtx = negVideoTextEmbeddings {
                 let negAudioCtx = (negAudioTextEmbeddings ?? audioCtx).asType(.bfloat16)
-                let negDenoised = try runTransformer(context: negCtx, audioContext: negAudioCtx)
-
-                // CFG: pred = cond + (cfg_scale - 1) * (cond - uncond)
-                denoisedVideo = denoisedVideo + MLXArray(cfgScale - 1.0) * (condDenoised - negDenoised)
+                negDenoised = try runTransformer(context: negCtx, audioContext: negAudioCtx)
             }
 
             // STG: perturbed pass with self-attention skipped on stgBlocks (dev model only)
+            var stgDenoised: MLXArray? = nil
             if stgScale != 0.0 && !stgBlocks.isEmpty {
                 if let ltx2 = ltx2Transformer { ltx2.setSTGBlocks(stgBlocks) }
                 if let t = transformer { t.setSTGBlocks(stgBlocks) }
-
-                let stgDenoised = try runTransformer(context: videoTextEmbeddings, audioContext: audioCtx)
-
+                stgDenoised = try runTransformer(context: videoTextEmbeddings, audioContext: audioCtx)
                 if let ltx2 = ltx2Transformer { ltx2.clearSTG() }
                 if let t = transformer { t.clearSTG() }
-
-                // STG: pred += stg_scale * (cond - perturbed)
-                denoisedVideo = denoisedVideo + MLXArray(stgScale) * (condDenoised - stgDenoised)
             }
 
-            // Guidance rescale (applied after all guidance terms, matching Lightricks)
-            if guidanceRescale > 0 {
-                let condStd = condDenoised.asType(.float32).variance().sqrt()
-                let predStd = denoisedVideo.asType(.float32).variance().sqrt()
-                let factor = MLXArray(guidanceRescale) * (condStd / predStd) + MLXArray(1.0 - guidanceRescale)
-                denoisedVideo = denoisedVideo * factor
-            }
+            var denoisedVideo = Self.combineGuidance(
+                cond: condDenoised, neg: negDenoised, stg: stgDenoised,
+                cfgScale: cfgScale, stgScale: stgScale, guidanceRescale: guidanceRescale)
 
             // post_process_latent: blend denoised x0 with clean latent BEFORE Euler step
             // (matching Lightricks: denoised = denoised * mask + clean * (1 - mask))

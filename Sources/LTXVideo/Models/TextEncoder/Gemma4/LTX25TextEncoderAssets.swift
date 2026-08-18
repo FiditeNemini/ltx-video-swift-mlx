@@ -17,7 +17,10 @@ import Gemma4Swift
 /// the transformer checkpoint names it in `gemma_source_checkpoint`, and pairing
 /// a different Gemma root with it yields garbage, not degraded output — hence
 /// ``verifyPairing(withTransformerMetadata:)``.
-struct LTX25TextEncoderAssets {
+struct LTX25TextEncoderAssets: @unchecked Sendable {
+    // @unchecked: immutable struct over lazily-mmap'd MLXArrays that are only
+    // ever read; it crosses from the pipeline actor into the encoder's async
+    // loader without concurrent mutation.
     /// Every tensor in the file, lazily mmap'd by MLX.
     private let weights: [String: MLXArray]
 

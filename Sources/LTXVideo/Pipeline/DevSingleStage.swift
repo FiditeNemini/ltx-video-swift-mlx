@@ -105,11 +105,7 @@ has_subtitles, has_blurbox, transition from black, transition to black, speech_e
             }
 
             let condX0 = denoisedX0(context: encoded.embeddings, mask: encoded.mask)
-            var combined = condX0
-
-            // CFG on x0: pred = cond + (scale − 1)(cond − uncond)
             let negX0 = denoisedX0(context: negative.embeddings, mask: negative.mask)
-            combined = combined + MLXArray(cfgScale - 1.0) * (condX0 - negX0)
 
             // STG: perturbed pass with self-attention skipped on the STG blocks.
             transformer?.setSTGBlocks(stgBlocks)
@@ -117,16 +113,10 @@ has_subtitles, has_blurbox, transition from black, transition to black, speech_e
             let stgX0 = denoisedX0(context: encoded.embeddings, mask: encoded.mask)
             transformer?.clearSTG()
             ltx2Transformer?.clearSTG()
-            combined = combined + MLXArray(stgScale) * (condX0 - stgX0)
 
-            // Rescale toward the conditioned prediction's variance.
-            if guidanceRescale > 0 {
-                let condStd = condX0.asType(.float32).variance().sqrt()
-                let predStd = combined.asType(.float32).variance().sqrt()
-                let factor = MLXArray(guidanceRescale) * (condStd / predStd)
-                    + MLXArray(1.0 - guidanceRescale)
-                combined = combined * factor
-            }
+            let combined = LTXPipeline.combineGuidance(
+                cond: condX0, neg: negX0, stg: stgX0,
+                cfgScale: cfgScale, stgScale: stgScale, guidanceRescale: guidanceRescale)
 
             // Euler on the recomposed velocity.
             let velocity = (latent - combined) / MLXArray(sigma)
