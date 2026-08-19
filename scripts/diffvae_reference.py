@@ -66,7 +66,7 @@ taps = {}
 def tap(name):
     def hook(_m, _inp, out):
         t = out[0] if isinstance(out, tuple) else out
-        taps[name] = t.detach().float().contiguous()
+        taps[name] = t.detach().float().clone().contiguous()
     return hook
 
 b0 = model.det_stages[0][0]
@@ -76,6 +76,10 @@ b0.attn.register_forward_hook(tap("b0_attn"))
 b0.register_forward_hook(tap("b0_out"))
 model.det_stages[0][1].register_forward_hook(tap("b1_out"))
 model.upsamples[0].register_forward_hook(tap("up0_out"))
+for st in range(4):
+    model.det_stages[st][-1].register_forward_hook(tap(f"stage{st}_last"))
+    model.upsamples[st].register_forward_hook(tap(f"up{st}_out"))
+model.diff_blocks[0].register_forward_hook(tap("diff0_out"))
 
 with torch.no_grad():
     ctx13 = model.forward_stages_1_to_3(latent, drop_leading_frame=True)
@@ -87,7 +91,8 @@ with torch.no_grad():
 
 print("REF ctx", tuple(ctx.shape), "mean|x|", ctx.abs().mean().item(), "std", ctx.std().item())
 print("REF pred", tuple(pred.shape), "mean|x|", pred.abs().mean().item(), "std", pred.std().item())
-dump = {"latent": latent, "context": ctx.contiguous(), "prediction": pred.contiguous()}
+dump = {"latent": latent.clone(), "context": ctx.detach().clone().contiguous(),
+        "prediction": pred.detach().clone().contiguous()}
 dump.update(taps)
 for k, v in sorted(taps.items()):
     print(f"REF tap {k} {tuple(v.shape)} mean|x| {v.abs().mean().item():.5f}")

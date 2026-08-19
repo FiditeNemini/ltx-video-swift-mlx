@@ -21,6 +21,11 @@
 
 ## 2026-08-19
 
+* **Creation**: [Tiled-attention mask caches need the whole window pattern](/docs/knowledge/pitfalls/na-tile-mask-cache-key.md)
+  — the last bug between the DiffVAE port and element-wise parity; found by the
+  new reference harness, which now pins the whole decoder at ~1e-6.
+
+
 * **Creation**: [Dotted parameter names never load](/docs/knowledge/pitfalls/dotted-parameter-names-never-load.md)
   — found while bringing up the LTX-2.5 diffusion video decoder: the latent
   statistics silently kept mean 0 / std 1, washing out every decode.

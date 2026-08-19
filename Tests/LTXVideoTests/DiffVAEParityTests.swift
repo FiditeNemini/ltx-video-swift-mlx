@@ -52,8 +52,13 @@ struct DiffVAEParityTests {
         taps.append(("b0_out", out0))
         var h = decoder.detStages[0][1](out0)
         taps.append(("b1_out", h))
-        for i in 2 ..< decoder.detStages[0].count { h = decoder.detStages[0][i](h) }
-        taps.append(("up0_out", decoder.upsamples[0](h, dropLeadingFrame: true)))
+        for stage in 0 ..< 4 {
+            let from = stage == 0 ? 2 : 0
+            for i in from ..< decoder.detStages[stage].count { h = decoder.detStages[stage][i](h) }
+            taps.append(("stage\(stage)_last", h))
+            h = decoder.upsamples[stage](h, dropLeadingFrame: true)
+            taps.append(("up\(stage)_out", h))
+        }
 
         for (name, ours) in taps {
             guard let ref = reference[name]?.asType(DType.float32) else { continue }

@@ -31,8 +31,11 @@ import MLXNN
 public enum NeighborhoodAttention3D {
 
     /// Element budget for one tile's `[queries, keys]` score matrix.
-    /// Mirrors the reference fallback's `NA_SCORE_BUDGET`.
-    static let scoreBudget = 32 * 1024 * 1024
+    /// Mirrors the reference fallback's `NA_SCORE_BUDGET`. Settable so a test
+    /// can force real tiling on a volume small enough to brute-force — without
+    /// that, equivalence tests only ever exercise the single-tile path, which
+    /// is how a mask-cache collision reached the decoder unnoticed.
+    nonisolated(unsafe) static var scoreBudget = 32 * 1024 * 1024
 
     /// Per-index `(start, end)` of the attended window along one axis.
     ///
@@ -174,10 +177,13 @@ public enum NeighborhoodAttention3D {
 
                     let keyLengths = keySpans.map { $0.1 - $0.0 }
                     let qShape = [t1 - t0, h1 - h0, w1 - w0]
-                    // Tiles with identical geometry share a mask — interior tiles
-                    // are all the same, only the borders differ.
+                    // Tiles with identical geometry share a mask. The key carries
+                    // the *whole* window pattern: a border tile, whose windows
+                    // clamp, otherwise shares "first start / last end" with an
+                    // interior tile whose windows slide — same key, wrong mask,
+                    // and a silent error confined to the borders.
                     let key = "\(qShape)|\(keyLengths)|"
-                        + relBounds.map { "\($0.starts.first ?? 0),\($0.ends.last ?? 0)" }.joined(separator: ";")
+                        + relBounds.map { "\($0.starts)>\($0.ends)" }.joined(separator: ";")
                     let mask: MLXArray
                     if let cached = maskCache[key] {
                         mask = cached
