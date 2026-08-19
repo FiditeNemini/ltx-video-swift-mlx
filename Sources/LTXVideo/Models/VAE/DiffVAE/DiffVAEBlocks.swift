@@ -260,9 +260,13 @@ public class DiffVAEUpsample: Module {
         let (B, T, H, W) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
         let (p1, p2, p3) = stride
         var h = proj(x)
-        // (c p1 p2 p3) → interleave each stride factor into its axis.
-        h = h.reshaped([B, T, H, W, p1, p2, p3, outChannels])
-            .transposed(0, 1, 4, 2, 5, 3, 6, 7)
+        // The projection packs channels as (c, p1, p2, p3) — channel slowest,
+        // width-stride fastest — so the shuffle reads that order, not (p, c).
+        // Getting it backwards costs nothing structurally (shapes still match)
+        // and everything numerically: measured 1.44 relative error against the
+        // reference until this was fixed.
+        h = h.reshaped([B, T, H, W, outChannels, p1, p2, p3])
+            .transposed(0, 1, 5, 2, 6, 3, 7, 4)
             .reshaped([B, T * p1, H * p2, W * p3, outChannels])
         if p1 == 2 && dropLeadingFrame {
             h = h[0..., 1..., 0..., 0..., 0...]
