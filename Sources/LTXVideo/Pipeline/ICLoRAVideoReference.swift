@@ -163,10 +163,7 @@ extension LTXPipeline {
         }
 
         if let stageOneOutputPath {
-            let stage1Frames = decodeVideo(
-                latent: latent, decoder: decoder, timestep: nil,
-                temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-                temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap)
+            let stage1Frames = decodeFrames(latent: latent)
             MLX.eval(stage1Frames)
             _ = try await VideoExporter.exportVideo(
                 frames: stage1Frames, width: referenceWidth, height: referenceHeight,
@@ -223,10 +220,7 @@ extension LTXPipeline {
 
         onProgress?(GenerationProgress(
             currentStep: totalSteps, totalSteps: totalSteps, sigma: 0, phase: .decoding))
-        let frames = decodeVideo(
-            latent: latent, decoder: decoder, timestep: nil,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap)
+        let frames = decodeFrames(latent: latent)
         MLX.eval(frames)
 
         return VideoGenerationResult(

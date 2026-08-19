@@ -169,6 +169,11 @@ public actor LTXPipeline {
     /// VAE decoder
     internal var vaeDecoder: VideoDecoder?
 
+    /// LTX-2.5's diffusion video decoder, when the caller opted into it. The
+    /// conv decoder stays loaded either way: it owns the latent statistics the
+    /// rest of the pipeline reads, and it is the fallback.
+    internal var diffusionVAEDecoder: DiffusionVideoDecoder?
+
     /// VAE encoder (loaded only for image-to-video)
     private var vaeEncoder: VideoEncoder?
 
@@ -383,6 +388,58 @@ public actor LTXPipeline {
             combined = combined * factor
         }
         return combined
+    }
+
+    /// Load LTX-2.5's diffusion video decoder and use it for every decode from
+    /// then on.
+    ///
+    /// Opt-in: it is a separate ~1.5 GB download, and it costs more per decode
+    /// than the convolutional decoder (a full attention pass over the pixel
+    /// volume rather than a stack of convolutions). The conv decoder stays
+    /// loaded — the pipeline reads its latent statistics elsewhere, and it is
+    /// the fallback if this one is unloaded.
+    ///
+    /// - Throws: when the checkpoint's generation ships no diffusion decoder.
+    public func loadDiffusionDecoder(
+        progressCallback: DownloadProgressCallback? = nil
+    ) async throws {
+        guard model.family == .ltx25 else {
+            throw LTXError.invalidConfiguration(
+                "The diffusion video decoder ships from LTX-2.5 onward; "
+                + "\(model.displayName) has only the convolutional one.")
+        }
+        let path = try await downloader.downloadDiffusionVideoVAE(
+            model: model, progress: progressCallback)
+        LTXDebug.log("Loading diffusion video decoder from \(path.lastPathComponent)...")
+        diffusionVAEDecoder = try DiffVAEWeightLoader.load(from: path.path)
+        LTXDebug.log("Diffusion video decoder ready")
+    }
+
+    /// Drop the diffusion decoder, reverting to the convolutional one.
+    public func unloadDiffusionDecoder() {
+        diffusionVAEDecoder = nil
+        Memory.clearCache()
+    }
+
+    /// Decode a video latent to `[F, H, W, C]` frames in `[0, 1]`.
+    ///
+    /// One funnel for every path (generate, retake, dev single-stage, IC-LoRA)
+    /// so the decoder choice is made once: the diffusion decoder when it was
+    /// loaded, the convolutional one otherwise.
+    func decodeFrames(latent: MLXArray, timestep: Float? = nil) -> MLXArray {
+        if let diffusion = diffusionVAEDecoder {
+            return decodeVideo(
+                latent: latent, decoder: diffusion,
+                temporalTileSize: memoryOptimization.vaeTemporalTileSize,
+                temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap)
+        }
+        guard let conv = vaeDecoder else {
+            return MLXArray.zeros([0])
+        }
+        return decodeVideo(
+            latent: latent, decoder: conv, timestep: timestep,
+            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
+            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap)
     }
 
     /// Build the prompt encoder this checkpoint was trained with.
@@ -1331,11 +1388,7 @@ public actor LTXPipeline {
         profiler.start("VAE Decode")
 
         profiler.start("VAE Forward Pass")
-        let videoTensor = decodeVideo(
-            latent: videoLatent, decoder: vaeDecoder, timestep: nil,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
-        )
+        let videoTensor = decodeFrames(latent: videoLatent)
         MLX.eval(videoTensor)
         profiler.end("VAE Forward Pass")
 
@@ -1799,11 +1852,7 @@ public actor LTXPipeline {
         ))
         LTXMemoryManager.setPhase(.vaeDecode)
         profiler.start("VAE Decode")
-        let videoTensor = decodeVideo(
-            latent: videoLatent, decoder: vaeDecoder, timestep: nil,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
-        )
+        let videoTensor = decodeFrames(latent: videoLatent)
         MLX.eval(videoTensor)
         profiler.end("VAE Decode")
 
@@ -2513,11 +2562,7 @@ public actor LTXPipeline {
             currentStep: totalSteps, totalSteps: totalSteps, sigma: 0, phase: .decoding
         ))
         LTXMemoryManager.setPhase(.vaeDecode)
-        let videoTensor = decodeVideo(
-            latent: videoLatent, decoder: vaeDecoder, timestep: nil,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
-        )
+        let videoTensor = decodeFrames(latent: videoLatent)
         MLX.eval(videoTensor)
         let trimmedVideo: MLXArray
         if videoTensor.dim(0) > numFrames {

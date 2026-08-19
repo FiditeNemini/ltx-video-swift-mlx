@@ -251,7 +251,7 @@ public struct LTXComponentFile: Sendable, Equatable, Hashable {
         case textEncoder
         /// Convolutional video VAE — the decoder this package implements.
         case videoVAE
-        /// Diffusion video decoder (LTX-2.5 "DiffVAE") — higher quality, not implemented here.
+        /// Diffusion video decoder (LTX-2.5 "DiffVAE") — opt-in, see `loadDiffusionDecoder()`.
         case diffusionVideoVAE
         case audioVAE
         /// Optional caption-conditioned clip-length predictor (LTX-2.5).

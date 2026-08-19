@@ -388,6 +388,30 @@ public actor ModelDownloader {
     /// diffusion video decoder and the duration head are deliberately not fetched:
     /// neither is implemented, and together they would add gigabytes a caller
     /// cannot use.
+    /// Download the diffusion video decoder for a split checkpoint, on demand.
+    ///
+    /// Kept out of ``downloadCheckpoint`` because it is opt-in: most runs use
+    /// the convolutional decoder, and this is another ~1.5 GB.
+    public func downloadDiffusionVideoVAE(
+        model: LTXModel,
+        progress: DownloadProgressCallback? = nil
+    ) async throws -> URL {
+        guard let file = model.family.sharedComponentFiles.first(where: { $0.kind == .diffusionVideoVAE })
+        else {
+            throw LTXError.invalidConfiguration(
+                "\(model.family.displayName) ships no diffusion video decoder")
+        }
+        let destination = componentCacheDir(model: model).appendingPathComponent(file.filename)
+        if !FileManager.default.fileExists(atPath: destination.path) {
+            progress?(DownloadProgress(
+                progress: 0.0, currentFile: file.filename,
+                message: "Downloading \(file.filename) (~\(String(format: "%.1f", file.sizeGB)) GB)..."))
+            try await downloadFile(
+                repoId: model.huggingFaceRepo, filename: file.path, to: destination)
+        }
+        return destination
+    }
+
     public func downloadCheckpoint(
         model: LTXModel,
         progress: DownloadProgressCallback? = nil

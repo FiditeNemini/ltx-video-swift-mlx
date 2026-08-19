@@ -19,6 +19,12 @@
   Partially supersedes July's double-delta entry: unfuse restored contaminated
   weights in *every* case, not just the LipDub-then-LoRA one.
 
+## 2026-08-19
+
+* **Creation**: [Dotted parameter names never load](/docs/knowledge/pitfalls/dotted-parameter-names-never-load.md)
+  — found while bringing up the LTX-2.5 diffusion video decoder: the latent
+  statistics silently kept mean 0 / std 1, washing out every decode.
+
 ## 2026-08-17
 
 * **Update**: archived the distilled-vs-dev quality series as the LTX-2.5

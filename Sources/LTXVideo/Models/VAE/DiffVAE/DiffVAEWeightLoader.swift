@@ -59,6 +59,9 @@ public enum DiffVAEWeightLoader {
             if name.hasPrefix("t_embedder.mlp.2.") {
                 name = name.replacingOccurrences(of: "t_embedder.mlp.2.", with: "t_embedder.mlp.1.")
             }
+            // Dotted names would be read as a module path by unflattened().
+            if name == "per_channel_statistics.mean-of-means" { name = "mean_of_means" }
+            if name == "per_channel_statistics.std-of-means" { name = "std_of_means" }
             mapped[name] = value
         }
         guard !mapped.isEmpty else {
@@ -93,6 +96,26 @@ public enum DiffVAEWeightLoader {
 
         _ = decoder.update(parameters: ModuleParameters.unflattened(updates))
         eval(decoder.parameters())
+
+        // Verify the update landed. Matching key names before the update is not
+        // enough: `unflattened` reads "." as a module boundary, so a flat
+        // parameter whose name contains a dot matches, updates nothing, and
+        // keeps its init value — which is exactly how the latent statistics
+        // stayed at mean 0 / std 1 and washed out every decode.
+        let after = Dictionary(uniqueKeysWithValues: decoder.parameters().flattened())
+        var notApplied: [String] = []
+        for (key, value) in updates {
+            guard let live = after[key] else { notApplied.append(key); continue }
+            if !MLX.allClose(live.asType(.float32), value.asType(.float32),
+                             atol: 1e-6).item(Bool.self) {
+                notApplied.append(key)
+            }
+        }
+        guard notApplied.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "\(notApplied.count) diffusion-decoder parameters did not take their "
+                + "checkpoint values, e.g. \(notApplied.prefix(3).joined(separator: ", "))")
+        }
         LTXDebug.log("[DiffVAE] applied \(updates.count) weights "
             + "(stages \(decoder.config.stageChannels), steps \(decoder.config.numInferenceSteps))")
     }

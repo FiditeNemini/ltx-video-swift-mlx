@@ -73,3 +73,37 @@ struct DiffVAEDecoderTests {
         #expect(maxV > minV, "a constant frame means the decoder produced nothing")
     }
 }
+
+@Suite("DiffVAE activation probe (gated)", .enabled(if: ProcessInfo.processInfo.environment["LTX25_DIFFVAE"] != nil))
+struct DiffVAEProbeTests {
+    @Test func stageMagnitudes() throws {
+        let decoder = try DiffVAEWeightLoader.load(
+            from: ProcessInfo.processInfo.environment["LTX25_DIFFVAE"]!)
+        let latent = MLXRandom.normal([1, 128, 2, 4, 4]).asType(.float32)
+
+        func stats(_ label: String, _ x: MLXArray) {
+            MLX.eval(x)
+            let a = MLX.abs(x)
+            print(String(format: "PROBE %@ shape %@ mean|x| %.4f max|x| %.4f std %.4f",
+                         label, "\(x.shape)",
+                         a.mean().item(Float.self), a.max().item(Float.self),
+                         MLX.variance(x.asType(.float32)).sqrt().item(Float.self)))
+        }
+
+        MLX.eval(decoder.meanOfMeans, decoder.stdOfMeans)
+        print(String(format: "PROBE stats mean[0..3] %.3f %.3f %.3f  std[0..3] %.3f %.3f %.3f",
+            decoder.meanOfMeans[0].item(Float.self), decoder.meanOfMeans[1].item(Float.self),
+            decoder.meanOfMeans[2].item(Float.self),
+            decoder.stdOfMeans[0].item(Float.self), decoder.stdOfMeans[1].item(Float.self),
+            decoder.stdOfMeans[2].item(Float.self)))
+        stats("latent", latent)
+        let ctx = decoder.context(from: latent)
+        stats("context", ctx)
+
+        let pixelShape = [1, 3, ctx.dim(1), ctx.dim(2) * 4, ctx.dim(3) * 4]
+        MLXRandom.seed(42)
+        let xT = MLXRandom.normal(pixelShape).asType(ctx.dtype)
+        let out = decoder.diffusionStep(context: ctx, xT: xT, t: MLXArray([Float(1.0)]))
+        stats("prediction", out)
+    }
+}

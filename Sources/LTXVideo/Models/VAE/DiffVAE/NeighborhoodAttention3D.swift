@@ -143,6 +143,12 @@ public enum NeighborhoodAttention3D {
 
         let output = MLXArray.zeros(like: q)
         var maskCache: [String: MLXArray] = [:]
+        // A large volume splits into hundreds of tiles. Left lazy, they queue
+        // into one Metal command buffer and trip the GPU watchdog, so the graph
+        // is materialised every few tiles — the cost is bounded, the result
+        // identical.
+        var tilesSinceEval = 0
+        let evalEvery = 16
 
         // Walk query tiles; each tile reads the union of its queries' windows.
         for t0 in stride(from: 0, to: T, by: tiles.0) {
@@ -195,6 +201,11 @@ public enum NeighborhoodAttention3D {
                         queries: qTile, keys: kTile, values: vTile, scale: scale, mask: mask)
                     output[0..., 0..., t0 ..< t1, h0 ..< h1, w0 ..< w1, 0...] =
                         out.reshaped([B, heads, qShape[0], qShape[1], qShape[2], headDim])
+                    tilesSinceEval += 1
+                    if tilesSinceEval >= evalEvery {
+                        MLX.eval(output)
+                        tilesSinceEval = 0
+                    }
                 }
             }
         }

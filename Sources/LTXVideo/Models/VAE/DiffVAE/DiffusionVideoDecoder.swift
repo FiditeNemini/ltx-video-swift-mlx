@@ -87,8 +87,13 @@ public class DiffusionVideoDecoder: Module {
     @ParameterInfo(key: "type_emb") var typeEmb: MLXArray
 
     /// Per-channel latent statistics, as on the convolutional decoder.
-    @ParameterInfo(key: "per_channel_statistics.mean-of-means") var meanOfMeans: MLXArray
-    @ParameterInfo(key: "per_channel_statistics.std-of-means") var stdOfMeans: MLXArray
+    ///
+    /// Named without dots on purpose: `ModuleParameters.unflattened` splits keys
+    /// on ".", so a parameter called `per_channel_statistics.mean-of-means`
+    /// silently never receives its value. The loader maps the checkpoint's
+    /// dotted names onto these.
+    @ParameterInfo(key: "mean_of_means") var meanOfMeans: MLXArray
+    @ParameterInfo(key: "std_of_means") var stdOfMeans: MLXArray
 
     public init(config: DiffVAEConfig) {
         self.config = config
@@ -165,8 +170,12 @@ public class DiffusionVideoDecoder: Module {
 
         var x = convIn(z.transposed(0, 2, 3, 4, 1))   // → [B, F, H, W, C]
         for stage in 0 ..< 4 {
-            for block in detStages[stage] { x = block(x) }
+            for block in detStages[stage] {
+                x = block(x)
+                MLX.eval(x)   // bound the command buffer; see NeighborhoodAttention3D
+            }
             x = upsamples[stage](x, dropLeadingFrame: true)
+            MLX.eval(x)
         }
         return x
     }
@@ -184,6 +193,7 @@ public class DiffusionVideoDecoder: Module {
         var x = xHalf
         for block in diffBlocks {
             x = block(contextAndX, modulation: modulation)
+            MLX.eval(x)
             contextAndX = MLX.concatenated([ctx, x], axis: -1)
         }
         x = convOut(normOut(x))

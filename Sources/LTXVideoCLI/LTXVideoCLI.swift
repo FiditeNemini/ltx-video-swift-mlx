@@ -93,6 +93,9 @@ struct Generate: AsyncParsableCommand {
     @Flag(name: .long, help: "Enhance prompt using Gemma before generation")
     var enhancePrompt: Bool = false
 
+    @Flag(name: .long, help: "Decode with LTX-2.5's diffusion video VAE instead of the convolutional one (+1.5 GB download, slower, finer detail)")
+    var diffvae: Bool = false
+
     @Option(name: .long, help: "Path to LoRA .safetensors file to apply during generation")
     var lora: String?
 
@@ -293,6 +296,15 @@ struct Generate: AsyncParsableCommand {
                 print("  \(progress.message) (\(Int(progress.progress * 100))%)")
             }
             print("Audio models loaded")
+        }
+
+        if diffvae {
+            print("Loading the diffusion video decoder...")
+            fflush(stdout)
+            try await pipeline.loadDiffusionDecoder { progress in
+                if let file = progress.currentFile { print("  \(file)"); fflush(stdout) }
+            }
+            print("Diffusion decoder ready")
         }
 
         // Fuse LoRA if specified (after model loading, before generation)
