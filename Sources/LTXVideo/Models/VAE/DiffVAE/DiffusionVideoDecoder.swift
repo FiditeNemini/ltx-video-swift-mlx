@@ -148,6 +148,25 @@ public class DiffusionVideoDecoder: Module {
             .reshaped([B, C * patch * patch, F, H / patch, W / patch])
     }
 
+    /// Mirror-pad one axis up to `target`, the edge policy the reference uses
+    /// for spatial padding (repeated content would fold energy into the border
+    /// windows; mirroring keeps the local statistics).
+    static func mirrorPad(_ x: MLXArray, axis: Int, to target: Int) -> MLXArray {
+        var out = x
+        while out.dim(axis) < target {
+            let n = out.dim(axis)
+            let take = min(n, target - n)
+            // reflect the last `take` rows, excluding the edge row itself when possible
+            var slices: [MLXArray] = [out]
+            for i in 0 ..< take {
+                let index = max(0, n - 2 - i)
+                slices.append(out.take(MLXArray([Int32(index)]), axis: axis))
+            }
+            out = MLX.concatenated(slices, axis: axis)
+        }
+        return out
+    }
+
     /// Inverse of ``patchify``.
     static func unpatchify(_ x: MLXArray, patch: Int) -> MLXArray {
         guard patch > 1 else { return x }
@@ -157,6 +176,36 @@ public class DiffusionVideoDecoder: Module {
             // b (c r q) f h w -> b c f (h q) (w r)
             .transposed(0, 1, 4, 5, 3, 6, 2)
             .reshaped([B, C, F, H * patch, W * patch])
+    }
+
+    // MARK: - Minimum geometry
+
+    /// Smallest latent that keeps every stage at least as large as its own
+    /// attention kernel.
+    ///
+    /// The reference refuses a volume smaller than the kernel outright and pads
+    /// the latent to reach it; this port used to shrink the kernel instead,
+    /// which is a different operation from the trained one. Derived from the
+    /// config rather than hardcoded, since the kernels and the upsample chain
+    /// both come from the checkpoint.
+    var minimumLatentShape: (frames: Int, height: Int, width: Int) {
+        var minT = 1, minH = 1, minW = 1
+        // Walk the stages forward, expressing each stage's requirement back in
+        // latent units through the upsamples that precede it.
+        var scaleT = 1, scaleH = 1, scaleW = 1        // volume = scale * latent (temporal: minus drop)
+        var dropT = 0                                  // frames lost to leading-frame drops
+        for stage in 0 ..< config.stageKernels.count {
+            let k = config.stageKernels[stage]
+            // stage volume T = scaleT * latentT - dropT  ≥  k[0]
+            minT = max(minT, Int(ceil((Double(k[0]) + Double(dropT)) / Double(scaleT))))
+            minH = max(minH, Int(ceil(Double(k[1]) / Double(scaleH))))
+            minW = max(minW, Int(ceil(Double(k[2]) / Double(scaleW))))
+            guard stage < DiffVAEConfig.upsampleStrides.count else { break }
+            let up = DiffVAEConfig.upsampleStrides[stage].stride
+            scaleT *= up.0; scaleH *= up.1; scaleW *= up.2
+            if up.0 == 2 { dropT = dropT * 2 + 1 }
+        }
+        return (minT, minH, minW)
     }
 
     // MARK: - Forward
@@ -206,7 +255,28 @@ public class DiffusionVideoDecoder: Module {
     /// The shipped checkpoint is single-step x₀: the model's prediction *is*
     /// the image, and the initial `x_t` is pure noise at t = 1.
     public func decode(latent: MLXArray, seed: UInt64? = nil) -> MLXArray {
-        let ctx = context(from: latent)
+        // Pad up to the kernel floor rather than shrinking kernels: the extra
+        // rows are cropped from the pixels at the end, so a short clip decodes
+        // through exactly the trained operation.
+        let trueFrames = latent.dim(2), trueHeight = latent.dim(3), trueWidth = latent.dim(4)
+        let minimum = minimumLatentShape
+        var padded = latent
+        if trueFrames < minimum.frames {
+            let last = padded[0..., 0..., (trueFrames - 1) ..< trueFrames, 0..., 0...]
+            let repeats = (0 ..< (minimum.frames - trueFrames)).map { _ in last }
+            padded = MLX.concatenated([padded] + repeats, axis: 2)   // repeat the last frame
+        }
+        if trueHeight < minimum.height {
+            padded = Self.mirrorPad(padded, axis: 3, to: minimum.height)
+        }
+        if trueWidth < minimum.width {
+            padded = Self.mirrorPad(padded, axis: 4, to: minimum.width)
+        }
+        if padded.shape != latent.shape {
+            LTXDebug.log("[DiffVAE] padded latent \(latent.shape) → \(padded.shape) for the kernel floor")
+        }
+
+        let ctx = context(from: padded)
         let (B, F, H, W) = (ctx.dim(0), ctx.dim(1), ctx.dim(2), ctx.dim(3))
         let pixelShape = [B, config.outChannels, F, H * config.patchSize, W * config.patchSize]
 
@@ -231,8 +301,16 @@ public class DiffusionVideoDecoder: Module {
             MLX.eval(xT)
         }
 
+        // Crop the padding back off, in pixel units.
+        let outFrames = (trueFrames - 1) * 8 + 1
+        let outHeight = trueHeight * 32, outWidth = trueWidth * 32
+        var pixels = xT
+        if pixels.dim(2) > outFrames || pixels.dim(3) > outHeight || pixels.dim(4) > outWidth {
+            pixels = pixels[0..., 0..., 0 ..< outFrames, 0 ..< outHeight, 0 ..< outWidth]
+        }
+
         // [-1, 1] → [0, 1], and [B, C, F, H, W] → [F, H, W, C]
-        let frames = MLX.clip((xT.asType(.float32) + 1) * 0.5, min: 0, max: 1)
+        let frames = MLX.clip((pixels.asType(.float32) + 1) * 0.5, min: 0, max: 1)
         return frames[0].transposed(1, 2, 3, 0)
     }
 }

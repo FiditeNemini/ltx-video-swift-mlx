@@ -46,6 +46,24 @@ struct DiffVAEDecoderTests {
     }
 
     @Test(.enabled(if: checkpointPath != nil))
+    func padsSmallVolumesToTheKernelFloor() throws {
+        let decoder = try DiffVAEWeightLoader.load(from: Self.checkpointPath!)
+        let minimum = decoder.minimumLatentShape
+        // The shipped config's floor: stage 0 needs 7 spatially, the diffusion
+        // stage's kernel of 11 needs 3 latent frames after the temporal chain.
+        #expect(minimum.frames == 3)
+        #expect(minimum.height == 7 && minimum.width == 7)
+
+        // A latent below the floor must still decode, and to its *true* size —
+        // the padding is cropped back off in pixel space.
+        let latent = MLXRandom.normal([1, 128, 1, 2, 2]).asType(DType.float32)
+        let frames = decoder.decode(latent: latent, seed: 1)
+        MLX.eval(frames)
+        #expect(frames.dim(0) == 1, "one latent frame stays one pixel frame")
+        #expect(frames.dim(1) == 64 && frames.dim(2) == 64)
+    }
+
+    @Test(.enabled(if: checkpointPath != nil))
     func loadsRealCheckpointAndDecodes() throws {
         let path = Self.checkpointPath!
         #expect(DiffVAEWeightLoader.isDiffusionVAE(path: path))
