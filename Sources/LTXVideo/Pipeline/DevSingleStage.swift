@@ -128,13 +128,10 @@ has_subtitles, has_blurbox, transition from black, transition to black, speech_e
 
         onProgress?(GenerationProgress(
             currentStep: numSteps, totalSteps: numSteps, sigma: 0, phase: .decoding))
-        guard let decoder = vaeDecoder else {
+        guard vaeDecoder != nil || diffusionVAEDecoder != nil else {
             throw LTXError.modelNotLoaded("VAE decoder not loaded")
         }
-        let frames = decodeVideo(
-            latent: latent, decoder: decoder, timestep: nil,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
-            temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap)
+        let frames = decodeFrames(latent: latent)
         MLX.eval(frames)
 
         return VideoGenerationResult(

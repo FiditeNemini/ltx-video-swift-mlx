@@ -31,6 +31,29 @@ sampling recipe change. Full protocol notes in
 | `series-25-dev-no-lora-control.mp4` | 2.5-dev, LoRA at scale 0, two-stage, audio | 26 min | Negative control: what the 8-step schedule produces without distillation |
 | `series-25-dev-full-30steps.mp4` | 2.5-dev single-stage, 30 steps, CFG 3.0 + STG [28] + rescale 0.7, video-only | 5 h 10 | The dev checkpoint's quality ceiling — and the run that surfaced the [empty-negative pitfall](../../knowledge/pitfalls/empty-cfg-negative-erases-the-prompt.md): with the port-inherited "" negative this exact run lost the whole choreography |
 
+## Convolutional vs diffusion decoder (August 20)
+
+Same latent, seed 42, 121 frames at 768x512, one variable: which decoder
+renders the pixels. The prompt is `bench-prompt-2cv.txt`, the conditioning
+image `conditioning-frame.png` — both versioned here so the comparison is
+reproducible.
+
+| File | Decoder | Wall time | Sharpness | HF energy | Contrast |
+|---|---|---|---|---|---|
+| `decoder-conv-121f.mp4` | convolutional (default) | **195 s** | 3.51 | 1.56 | 53.2 |
+| `decoder-diffvae-121f.mp4` | diffusion (`--diffvae`) | 395 s | 3.22 | 1.43 | 51.6 |
+
+PSNR between them is 32 dB: globally alike, differing only in fine detail —
+and the diffusion decoder measures marginally *lower* on every sharpness
+proxy, for twice the time. Colour differs by ~1%: it lifts blue and green
+slightly (so it is fractionally *cooler*, not warmer) and desaturates the
+car's red by 0.01. At this resolution and duration it buys nothing
+perceptible, which is why it stays opt-in.
+
+The port itself is faithful — pinned element-wise at ~1e-6 against the
+reference implementation, stage by stage — so this is a property of the
+model at this scale, not of the implementation.
+
 Known cosmetic caveats, deliberate (they document real behaviour):
 - The transition clips open on a dark blurred close-up: that is genuinely the
   last frame of video A, which drifts at its end. Keyframes anchor only the

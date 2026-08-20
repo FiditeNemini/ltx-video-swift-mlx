@@ -47,6 +47,8 @@ or re-litigated.
 * [LipDub overwrites anything crossing the mouth](pitfalls/lipdub-overwrites-objects-crossing-the-mouth.md) - no occlusion modelling: a headset band or hand in front of the lips is painted over; visible in the repo's own teaser
 * [CFG against an empty negative erases the prompt](pitfalls/empty-cfg-negative-erases-the-prompt.md) - the dev paths inherited "" from the MLX port; one A/B apart, the official negative restored a 14-second choreography
 * [no_repeat_ngram bans quoting the prompt](pitfalls/ngram-blocking-mangles-prompt-quoting.md) - enhancer timestamps mangled, duration over-predicted ~5 s; reference-space limitation, fix pending in gemma-4-swift-mlx
+* [Tiled-attention mask caches need the whole window pattern](pitfalls/na-tile-mask-cache-key.md) - border and interior tiles collide on a summary key; 8% error in one stage, invisible without a reference
+* [Dotted parameter names never load](pitfalls/dotted-parameter-names-never-load.md) - unflattened() reads "." as a module boundary; the update lands nowhere and strict key checks miss it
 * [The wrong vocoder cost the top octave](pitfalls/wrong-vocoder-lost-the-top-octave.md) - LTX-2's vocoder decoded 2.3/2.5 latents plausibly; +18 dB at 12-16 kHz once corrected, nothing below 8 kHz — and how a two-variable A/B first got this badly wrong
 * [Don't validate the LTX Gemma by generating text](pitfalls/ltx-gemma-head-is-vestigial.md) - its tied head is saturated by design; check parameter coverage, scale band and meaning instead
 * [The continuation-tail clip must be re-encoded](pitfalls/continuation-tail-clip-encoding.md) - an input seek leaves frame 0 off t=0 and the zero-tolerance extractor refuses it

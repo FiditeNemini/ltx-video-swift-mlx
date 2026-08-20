@@ -317,6 +317,39 @@ class VideoDecoder: Module {
 
 // MARK: - Decode Video
 
+/// Decode a video latent with the *diffusion* decoder.
+///
+/// Same contract as the convolutional overload — `[F, H, W, C]` in `[0, 1]` —
+/// and the same temporal tiling, which matters more here: the diffusion stage
+/// runs attention over the full-resolution volume, so peak memory grows with
+/// the clip length far faster than the conv decoder's does.
+func decodeVideo(
+    latent: MLXArray,
+    decoder: DiffusionVideoDecoder,
+    temporalTileSize: Int = 0,
+    temporalTileOverlap: Int = 1
+) -> MLXArray {
+    var input = latent
+    if input.ndim == 4 {
+        input = MLX.expandedDimensions(input, axis: 0)
+    }
+    let latentFrames = input.dim(2)
+
+    if temporalTileSize > 0 && latentFrames > temporalTileSize {
+        LTXDebug.log("DiffVAE temporal tiling: \(latentFrames) latent frames, tile=\(temporalTileSize)")
+        var chunks: [MLXArray] = []
+        var start = 0
+        while start < latentFrames {
+            let end = min(start + temporalTileSize, latentFrames)
+            let chunk = input[0..., 0..., start ..< end, 0..., 0...]
+            chunks.append(decoder.decode(latent: chunk))
+            start = end
+        }
+        return MLX.concatenated(chunks, axis: 0)
+    }
+    return decoder.decode(latent: input)
+}
+
 /// Decode a video latent tensor with the given decoder
 ///
 /// For short videos (latent frames <= `temporalTileSize`), decodes in a single pass.
