@@ -41,7 +41,8 @@ extension LTXPipeline {
         numFrames: Int,
         seed: UInt64? = nil,
         eta: Float = 0.5,
-        renoiseFrom: Float = 0.725,
+        renoiseFrom: Float = 0.975,
+        anchorEvery: Int = 4,
         onProgress: (@Sendable (GenerationProgress) -> Void)? = nil
     ) async throws -> VideoGenerationResult {
         let startTime = Date()
@@ -82,6 +83,8 @@ extension LTXPipeline {
             batch: 1, channels: 128,
             frames: densifiedFrames, height: height, width: width)
 
+        // The anchors must show the *clean* densified latent, not the renoised one.
+        let sourceLatentDensified = latent
         if let seed { MLXRandom.seed(seed) }
         // Start the schedule below the high-noise region. Upstream renoises to
         // 0.975 here, but every one of its tiles is anchored on keyframe seams;
@@ -99,6 +102,31 @@ extension LTXPipeline {
             + MLXArray(1.0 - sigmas[0]) * latent
         MLX.eval(latent)
 
+        // Anchor the refinement on the source's own frames, which is what makes
+        // a high renoise level survivable: at 0.975 only ~2% of the source
+        // remains in the latent, and without anchors the model redraws the
+        // subject (measured 14.4 dB identity, versus 20.1 dB when starting
+        // lower instead). Upstream anchors its tile seams; here the anchors are
+        // the source frames themselves, which sit at even indices of the
+        // densified latent.
+        var anchorContext: AppendKeyframeContext? = nil
+        if anchorEvery > 0, let cfg = (transformer?.config ?? ltx2Transformer?.config) {
+            var guides: [AppendedGuideTokens] = []
+            var anchored: [Int] = []
+            let densifiedLatentFrames = latent.dim(2)
+            for j in stride(from: 0, to: densifiedLatentFrames, by: 2 * anchorEvery) {
+                let frame = sourceLatentDensified[0..., 0..., j ..< (j + 1), 0..., 0...]
+                guides.append(buildKeyframeGuideToken(
+                    encodedLatent: frame,
+                    temporalPosition: Self.gridTemporalPosition(latentFrame: j)))
+                anchored.append(j)
+            }
+            anchorContext = assembleAppendContext(
+                guides: guides, shape: shape, hasAudio: false,
+                refConfig: cfg, stageLabel: "temporal anchors")
+            LTXDebug.log("[temporal] anchored on latent frames \(anchored)")
+        }
+
         let stepper = AncestralEulerStep(eta: eta)
         for step in 0 ..< (sigmas.count - 1) {
             let sigma = sigmas[step]
@@ -106,7 +134,7 @@ extension LTXPipeline {
                 currentStep: step, totalSteps: sigmas.count - 1, sigma: sigma, phase: .refinement))
             let velocity = runDenoiseStep(
                 sigma: sigma, videoLatent: latent, audioLatentPacked: nil,
-                shape: shape, videoAppendCtx: nil, audioRefCtx: nil, audioNumFrames: 0,
+                shape: shape, videoAppendCtx: anchorContext, audioRefCtx: nil, audioNumFrames: 0,
                 videoTextEmbeddings: encoded.embeddings,
                 audioTextEmbeddings: encoded.embeddings,
                 textMask: encoded.mask)
@@ -136,6 +164,15 @@ extension LTXPipeline {
     /// four steps starting below the high-noise region, since the input already
     /// carries the composition.
     var temporalSigmas: [Float] { Array(DISTILLED_SIGMA_VALUES.dropFirst(4)) }
+
+    /// Temporal coordinate the position grid gives a latent frame — the
+    /// midpoint of the pixel span it covers, after the causal shift, over fps.
+    /// Anchors have to land on exactly this, not on a rounded pixel index.
+    static func gridTemporalPosition(latentFrame i: Int, fps: Float = 24.0, temporalScale: Float = 8) -> Float {
+        let start = max(Float(i) * temporalScale + (1 - temporalScale), 0)
+        let end = max((Float(i) + 1) * temporalScale + (1 - temporalScale), 0)
+        return ((start + end) / 2) / fps
+    }
 
     /// Single-window interpolation holds the whole densified clip in memory at
     /// once; beyond this, upstream's tiling is required.
