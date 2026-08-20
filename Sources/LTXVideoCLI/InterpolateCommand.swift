@@ -46,6 +46,9 @@ struct Interpolate: AsyncParsableCommand {
     @Option(name: .long, help: "Anchor every Nth source frame to hold the subject through the refinement (0 disables anchoring)")
     var anchorEvery: Int = 4
 
+    @Option(name: .long, help: "Max latent frames denoised at once; lower trades speed for memory on long clips")
+    var tileFrames: Int = 32
+
     @Option(name: .long, help: "Random seed")
     var seed: UInt64?
 
@@ -112,7 +115,7 @@ struct Interpolate: AsyncParsableCommand {
         let result = try await pipeline.interpolateTemporally(
             videoPath: input, prompt: prompt, upscalerPath: upscalerPath,
             width: width, height: height, numFrames: frames, seed: seed, eta: eta,
-            renoiseFrom: renoiseFrom, anchorEvery: anchorEvery,
+            renoiseFrom: renoiseFrom, anchorEvery: anchorEvery, maxTileLatentFrames: tileFrames,
             onProgress: { progress in
                 print("  Step \(progress.currentStep + 1)/\(progress.totalSteps) [\(progress.phase)]")
                 fflush(stdout)
