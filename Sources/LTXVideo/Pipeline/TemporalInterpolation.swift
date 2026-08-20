@@ -41,6 +41,7 @@ extension LTXPipeline {
         numFrames: Int,
         seed: UInt64? = nil,
         eta: Float = 0.5,
+        renoiseFrom: Float = 0.725,
         onProgress: (@Sendable (GenerationProgress) -> Void)? = nil
     ) async throws -> VideoGenerationResult {
         let startTime = Date()
@@ -82,7 +83,18 @@ extension LTXPipeline {
             frames: densifiedFrames, height: height, width: width)
 
         if let seed { MLXRandom.seed(seed) }
-        let sigmas = temporalSigmas
+        // Start the schedule below the high-noise region. Upstream renoises to
+        // 0.975 here, but every one of its tiles is anchored on keyframe seams;
+        // without an anchor that level keeps only ~2% of the source and the
+        // subject is redrawn — the identity-loss mode already documented for
+        // the IC-LoRA upscale chain. Starting lower trades invented motion for
+        // keeping the clip's subject.
+        let sigmas = temporalSigmas.filter { $0 <= renoiseFrom || $0 == 0 }
+        guard sigmas.count >= 2 else {
+            throw LTXError.invalidConfiguration(
+                "renoiseFrom \(renoiseFrom) leaves no refinement steps; use at least 0.42")
+        }
+        LTXDebug.log("[temporal] refining from σ=\(sigmas[0]) over \(sigmas.count - 1) steps")
         latent = MLXArray(sigmas[0]) * MLXRandom.normal(latent.shape).asType(latent.dtype)
             + MLXArray(1.0 - sigmas[0]) * latent
         MLX.eval(latent)

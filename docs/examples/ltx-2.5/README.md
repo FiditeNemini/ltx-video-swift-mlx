@@ -54,6 +54,21 @@ The port itself is faithful — pinned element-wise at ~1e-6 against the
 reference implementation, stage by stage — so this is a property of the
 model at this scale, not of the implementation.
 
+## Temporal interpolation (August 20)
+
+`interpolate-2cv-48fps.mp4` — the 121-frame bench clip densified to **241
+frames at 48 fps**, same 5.02 s duration, via the latent temporal upsampler
+plus a short ancestral refinement (`ltx-video interpolate`, seed 42,
+`--renoise-from 0.725`). 239 s.
+
+Motion spreads as intended: mean inter-frame difference drops to 0.60 of the
+source's (0.50 would be a perfect split), and sharpness *rises* (3.83 → 4.90)
+rather than falling the way an averaging interpolation would.
+
+Starting the refinement at upstream's 0.975 instead produces equally smooth
+motion but a different car — see the
+[renoise pitfall](../../knowledge/pitfalls/renoise-level-needs-its-anchor.md).
+
 Known cosmetic caveats, deliberate (they document real behaviour):
 - The transition clips open on a dark blurred close-up: that is genuinely the
   last frame of video A, which drifts at its end. Keyframes anchor only the

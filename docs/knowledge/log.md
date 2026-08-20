@@ -19,6 +19,12 @@
   Partially supersedes July's double-delta entry: unfuse restored contaminated
   weights in *every* case, not just the LipDub-then-LoRA one.
 
+## 2026-08-20
+
+* **Creation**: [A renoise level needs its anchoring](/docs/knowledge/pitfalls/renoise-level-needs-its-anchor.md)
+  — temporal interpolation shipped; upstream's sigma redrew the subject until
+  the refinement was started lower (identity 14.4 → 20.1 dB).
+
 ## 2026-08-19
 
 * **Creation**: [Tiled-attention mask caches need the whole window pattern](/docs/knowledge/pitfalls/na-tile-mask-cache-key.md)
