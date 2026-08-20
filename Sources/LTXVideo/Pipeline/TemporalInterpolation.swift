@@ -40,8 +40,8 @@ extension LTXPipeline {
         numFrames: Int,
         seed: UInt64? = nil,
         eta: Float = 0.5,
-        renoiseFrom: Float = 0.975,
-        anchorEvery: Int = 4,
+        renoiseFrom: Float? = nil,
+        anchorEvery: Int? = nil,
         maxTileLatentFrames: Int = 32,
         onProgress: (@Sendable (GenerationProgress) -> Void)? = nil
     ) async throws -> VideoGenerationResult {
@@ -80,27 +80,36 @@ extension LTXPipeline {
         // The anchors must show the *clean* densified latent, not the renoised one.
         let sourceLatentDensified = latent
         if let seed { MLXRandom.seed(seed) }
-        // Start the schedule below the high-noise region. Upstream renoises to
-        // 0.975 here, but every one of its tiles is anchored on keyframe seams;
-        // without an anchor that level keeps only ~2% of the source and the
-        // subject is redrawn — the identity-loss mode already documented for
-        // the IC-LoRA upscale chain. Starting lower trades invented motion for
-        // keeping the clip's subject.
-        let sigmas = temporalSigmas.filter { $0 <= renoiseFrom || $0 == 0 }
-        guard sigmas.count >= 2 else {
-            throw LTXError.invalidConfiguration(
-                "renoiseFrom \(renoiseFrom) leaves no refinement steps; use at least 0.42")
-        }
-        LTXDebug.log("[temporal] refining from σ=\(sigmas[0]) over \(sigmas.count - 1) steps")
-        latent = MLXArray(sigmas[0]) * MLXRandom.normal(latent.shape).asType(latent.dtype)
-            + MLXArray(1.0 - sigmas[0]) * latent
-        MLX.eval(latent)
 
         let tiles = TemporalTiling.tiles(
             latentFrames: latent.dim(2), maxTileFrames: maxTileLatentFrames)
-        if tiles.count > 1 {
-            LTXDebug.log("[temporal] \(tiles.count) tiles over \(latent.dim(2)) latent frames")
+
+        // Tiling changes what is safe. A single window can renoise to 0.975 and
+        // anchor sparsely: the anchors only have to hold one continuous
+        // trajectory. Tiles renoise *independently*, so at that level each one
+        // rebuilds its own subject from near-noise and the seams stop agreeing —
+        // measured 13.4 dB identity at a seam, against 24.3 dB with the tiled
+        // defaults below. Callers can still override both.
+        let tiled = tiles.count > 1
+        let effectiveRenoise = renoiseFrom ?? (tiled ? 0.725 : 0.975)
+        let effectiveAnchorEvery = anchorEvery ?? (tiled ? 1 : 4)
+        if tiled {
+            LTXDebug.log("[temporal] \(tiles.count) tiles over \(latent.dim(2)) latent frames — "
+                + "renoise \(effectiveRenoise), anchor every \(effectiveAnchorEvery)"
+                + (renoiseFrom != nil || anchorEvery != nil ? " (caller override)" : " (tiled defaults)"))
         }
+
+        let sigmas = temporalSigmas.filter { $0 <= effectiveRenoise || $0 == 0 }
+        guard sigmas.count >= 2 else {
+            throw LTXError.invalidConfiguration(
+                "renoiseFrom \(effectiveRenoise) leaves no refinement steps; use at least 0.42")
+        }
+        LTXDebug.log("[temporal] refining from σ=\(sigmas[0]) over \(sigmas.count - 1) steps")
+
+        // Renoise the whole canvas once, at the level the schedule starts from.
+        latent = MLXArray(sigmas[0]) * MLXRandom.normal(latent.shape).asType(latent.dtype)
+            + MLXArray(1.0 - sigmas[0]) * latent
+        MLX.eval(latent)
 
         // Refine tile by tile. Each tile is denoised as a standalone sequence
         // (positions restart at 0, as upstream's remap does), anchored on the
@@ -117,14 +126,26 @@ extension LTXPipeline {
                 frames: (tile.length - 1) * 8 + 1, height: height, width: width)
 
             var anchorContext: AppendKeyframeContext? = nil
-            if anchorEvery > 0, let cfg = (transformer?.config ?? ltx2Transformer?.config) {
+            if effectiveAnchorEvery > 0, let cfg = (transformer?.config ?? ltx2Transformer?.config) {
                 var guides: [AppendedGuideTokens] = []
                 var anchored: [Int] = []
                 // Source frames sit at even indices of the densified latent; a
                 // tile anchors those falling inside its own window, addressed
                 // locally so its RoPE grid matches.
-                for global in stride(from: 0, to: latent.dim(2), by: 2 * anchorEvery)
-                where global >= tile.start && global < tile.endExclusive {
+                var positions = Set(
+                    stride(from: 0, to: latent.dim(2), by: 2 * effectiveAnchorEvery)
+                        .filter { $0 >= tile.start && $0 < tile.endExclusive })
+                // Always anchor the seam itself. A strided anchor grid does not
+                // generally land on a tile boundary, and a weakly anchored seam
+                // is exactly where the two tiles' inventions fail to meet:
+                // measured a 38.4 inter-frame spike (z = +11) at a seam with no
+                // anchor within four frames, against none at a seam that had one.
+                // Source frames sit at even indices, so round the boundary down.
+                for boundary in [tile.start, tile.start + tile.dropPrefix]
+                where boundary < tile.endExclusive {
+                    positions.insert(boundary - (boundary % 2))
+                }
+                for global in positions.sorted() {
                     let local = global - tile.start
                     guides.append(buildKeyframeGuideToken(
                         encodedLatent: sourceLatentDensified[

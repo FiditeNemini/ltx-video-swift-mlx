@@ -40,11 +40,11 @@ struct Interpolate: AsyncParsableCommand {
     @Option(name: .long, help: "How ancestral the refinement is: 0 interpolates, 1 invents most")
     var eta: Float = 0.5
 
-    @Option(name: .long, help: "Noise level the refinement starts from. Lower keeps the source's subject; higher invents more motion but can redraw it (0.975 is upstream's, which relies on keyframe anchoring this port does not have)")
-    var renoiseFrom: Float = 0.975
+    @Option(name: .long, help: "Noise level the refinement starts from; defaults to 0.975 for a single window and 0.725 when the clip is tiled, where independent tiles at a high level stop agreeing at their seams")
+    var renoiseFrom: Float?
 
-    @Option(name: .long, help: "Anchor every Nth source frame to hold the subject through the refinement (0 disables anchoring)")
-    var anchorEvery: Int = 4
+    @Option(name: .long, help: "Anchor every Nth source frame to hold the subject (0 disables); defaults to 4 for a single window, 1 when tiled")
+    var anchorEvery: Int?
 
     @Option(name: .long, help: "Max latent frames denoised at once; lower trades speed for memory on long clips")
     var tileFrames: Int = 32
