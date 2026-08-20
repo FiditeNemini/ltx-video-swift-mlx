@@ -81,12 +81,20 @@ struct LTXModelCatalogTests {
         }
     }
 
-    /// The guard still has to fire for anything the catalog marks unimplemented —
-    /// the point is to fail before a multi-gigabyte download, not after it.
-    @Test func testUnimplementedVariantsAreRefused() {
-        let unimplemented = LTXAuxiliaryModel.allCases.filter { !$0.support.isRunnable }
-        #expect(!unimplemented.isEmpty)
-        for aux in unimplemented {
+    /// The refusal mechanism must keep working even though every catalogued
+    /// artefact happens to be runnable today — the point is to fail before a
+    /// multi-gigabyte download, not after it. Asserting on the *inventory*
+    /// instead would have this test break every time something ships, which is
+    /// exactly what it did when the temporal upscaler landed.
+    @Test func testUnimplementedSupportIsRefused() {
+        let pending = LTXModelSupport.notImplemented("temporal upscaling is not implemented")
+        #expect(!pending.isRunnable)
+        #expect(pending.label == "catalog")
+        #expect(LTXModelSupport.supported.isRunnable)
+        #expect(LTXModelSupport.supported.label == "ready")
+
+        // And anything the catalog does mark unimplemented must label itself so.
+        for aux in LTXAuxiliaryModel.allCases where !aux.support.isRunnable {
             #expect(aux.support.label == "catalog")
         }
     }
