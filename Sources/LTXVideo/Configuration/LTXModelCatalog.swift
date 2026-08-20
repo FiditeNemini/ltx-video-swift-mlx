@@ -465,7 +465,7 @@ public enum LTXAuxiliaryModel: String, CaseIterable, Sendable {
             // the distilled LoRA fuses onto the dev checkpoint.
             return .supported
         case .latentTemporalUpscalerX2_25:
-            return .notImplemented("temporal upscaling is not implemented")
+            return .supported
         }
     }
 }
