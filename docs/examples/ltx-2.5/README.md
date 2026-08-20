@@ -58,15 +58,17 @@ model at this scale, not of the implementation.
 
 `interpolate-2cv-48fps.mp4` — the 121-frame bench clip densified to **241
 frames at 48 fps**, same 5.02 s duration, via the latent temporal upsampler
-plus a short ancestral refinement (`ltx-video interpolate`, seed 42,
-`--renoise-from 0.725`). 239 s.
+plus an ancestral refinement anchored on the source's own frames
+(`ltx-video interpolate`, seed 42, defaults). 663 s.
 
 Motion spreads as intended: mean inter-frame difference drops to 0.60 of the
 source's (0.50 would be a perfect split), and sharpness *rises* (3.83 → 4.90)
 rather than falling the way an averaging interpolation would.
 
-Starting the refinement at upstream's 0.975 instead produces equally smooth
-motion but a different car — see the
+Anchoring is what makes upstream's 0.975 noise level usable: without it the
+same run redraws the car (identity 14.4 dB against 26.7 dB anchored), and
+lowering the level instead only reaches 20.1 dB with less motion and less
+sharpness — see the
 [renoise pitfall](../../knowledge/pitfalls/renoise-level-needs-its-anchor.md).
 
 Known cosmetic caveats, deliberate (they document real behaviour):

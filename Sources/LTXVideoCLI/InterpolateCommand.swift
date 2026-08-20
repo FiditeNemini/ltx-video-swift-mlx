@@ -41,7 +41,10 @@ struct Interpolate: AsyncParsableCommand {
     var eta: Float = 0.5
 
     @Option(name: .long, help: "Noise level the refinement starts from. Lower keeps the source's subject; higher invents more motion but can redraw it (0.975 is upstream's, which relies on keyframe anchoring this port does not have)")
-    var renoiseFrom: Float = 0.725
+    var renoiseFrom: Float = 0.975
+
+    @Option(name: .long, help: "Anchor every Nth source frame to hold the subject through the refinement (0 disables anchoring)")
+    var anchorEvery: Int = 4
 
     @Option(name: .long, help: "Random seed")
     var seed: UInt64?
@@ -109,7 +112,7 @@ struct Interpolate: AsyncParsableCommand {
         let result = try await pipeline.interpolateTemporally(
             videoPath: input, prompt: prompt, upscalerPath: upscalerPath,
             width: width, height: height, numFrames: frames, seed: seed, eta: eta,
-            renoiseFrom: renoiseFrom,
+            renoiseFrom: renoiseFrom, anchorEvery: anchorEvery,
             onProgress: { progress in
                 print("  Step \(progress.currentStep + 1)/\(progress.totalSteps) [\(progress.phase)]")
                 fflush(stdout)

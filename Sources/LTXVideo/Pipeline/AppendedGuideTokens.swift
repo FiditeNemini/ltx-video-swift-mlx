@@ -40,6 +40,26 @@ struct AppendKeyframeContext {
     let guideCount: Int
 }
 
+/// Assemble a context from guide tokens the caller already built.
+///
+/// `prepareKeyframeAppend` builds guides from encoded keyframe images; anchoring
+/// a sequence on its own frames needs the same assembly over guides built with
+/// explicit coordinates, so the shared half lives here.
+func assembleAppendContext(
+    guides: [AppendedGuideTokens],
+    shape: VideoLatentShape,
+    hasAudio: Bool,
+    refConfig: LTXTransformerConfig,
+    stageLabel: String
+) -> AppendKeyframeContext? {
+    guard !guides.isEmpty else { return nil }
+    let basePos = createPositionGrid(
+        batchSize: 1, frames: shape.frames, height: shape.height, width: shape.width)
+    return buildContext(
+        guides: guides, basePos: basePos, shape: shape,
+        hasAudio: hasAudio, refConfig: refConfig, stageLabel: stageLabel)
+}
+
 /// Build the constant-across-steps `AppendKeyframeContext` for one stage.
 ///
 /// Encodes each keyframe into a guide token group, concatenates them, computes
@@ -74,6 +94,19 @@ func prepareKeyframeAppend(
             fps: 24.0
         )
     }
+    return buildContext(
+        guides: guides, basePos: basePos, shape: shape,
+        hasAudio: hasAudio, refConfig: refConfig, stageLabel: stageLabel)
+}
+
+private func buildContext(
+    guides: [AppendedGuideTokens],
+    basePos: MLXArray,
+    shape: VideoLatentShape,
+    hasAudio: Bool,
+    refConfig: LTXTransformerConfig,
+    stageLabel: String
+) -> AppendKeyframeContext {
     let allGuideTokens = MLX.concatenated(guides.map { $0.tokens }, axis: 1)
     let allGuidePositions = MLX.concatenated(guides.map { $0.positions }, axis: 2)
     let originalCount = shape.tokenCount
@@ -170,13 +203,32 @@ func buildKeyframeGuideToken(
     spatialScale: Int = 32,
     dtype: DType = .bfloat16
 ) -> AppendedGuideTokens {
+    buildKeyframeGuideToken(
+        encodedLatent: encodedLatent,
+        temporalPosition: (Float(pixelFrameIndex) + 0.5) / fps,
+        spatialScale: spatialScale, dtype: dtype)
+}
+
+/// Same, from an explicit temporal coordinate.
+///
+/// A guide built from an image belongs at a pixel frame, so the integer form
+/// above is the natural one. A guide built from a latent frame *of the sequence
+/// being denoised* has to land exactly on that frame's own grid coordinate —
+/// which is `(8i - 3) / fps`, not expressible as `(pixel + 0.5) / fps`. Rounding
+/// to the nearest pixel would offset the anchor by half a frame, so callers that
+/// anchor on the sequence itself pass the coordinate directly.
+func buildKeyframeGuideToken(
+    encodedLatent: MLXArray,
+    temporalPosition tPos: Float,
+    spatialScale: Int = 32,
+    dtype: DType = .bfloat16
+) -> AppendedGuideTokens {
     let h = encodedLatent.dim(3)
     let w = encodedLatent.dim(4)
     let numTokens = h * w
 
     let patched = patchify(encodedLatent).asType(dtype)
 
-    let tPos = (Float(pixelFrameIndex) + 0.5) / fps
     let tCoords = [Float](repeating: tPos, count: numTokens)
 
     let sScale = Float(spatialScale)
