@@ -47,6 +47,7 @@ or re-litigated.
 * [LipDub overwrites anything crossing the mouth](pitfalls/lipdub-overwrites-objects-crossing-the-mouth.md) - no occlusion modelling: a headset band or hand in front of the lips is painted over; visible in the repo's own teaser
 * [CFG against an empty negative erases the prompt](pitfalls/empty-cfg-negative-erases-the-prompt.md) - the dev paths inherited "" from the MLX port; one A/B apart, the official negative restored a 14-second choreography
 * [no_repeat_ngram bans quoting the prompt](pitfalls/ngram-blocking-mangles-prompt-quoting.md) - enhancer timestamps mangled, duration over-predicted ~5 s; reference-space limitation, fix pending in gemma-4-swift-mlx
+* [Smoothness metrics miss identity drift](pitfalls/smoothness-metrics-miss-identity-drift.md) - a seam where each tile drifted gradually to a different subject reads as perfectly smooth
 * [A renoise level needs its anchoring](pitfalls/renoise-level-needs-its-anchor.md) - upstream's sigma 0.975 redraws the subject without the keyframe seams that make it viable there
 * [Tiled-attention mask caches need the whole window pattern](pitfalls/na-tile-mask-cache-key.md) - border and interior tiles collide on a summary key; 8% error in one stage, invisible without a reference
 * [Dotted parameter names never load](pitfalls/dotted-parameter-names-never-load.md) - unflattened() reads "." as a module boundary; the update lands nowhere and strict key checks miss it

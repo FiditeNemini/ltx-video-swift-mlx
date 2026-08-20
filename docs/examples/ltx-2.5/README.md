@@ -71,6 +71,21 @@ lowering the level instead only reaches 20.1 dB with less motion and less
 sharpness — see the
 [renoise pitfall](../../knowledge/pitfalls/renoise-level-needs-its-anchor.md).
 
+### Tiled: 337 → 673 frames
+
+`interpolate-tiled-673f.mp4` — the 14 s series clip at **673 frames / 48 fps**,
+denoised in 3 overlapping tiles (35 min). Identity against the source holds at
+27-28 dB across the clip, dipping to 24.3 dB only where the content itself
+moves fastest.
+
+The tiled defaults differ from the single-window ones for a reason worth
+keeping: tiles renoise independently, so at the single-window level (0.975)
+each rebuilds its own subject and the seams stop agreeing — 13.4 dB identity
+at a seam, and a visibly different car afterwards. Tiled runs therefore
+default to 0.725 with dense anchoring. See
+[smoothness metrics miss identity drift](../../knowledge/pitfalls/smoothness-metrics-miss-identity-drift.md),
+which is also how that defect was *missed* by the first round of measurement.
+
 Known cosmetic caveats, deliberate (they document real behaviour):
 - The transition clips open on a dark blurred close-up: that is genuinely the
   last frame of video A, which drifts at its end. Keyframes anchor only the

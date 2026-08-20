@@ -21,6 +21,11 @@
 
 ## 2026-08-20
 
+* **Creation**: [Smoothness metrics miss identity drift](/docs/knowledge/pitfalls/smoothness-metrics-miss-identity-drift.md)
+  — the tiling seams measured clean and were not; per-frame fidelity against
+  the source found both defects the user had reported.
+
+
 * **Creation**: [A renoise level needs its anchoring](/docs/knowledge/pitfalls/renoise-level-needs-its-anchor.md)
   — temporal interpolation shipped; upstream's sigma redrew the subject until
   the refinement was started lower (identity 14.4 → 20.1 dB).
