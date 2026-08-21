@@ -30,6 +30,32 @@
   — temporal interpolation shipped; upstream's sigma redrew the subject until
   the refinement was started lower (identity 14.4 → 20.1 dB).
 
+## 2026-08-21
+
+* **Creation**: [The enhancer's residual defects are the reference's](/docs/knowledge/investigations/enhancer-residual-defects-2026-08.md)
+  — four prompts against the Space's own inference: viewpoint stacking appears
+  in both (verbatim the same phrase on one prompt), detached adverbs three times
+  more often upstream, and only the Space breaks spacing inside quoted dialogue.
+  Nothing here to fix; what is left is a product choice.
+
+* **Creation**: [Cross-attention's q_norm is not the block's pre-norm](/docs/knowledge/pitfalls/cross-attention-prenorm.md)
+  — the first bug the new *transformer* parity harness found, on its first run:
+  the legacy 6-value block fed cross-attention the raw residual (1.1e-2 relative
+  error, 6.2e-6 after). No shipped generation used that path; both real block
+  variants now pin at ~5e-6 against upstream.
+
+* **Creation**: [Generated keyframe slots are appended, denoised and marked](/docs/knowledge/decisions/generated-keyframe-slots.md)
+  — DFR's last missing primitive, and the audit finding that came with it: the
+  2.5 "detailing LoRA" is the pixel spatial upscaler this package already
+  drives, so only the slots needed porting. Records the three properties that
+  separate a slot from an appended guide token, and the parity check against
+  Lightricks' own `_slot_positions`.
+
+* **Creation**: [A densified clip must be positioned at its new rate](/docs/knowledge/pitfalls/densified-clip-keeps-its-rate.md)
+  — the temporal round doubles frames *and* fps; positioning at the source's
+  rate made the model read a 4.9 s clip as 9.8 s. Quiet because the grid and the
+  anchors agreed with each other.
+
 ## 2026-08-19
 
 * **Creation**: [Tiled-attention mask caches need the whole window pattern](/docs/knowledge/pitfalls/na-tile-mask-cache-key.md)
