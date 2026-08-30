@@ -257,21 +257,21 @@ func loadImage(from path: String, width: Int, height: Int) throws -> MLXArray {
         throw LTXError.videoProcessingFailed("Failed to get pixel data from resized image")
     }
 
-    // Convert RGBA pixels to float RGB normalized to [-1, 1]
+    // Convert RGBA pixels to float RGB normalized to [-1, 1] — one vectorized
+    // pass on MLX instead of a scalar Swift loop over every pixel.
     let ptr = data.bindMemory(to: UInt8.self, capacity: height * width * 4)
-    var pixels = [Float](repeating: 0, count: height * width * 3)
-    for i in 0..<(height * width) {
-        pixels[i * 3 + 0] = Float(ptr[i * 4 + 0]) / 127.5 - 1.0  // R
-        pixels[i * 3 + 1] = Float(ptr[i * 4 + 1]) / 127.5 - 1.0  // G
-        pixels[i * 3 + 2] = Float(ptr[i * 4 + 2]) / 127.5 - 1.0  // B
-    }
+    let rgba = MLXArray(UnsafeBufferPointer(start: ptr, count: height * width * 4), [height, width, 4])
+    let hwc = rgba[0..., 0..., 0..<3].asType(.float32) / 127.5 - 1.0
 
     // Build tensor: (H, W, 3) -> (3, H, W) -> (1, 3, 1, H, W)
-    let hwc = MLXArray(pixels, [height, width, 3])
     let chw = hwc.transposed(2, 0, 1)  // (3, H, W)
     let result = chw.reshaped([1, 3, 1, height, width])
 
-    LTXDebug.log("Image tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+    // .item() forces a synchronous eval of the whole lazy graph above — only
+    // pay for it when debug logging is actually on (default off).
+    if LTXDebug.isEnabled {
+        LTXDebug.log("Image tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+    }
 
     return result
 }
@@ -354,10 +354,13 @@ func loadVideo(
         }
     }
 
-    // Extract and process frames
+    // Extract and process frames. Raw RGBA bytes are accumulated per frame
+    // (one `append(contentsOf:)` each) and converted to normalized floats in
+    // a single vectorized MLX pass at the end, instead of a scalar Swift loop
+    // over every pixel of every frame.
     let colorSpace = CGColorSpaceCreateDeviceRGB()
-    var allPixels = [Float]()
-    allPixels.reserveCapacity(numFrames * height * width * 3)
+    var allBytes = [UInt8]()
+    allBytes.reserveCapacity(numFrames * height * width * 4)
 
     for (frameIdx, time) in requestTimes.enumerated() {
         let cgImage: CGImage
@@ -388,21 +391,25 @@ func loadVideo(
             throw LTXError.videoProcessingFailed("Failed to get pixel data from frame \(frameIdx)")
         }
 
-        // Convert RGBA to float RGB normalized to [-1, 1]
         let ptr = data.bindMemory(to: UInt8.self, capacity: height * width * 4)
-        for i in 0..<(height * width) {
-            allPixels.append(Float(ptr[i * 4 + 0]) / 127.5 - 1.0)  // R
-            allPixels.append(Float(ptr[i * 4 + 1]) / 127.5 - 1.0)  // G
-            allPixels.append(Float(ptr[i * 4 + 2]) / 127.5 - 1.0)  // B
-        }
+        allBytes.append(contentsOf: UnsafeBufferPointer(start: ptr, count: height * width * 4))
     }
 
+    // Convert RGBA to float RGB normalized to [-1, 1], one vectorized pass
+    // over every frame instead of per-pixel.
+    let fhwc4 = MLXArray(allBytes, [numFrames, height, width, 4])
+    let fhwc = fhwc4[0..., 0..., 0..., 0..<3].asType(.float32) / 127.5 - 1.0
+
     // Build tensor: (F, H, W, 3) -> (3, F, H, W) -> (1, 3, F, H, W)
-    let fhwc = MLXArray(allPixels, [numFrames, height, width, 3])
     let cfhw = fhwc.transposed(3, 0, 1, 2)  // (3, F, H, W)
     let result = cfhw.reshaped([1, 3, numFrames, height, width])
 
-    LTXDebug.log("Video tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+    // .item() forces a synchronous eval of the whole lazy graph above (every
+    // frame's decode + conversion) — only pay for it when debug logging is
+    // actually on (default off).
+    if LTXDebug.isEnabled {
+        LTXDebug.log("Video tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+    }
 
     return result
 }
