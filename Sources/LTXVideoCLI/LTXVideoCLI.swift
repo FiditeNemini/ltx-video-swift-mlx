@@ -529,8 +529,11 @@ struct Retake: AsyncParsableCommand {
 
     @OptionGroup var promptEnhancer: PromptEnhancerOptions
 
-    @Flag(name: .long, help: "Use distilled model (8 steps, fast) instead of dev (30 steps + CFG)")
+    @Flag(name: .long, help: "Use distilled model (8 steps, fast) instead of dev (30 steps + CFG). Older spelling of --model distilled.")
     var distilled: Bool = false
+
+    @Option(name: .long, help: "Model variant: distilled, dev, 2.5-distilled, 2.5-dev (default: dev)")
+    var model: String?
 
     @Option(name: .long, help: "Inference steps (dev model only — the distilled model runs a fixed trained 8-step schedule; default: 30)")
     var steps: Int?
@@ -575,6 +578,19 @@ struct Retake: AsyncParsableCommand {
     var ltxWeights: String?
 
     mutating func run() async throws {
+        // Resolved up front so every message names the variant actually running.
+        let retakeModel: LTXModel
+        if let model {
+            guard !distilled else {
+                throw ValidationError(
+                    "--model and --distilled are mutually exclusive. --distilled is the older "
+                    + "spelling of --model distilled.")
+            }
+            retakeModel = try parseModelVariant(model)
+        } else {
+            retakeModel = distilled ? .distilled : .dev
+        }
+
         if let dir = modelsDir {
             LTXModelRegistry.customModelsDirectory = URL(fileURLWithPath: dir)
         }
@@ -589,12 +605,12 @@ struct Retake: AsyncParsableCommand {
         var profilingSession: ProfilingSession? = nil
         if profile {
             let session = ProfilingSession(config: ProfilingConfig(trackMemory: true))
-            session.title = "LTX-2.3 PROFILING REPORT"
-            session.metadata["model"] = distilled ? "distilled" : "dev"
+            session.title = "\(retakeModel.displayName) PROFILING REPORT"
+            session.metadata["model"] = retakeModel.rawValue
             session.metadata["quant"] = mixedPrecision ? "mixed" : transformerQuant
             session.metadata["resolution"] = "\(width)x\(height)"
             session.metadata["frames"] = String(frames)
-            session.metadata["steps"] = String(distilled ? 8 : 30)
+            session.metadata["steps"] = String(steps ?? retakeModel.defaultSteps)
             profilingSession = session
             LTXVideoProfiler.shared.enable()
             LTXVideoProfiler.shared.activeSession = session
@@ -606,7 +622,7 @@ struct Retake: AsyncParsableCommand {
             }
         }
 
-        print("LTX-2.3 Video Retake (Single-Stage)")
+        print("\(retakeModel.displayName) — Video Retake (Single-Stage)")
         print("====================================")
         print("Source video: \(video)")
         print("Prompt: \(prompt)")
@@ -685,6 +701,15 @@ struct Retake: AsyncParsableCommand {
                 print("Audio renoise strength: \(audioStrength) (keeps part of the source track)")
             }
         }
+        // Step count is configurable on dev (proper schedule for any count);
+        // the distilled model runs its fixed trained 8-step schedule (issue
+        // #33 — arbitrary counts there produce artifacts). Checked here, before
+        // any weight load, alongside the other argument validation.
+        if steps != nil && !retakeModel.isForTraining {
+            throw ValidationError(
+                "--steps requires a dev checkpoint: distilled models run a fixed trained "
+                + "8-step sigma schedule and custom counts produce artifacts.")
+        }
         // Parse quantization
         let quantConfig: LTXQuantizationConfig
         if mixedPrecision {
@@ -697,7 +722,6 @@ struct Retake: AsyncParsableCommand {
         }
 
         // Create pipeline
-        let retakeModel: LTXModel = distilled ? .distilled : .dev
         print("Creating pipeline...")
         fflush(stdout)
         let pipeline = LTXPipeline(
@@ -741,14 +765,7 @@ struct Retake: AsyncParsableCommand {
             print("LoRA fused (\(fusedCount) layer-pairs)")
         }
 
-        // Resolve step count: configurable on dev (proper schedule for any
-        // count); the distilled model runs its fixed trained 8-step schedule
-        // (issue #33 — arbitrary counts there produce artifacts).
-        if steps != nil && distilled {
-            throw ValidationError(
-                "--steps requires the dev model: the distilled model runs a fixed " +
-                "trained 8-step sigma schedule and custom counts produce artifacts.")
-        }
+        // Step count is resolved earlier (before any weight load); just apply it here.
         let numSteps = steps ?? retakeModel.defaultSteps
         if let s = steps { print("Inference steps: \(s) (dev)") }
 
