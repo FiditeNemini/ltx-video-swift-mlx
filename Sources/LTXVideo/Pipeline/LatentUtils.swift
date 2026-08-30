@@ -267,7 +267,11 @@ func loadImage(from path: String, width: Int, height: Int) throws -> MLXArray {
     let chw = hwc.transposed(2, 0, 1)  // (3, H, W)
     let result = chw.reshaped([1, 3, 1, height, width])
 
-    LTXDebug.log("Image tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+    // .item() forces a synchronous eval of the whole lazy graph above — only
+    // pay for it when debug logging is actually on (default off).
+    if LTXDebug.isEnabled {
+        LTXDebug.log("Image tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+    }
 
     return result
 }
@@ -400,7 +404,12 @@ func loadVideo(
     let cfhw = fhwc.transposed(3, 0, 1, 2)  // (3, F, H, W)
     let result = cfhw.reshaped([1, 3, numFrames, height, width])
 
-    LTXDebug.log("Video tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+    // .item() forces a synchronous eval of the whole lazy graph above (every
+    // frame's decode + conversion) — only pay for it when debug logging is
+    // actually on (default off).
+    if LTXDebug.isEnabled {
+        LTXDebug.log("Video tensor: \(result.shape), mean=\(result.mean().item(Float.self)), range=[\(result.min().item(Float.self)), \(result.max().item(Float.self))]")
+    }
 
     return result
 }

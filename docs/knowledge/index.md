@@ -19,6 +19,7 @@ or re-litigated.
 * [Generation baselines on M3 Max 96 GB](benchmarks/generation-baselines-m3max.md) - healthy wall-clock numbers measured July 2026; anything far above them is contention/thermal/misconfiguration, not the engine
 * [LoRA training baselines on M3 Max 96 GB](benchmarks/lora-training-baselines-m3max.md) - wall-clock, peak memory and loss trajectories for the Disney overfit runs
 * [LTX-2.5 against MiniMax-H3 on a 10 s case](benchmarks/ltx25-vs-h3-starship-2026-08.md) - same machine and seed: phase table, per-step cost, and the 2.8× thermal spread that bounds any cost claim
+* [Vectorized RGBA pixel conversion vs. the scalar loop it replaced](benchmarks/pixel-conversion-vectorization-2026-08.md) - loadVideo on a 121-frame clip: ~8.15s to ~1.0s (~8x); the remaining time is AVFoundation decode, not conversion
 
 # Decisions
 
