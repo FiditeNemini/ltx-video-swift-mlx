@@ -60,6 +60,18 @@ struct ConnectorParityTests {
         var combined = feWeights
         for (k, v) in split.connector { combined[k] = v }
 
+        // MLXNN's no-`verify:` update() silently no-ops on unmatched or
+        // missing keys — a broken key mapping would leave a parameter at its
+        // random init and still "load" without error, invalidating every
+        // parity number below without saying so.
+        let declared = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        let missing = declared.keys.filter { combined[$0] == nil }.sorted()
+        guard missing.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "ConnectorParityTests: \(missing.count) model parameters got no checkpoint value, "
+                + "e.g. \(missing.prefix(5).joined(separator: ", "))")
+        }
+
         _ = model.update(parameters: ModuleParameters.unflattened(combined))
         eval(model.parameters())
         return model
@@ -80,8 +92,9 @@ struct ConnectorParityTests {
     /// hidden state directly (bypassing the Swift port's private register
     /// substitution) — isolating the 8-block math from register replacement,
     /// which is exactly how the register-replacement bug below was found: the
-    /// blocks matched to ~1e-5 in isolation while the full pipeline was 121%
-    /// off.
+    /// blocks matched to ~1e-5 in isolation while the full pipeline was 135%
+    /// off (measured with this repo's actual left-padding convention — see
+    /// connectorOutputMatchesReference).
     @Test func bisectFirstDivergence() throws {
         let reference = try MLX.loadArrays(url: URL(fileURLWithPath: env("LTX25_CONNECTOR_REF")))
         let model = try loadModel()
@@ -92,7 +105,10 @@ struct ConnectorParityTests {
             hiddenStates: hiddenStates, attentionMask: attentionMask)
         MLX.eval(feOutput)
         let refFE = reference["feature_extractor_output"]!.asType(DType.float32)
-        print("PARITY feature_extractor: relative error \(relativeError(feOutput, refFE))")
+        #expect(feOutput.shape == refFE.shape, "feature_extractor shape \(feOutput.shape) vs ref \(refFE.shape)")
+        let feError = relativeError(feOutput, refFE)
+        print("PARITY feature_extractor: relative error \(feError)")
+        #expect(feError < 0.02, "feature_extractor diverges from the reference: \(feError)")
 
         let postRegister = reference["post_register_hidden"]!.asType(DType.float32)
         let connector = model.embeddingsConnector
@@ -114,7 +130,10 @@ struct ConnectorParityTests {
             x = block(x, mask: nil, pe: freqsCis)
             MLX.eval(x)
             guard let refBlock = reference["block_\(i)"]?.asType(DType.float32) else { continue }
-            print("PARITY block_\(i): relative error \(relativeError(x, refBlock))")
+            #expect(x.shape == refBlock.shape, "block_\(i) shape \(x.shape) vs ref \(refBlock.shape)")
+            let blockError = relativeError(x, refBlock)
+            print("PARITY block_\(i): relative error \(blockError)")
+            #expect(blockError < 0.02, "block_\(i) diverges from the reference: \(blockError)")
         }
     }
 
