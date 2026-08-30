@@ -13,6 +13,12 @@
   claim in [the D2S-residual pitfall](/docs/knowledge/pitfalls/decoder-d2s-residual-false.md),
   which had the padding modes backwards.
 
+* **Creation**: [Vectorized RGBA pixel conversion vs. the scalar loop it
+  replaced](/docs/knowledge/benchmarks/pixel-conversion-vectorization-2026-08.md)
+  — `loadVideo` on a 121-frame 768x512 clip: ~8.15s to ~1.0s (~8x). The
+  remaining ~1s is AVFoundation decode overhead, not pixel conversion —
+  documented as the next lever if `loadVideo` needs to be faster still.
+
 * **Update**: Split the mid-run unload gating per component in
   [the unload-gating decision](/docs/knowledge/decisions/unload-gating-semantics.md).
   One flag for the prompt encoder and the transformer made LipDub fusion reuse
