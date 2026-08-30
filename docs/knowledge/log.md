@@ -2,6 +2,17 @@
 
 ## 2026-08-30
 
+* **Creation**: [The conv VAE decoder padded every conv with reflect instead
+  of zeros](/docs/knowledge/pitfalls/conv-decoder-wrong-spatial-padding.md) —
+  found by a new element-wise parity harness against Lightricks' own
+  `ConvVideoDecoder` (issue #57), the first of six planned sub-tasks. 17-27%
+  relative error on the default decode path used by every clip this repo has
+  ever produced, collapsing to ~1e-6 once the five conv sites in
+  `VideoDecoder.swift` got the checkpoint's actual `spatial_padding_mode:
+  "zeros"` instead of the framework's fallback default. Corrects a wrong
+  claim in [the D2S-residual pitfall](/docs/knowledge/pitfalls/decoder-d2s-residual-false.md),
+  which had the padding modes backwards.
+
 * **Update**: Split the mid-run unload gating per component in
   [the unload-gating decision](/docs/knowledge/decisions/unload-gating-semantics.md).
   One flag for the prompt encoder and the transformer made LipDub fusion reuse
