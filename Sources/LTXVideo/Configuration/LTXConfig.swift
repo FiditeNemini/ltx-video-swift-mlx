@@ -419,6 +419,35 @@ extension LTXTransformerConfig: CustomStringConvertible {
 /// )
 /// try config.validate()
 /// ```
+/// Which stream a retake regenerates.
+///
+/// The dual-stream transformer denoises video and audio separately, and freezing
+/// one is done by holding it at σ = 0 for the whole schedule — the frozen stream
+/// stays live as cross-modal context rather than being dropped, which is what
+/// keeps the regenerated stream consistent with it.
+public enum RetakeModality: String, Sendable, CaseIterable, Codable {
+    /// Regenerate the picture, keep the source audio (passthrough). The default,
+    /// and the historical behaviour of `regenerateAudio == false`.
+    case videoOnly
+
+    /// Regenerate both streams. Historical `regenerateAudio == true`.
+    case both
+
+    /// Regenerate the sound, keep the picture untouched — "same shots, new
+    /// audio". The frames are re-muxed from the source rather than decoded, so
+    /// the picture is bit-identical and no VAE decode is paid.
+    ///
+    /// Requires the audio models (``LTXPipeline/loadAudioModels(includeEncoder:progressCallback:)``
+    /// with `includeEncoder: true`) and a source video that carries an audio track.
+    case audioOnly
+
+    /// Whether the video latents are denoised.
+    public var regeneratesVideo: Bool { self != .audioOnly }
+
+    /// Whether the audio latents are denoised.
+    public var regeneratesAudio: Bool { self != .videoOnly }
+}
+
 public struct LTXVideoGenerationConfig: Sendable {
     /// Video width in pixels (must be divisible by 64)
     public var width: Int
@@ -469,10 +498,42 @@ public struct LTXVideoGenerationConfig: Sendable {
     /// End time (seconds) for partial retake. nil = retake all frames.
     public var retakeEndTime: Float?
 
-    /// Whether to regenerate audio during retake (requires audio models loaded).
-    /// When false (default), source audio is preserved via passthrough.
-    /// When true, audio is denoised alongside video using LTX2Transformer.
-    public var regenerateAudio: Bool
+    /// Which stream a retake regenerates. Default: ``RetakeModality/videoOnly``.
+    ///
+    /// `.both` and `.audioOnly` need the audio models loaded with their encoder.
+    public var retakeModality: RetakeModality
+
+    /// How far to renoise the source audio in an audio-only retake.
+    ///
+    /// `1.0` (default) starts from pure noise: a new soundtrack, unrelated to
+    /// the source track. Lower values keep a parenté with it — the schedule
+    /// starts at the highest trained sigma `<= this value`, and the audio latent
+    /// enters it as `σ·noise + (1 − σ)·source`, so rhythm and ambience survive
+    /// in proportion. Fewer steps run, so it is also faster.
+    ///
+    /// Only meaningful for ``RetakeModality/audioOnly``: the two streams share
+    /// one sigma schedule, so truncating it for `.both` would truncate the
+    /// picture's schedule too. Setting it below `1.0` in any other modality is a
+    /// configuration error rather than a silent no-op.
+    ///
+    /// The distilled schedule is 9 trained values (`1.0 … 0.421875, 0`), so on
+    /// the distilled model this snaps: `0.9` starts at `0.909375` — the same
+    /// level stage 2 renoises to — `0.8` at `0.725`, `0.5` at `0.421875`, and
+    /// anything below `0.421875` leaves no step to run and throws.
+    public var audioRetakeStrength: Float
+
+    /// Whether to regenerate audio during retake.
+    ///
+    /// Kept as a two-value view of ``retakeModality``: reading it is
+    /// `retakeModality.regeneratesAudio`, writing it selects `.both` or
+    /// `.videoOnly`. It cannot express `.audioOnly` — set ``retakeModality``
+    /// directly for that.
+    @available(*, deprecated, renamed: "retakeModality",
+               message: "Use retakeModality (.videoOnly / .both / .audioOnly).")
+    public var regenerateAudio: Bool {
+        get { retakeModality.regeneratesAudio }
+        set { retakeModality = newValue ? .both : .videoOnly }
+    }
 
     /// Optional list of keyframes for multi-frame interpolation (first / middle / last frame).
     /// When non-empty, generation is constrained to pass through each keyframe at its
@@ -494,7 +555,9 @@ public struct LTXVideoGenerationConfig: Sendable {
         retakeStartTime: Float? = nil,
         retakeEndTime: Float? = nil,
         regenerateAudio: Bool = false,
-        keyframes: [KeyframeInput] = []
+        keyframes: [KeyframeInput] = [],
+        retakeModality: RetakeModality? = nil,
+        audioRetakeStrength: Float = 1.0
     ) {
         self.width = width
         self.height = height
@@ -508,7 +571,10 @@ public struct LTXVideoGenerationConfig: Sendable {
         self.retakeStrength = retakeStrength
         self.retakeStartTime = retakeStartTime
         self.retakeEndTime = retakeEndTime
-        self.regenerateAudio = regenerateAudio
+        // `regenerateAudio` is the legacy two-value spelling; an explicit
+        // modality wins over it.
+        self.retakeModality = retakeModality ?? (regenerateAudio ? .both : .videoOnly)
+        self.audioRetakeStrength = audioRetakeStrength
         self.keyframes = keyframes
     }
 
@@ -528,7 +594,9 @@ public struct LTXVideoGenerationConfig: Sendable {
         retakeStartTime: Float? = nil,
         retakeEndTime: Float? = nil,
         regenerateAudio: Bool = false,
-        keyframes: [KeyframeInput] = []
+        keyframes: [KeyframeInput] = [],
+        retakeModality: RetakeModality? = nil,
+        audioRetakeStrength: Float = 1.0
     ) {
         self.width = width
         self.height = height
@@ -542,7 +610,10 @@ public struct LTXVideoGenerationConfig: Sendable {
         self.retakeStrength = retakeStrength
         self.retakeStartTime = retakeStartTime
         self.retakeEndTime = retakeEndTime
-        self.regenerateAudio = regenerateAudio
+        // `regenerateAudio` is the legacy two-value spelling; an explicit
+        // modality wins over it.
+        self.retakeModality = retakeModality ?? (regenerateAudio ? .both : .videoOnly)
+        self.audioRetakeStrength = audioRetakeStrength
         self.keyframes = keyframes
     }
 
@@ -603,6 +674,28 @@ public struct LTXVideoGenerationConfig: Sendable {
             }
             guard retakeStrength > 0.0 && retakeStrength <= 1.0 else {
                 throw LTXError.invalidConfiguration("Retake strength must be in (0.0, 1.0], got \(retakeStrength)")
+            }
+            guard audioRetakeStrength > 0.0 && audioRetakeStrength <= 1.0 else {
+                throw LTXError.invalidConfiguration(
+                    "Audio retake strength must be in (0.0, 1.0], got \(audioRetakeStrength)")
+            }
+            // Truncating the schedule truncates it for both streams, so a
+            // partial audio renoise only means something when the picture is
+            // frozen. Silently ignoring it would look like it worked.
+            if audioRetakeStrength < 1.0 && retakeModality != .audioOnly {
+                throw LTXError.invalidConfiguration(
+                    "audioRetakeStrength < 1 renoises the source audio partially, which needs "
+                    + "retakeModality == .audioOnly (video and audio share one sigma schedule). "
+                    + "Got \(retakeModality).")
+            }
+            // A partial window masks *video* latent frames. With the picture
+            // frozen there is nothing for it to select, and silently ignoring it
+            // would look like a working audio-window feature.
+            if retakeModality == .audioOnly && (retakeStartTime != nil || retakeEndTime != nil) {
+                throw LTXError.invalidConfiguration(
+                    "A partial retake window (retakeStartTime / retakeEndTime) selects video "
+                    + "frames to regenerate, and .audioOnly regenerates none. Drop the window, "
+                    + "or use .both to retake picture and sound over it.")
             }
         }
 

@@ -535,8 +535,14 @@ struct Retake: AsyncParsableCommand {
     @Option(name: .long, help: "Inference steps (dev model only — the distilled model runs a fixed trained 8-step schedule; default: 30)")
     var steps: Int?
 
-    @Flag(name: .long, help: "Regenerate audio (instead of preserving source audio)")
+    @Flag(name: .long, help: "Regenerate audio alongside the picture (same as --modality both)")
     var regenerateAudio: Bool = false
+
+    @Option(name: .long, help: "Which stream to regenerate: video (default, source audio kept), both, or audio (picture kept untouched)")
+    var modality: String?
+
+    @Option(name: .long, help: "Audio-only: how far to renoise the source track (0-1]. 1 = new soundtrack from noise (default); lower keeps the source's rhythm and ambience, and runs fewer steps")
+    var audioStrength: Float = 1.0
 
     @Option(name: .long, help: "Transformer quantization: bf16, qint8, int4, nvfp4, mxfp8")
     var transformerQuant: String = "bf16"
@@ -643,6 +649,42 @@ struct Retake: AsyncParsableCommand {
         guard loraScale >= 0 else {
             throw ValidationError("LoRA scale must be >= 0. Got \(loraScale)")
         }
+        // --modality wins over the older --regenerate-audio flag.
+        let retakeModality: RetakeModality
+        if let modality {
+            switch modality.lowercased() {
+            case "video", "videoonly", "video-only": retakeModality = .videoOnly
+            case "both", "video+audio": retakeModality = .both
+            case "audio", "audioonly", "audio-only": retakeModality = .audioOnly
+            default:
+                throw ValidationError(
+                    "Invalid --modality: \(modality). Use video, both, or audio.")
+            }
+        } else {
+            retakeModality = regenerateAudio ? .both : .videoOnly
+        }
+        guard audioStrength > 0.0 && audioStrength <= 1.0 else {
+            throw ValidationError("--audio-strength must be in (0.0, 1.0]. Got \(audioStrength)")
+        }
+        if audioStrength < 1.0 && retakeModality != .audioOnly {
+            throw ValidationError(
+                "--audio-strength renoises the source audio partially, which needs "
+                + "--modality audio (the two streams share one sigma schedule).")
+        }
+        if retakeModality == .audioOnly && (startTime != nil || endTime != nil) {
+            throw ValidationError(
+                "--start-time / --end-time select video frames to regenerate, and "
+                + "--modality audio regenerates none. Use --modality both for a window.")
+        }
+        switch retakeModality {
+        case .videoOnly: break  // the default; the header already reads as a retake
+        case .both: print("Regenerating: picture + sound")
+        case .audioOnly:
+            print("Regenerating: sound only (picture kept untouched)")
+            if audioStrength < 1.0 {
+                print("Audio renoise strength: \(audioStrength) (keeps part of the source track)")
+            }
+        }
         // Parse quantization
         let quantConfig: LTXQuantizationConfig
         if mixedPrecision {
@@ -682,7 +724,7 @@ struct Retake: AsyncParsableCommand {
         print("Models loaded in \(String(format: "%.1f", loadTime))s")
 
         // Load audio models if regenerating audio
-        if regenerateAudio {
+        if retakeModality.regeneratesAudio {
             print("Loading audio models (with encoder)...")
             fflush(stdout)
             try await pipeline.loadAudioModels(includeEncoder: true) { progress in
@@ -722,7 +764,8 @@ struct Retake: AsyncParsableCommand {
             retakeStrength: strength,
             retakeStartTime: startTime,
             retakeEndTime: endTime,
-            regenerateAudio: regenerateAudio
+            retakeModality: retakeModality,
+            audioRetakeStrength: audioStrength
         )
 
         // Generate retake (single-stage, no upscaler needed)
@@ -767,7 +810,9 @@ struct Retake: AsyncParsableCommand {
                 to: outputURL
             )
             print("Video saved to: \(videoURL.path)")
-            print("Audio: regenerated")
+            print(retakeModality == .audioOnly
+                  ? "Audio: regenerated (picture re-muxed from the source, untouched)"
+                  : "Audio: regenerated")
 
             // Also export standalone WAV
             let wavPath = output.replacingOccurrences(of: ".mp4", with: ".wav")

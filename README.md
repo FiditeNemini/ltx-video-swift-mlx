@@ -222,6 +222,40 @@ ltx-video retake "A cinematic arc shot around a vintage red car" \
 ltx-video retake "The vase explodes into colorful smoke" \
     --video source.mp4 --distilled \
     --start-time 7.0 --end-time 10.0 -w 768 -h 512 -f 241
+
+# Same shots, new sound: the picture is re-muxed untouched (no VAE decode),
+# only the audio stream is denoised
+ltx-video retake "Heavy rain drumming on a metal roof, distant thunder" \
+    --video source.mp4 --modality audio \
+    -w 768 -h 512 -f 121
+```
+
+A retake regenerates one stream or both. The other is frozen at σ = 0 and stays
+in the forward pass as cross-modal context, so the regenerated stream keeps
+matching it:
+
+| `--modality` | Picture | Sound |
+|---|---|---|
+| `video` (default) | regenerated | source track, passed through |
+| `both` | regenerated | regenerated |
+| `audio` | source frames, re-muxed untouched | regenerated |
+
+`both` and `audio` load the audio models. `audio` is much cheaper than a video
+retake — same transformer passes, no VAE decode — and its picture is bit-identical
+to the source.
+
+`--audio-strength` (audio-only) decides how much of the source track survives:
+`1.0` starts from pure noise, lower values enter the schedule at the highest
+trained sigma below that value and blend the source in
+(`σ·noise + (1 − σ)·source`). On the distilled model this snaps to its 9-value
+schedule — `0.9` → `0.909375`, `0.8` → `0.725`, `0.5` → `0.421875` — and anything
+below `0.421875` leaves no step to run.
+
+```bash
+# Keep the rhythm and room of the source track, change its character
+ltx-video retake "The same voice, in a larger room with a long reverb tail" \
+    --video source.mp4 --modality audio --audio-strength 0.8 \
+    -w 768 -h 512 -f 121
 ```
 
 ### Audio
@@ -272,7 +306,7 @@ ltx-video lipdub 'Speaking in French saying: "…suite du dialogue."' \
     -w 704 -h 1024 -f 233
 ```
 
-**Consecutive runs (Swift package):** the IC-LoRA is fused destructively into the 22B transformer. Consecutive `generateLipDub` calls with the same LoRA **and the same scale** reuse the fused transformer without re-fusing — no model reload per segment — provided the transformer survives between runs (`MemoryOptimizationConfig.disabled`, i.e. `unloadAfterUse: false`). Switching LoRA or scale, or running `generateVideo`/`generateRetake` while fused, throws until `loadModels()` + `loadAudioModels()` restore pristine weights. Check `pipeline.fusedLipDubLoRAPath` / `fusedLipDubLoRAScale` for the current state.
+**Consecutive runs (Swift package):** the IC-LoRA is fused destructively into the 22B transformer. Consecutive `generateLipDub` calls with the same LoRA **and the same scale** reuse the fused transformer without re-fusing — no model reload per segment — provided the transformer survives between runs. Use `MemoryOptimizationConfig.recommended(forRAMGB:).keepingTransformer()`: the transformer and its fusion stay, while the prompt encoder (26 GB on LTX-2.5) is still freed after each text encode and reloaded on its own — `.disabled` also works but holds the encoder resident for the whole run. Switching LoRA or scale, or running `generateVideo`/`generateRetake` while fused, throws until `loadModels()` + `loadAudioModels()` restore pristine weights. Check `pipeline.fusedLipDubLoRAPath` / `fusedLipDubLoRAScale` for the current state.
 
 **LoRA scale (`--lora-scale`, `lipdubLoRAScale:`, default 1.0)** — experimental. The delta is applied as `W' = W + scale · B·A`; the shipped IC-LoRA carries no `alpha` keys, so the value you pass is the whole multiplier. **Leave it at 1.0 unless you are experimenting**: this is an *in-context* LoRA, not a style LoRA — it teaches the transformer how to read the appended reference tokens (audio at negative positions, video reference), so scaling it down weakens the conditioning mechanism itself rather than softening an effect. Lightricks publishes it for use at 1.0. Values outside `0.5...1.5` log a warning; `<= 0` throws.
 
@@ -595,7 +629,9 @@ ltx-video export-quantized \
 | `--prompt-enhancer-precision` | `bf16` | LTX-2.5: precision of the downloaded enhancer (`bf16` or `6bit`) |
 | `--transformer-quant` | `bf16` | Quantization: `bf16`, `qint8`, `int4`, `nvfp4`, `mxfp8` |
 | `--mixed-precision` | off | Per-block quantization: first/last 6 blocks qint8, middle int4 |
-| `--regenerate-audio` | off | Regenerate audio via dual denoising (default: preserve source audio) |
+| `--modality` | `video` | Which stream to regenerate: `video` (source audio kept), `both`, or `audio` (picture kept untouched) |
+| `--audio-strength` | `1.0` | `--modality audio` only: how far to renoise the source track. `1` = new soundtrack from noise; lower keeps its rhythm and ambience, and runs fewer steps |
+| `--regenerate-audio` | off | Older spelling of `--modality both` |
 | `--beacon` | off | Advertise activity to external monitors (see [Activity Beacon](#activity-beacon-opt-in)) |
 | `--profile` | off | GPU/CPU profiling report + Chrome Trace export |
 
