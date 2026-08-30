@@ -42,6 +42,19 @@ struct ConvVAEDecoderParityTests {
     func loadDecoder() throws -> VideoDecoder {
         let decoder = VideoDecoder()
         let mapped = try LTXWeightLoader.loadVAEWeights(from: env("LTX25_CONVVAE"))
+
+        // MLXNN's no-verify: update() silently no-ops on keys the model
+        // doesn't declare a parameter for — a broken key mapping would leave
+        // a parameter at random init and every parity number below would be
+        // comparing against nothing, with no failure to say so.
+        let declared = Dictionary(uniqueKeysWithValues: decoder.parameters().flattened())
+        let missing = declared.keys.filter { mapped[$0] == nil }.sorted()
+        guard missing.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "ConvVAEDecoderParityTests: \(missing.count) model parameters got no checkpoint "
+                + "value, e.g. \(missing.prefix(5).joined(separator: ", "))")
+        }
+
         _ = decoder.update(parameters: ModuleParameters.unflattened(mapped))
         eval(decoder.parameters())
         return decoder
@@ -94,6 +107,7 @@ struct ConvVAEDecoderParityTests {
             }
             let err = relativeError(ours, ref)
             print("PARITY \(name): relative error \(err)")
+            #expect(err < 0.02, "\(name) diverges from the reference: \(err)")
         }
     }
 

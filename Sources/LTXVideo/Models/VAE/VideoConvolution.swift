@@ -199,6 +199,15 @@ class CausalConv3d: Module {
 /// Uses 2D+1D decomposition for forward pass but stores weights in
 /// standard 3D conv format (out_channels, in_channels, T, H, W).
 /// This allows direct loading of PyTorch Conv3d weights from safetensors.
+///
+/// `spatialPaddingMode` defaults to `.zeros`: every real checkpoint's
+/// `vae.spatial_padding_mode` is `"zeros"` (encoder and decoder alike — one
+/// flat key, shared). All 10 construction sites in `VideoDecoder.swift` /
+/// `VideoEncoder.swift` pass it explicitly regardless, but a stray future
+/// call site that omits it should not silently reintroduce
+/// docs/knowledge/pitfalls/conv-decoder-wrong-spatial-padding.md (17-27%
+/// relative error against the reference, invisible without a parity
+/// harness).
 class Conv3dFull: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "bias") var bias: MLXArray?
@@ -217,7 +226,7 @@ class Conv3dFull: Module {
         stride: (Int, Int, Int) = (1, 1, 1),
         padding: (Int, Int, Int) = (1, 1, 1),
         bias: Bool = true,
-        spatialPaddingMode: PaddingModeType = .reflect
+        spatialPaddingMode: PaddingModeType = .zeros
     ) {
         self.inChannels = inChannels
         self.outChannels = outChannels
@@ -362,7 +371,7 @@ class CausalConv3dFull: Module {
         kernelSize: Int = 3,
         stride: (Int, Int, Int) = (1, 1, 1),
         bias: Bool = true,
-        spatialPaddingMode: PaddingModeType = .reflect
+        spatialPaddingMode: PaddingModeType = .zeros
     ) {
         self.timeKernelSize = kernelSize
 
