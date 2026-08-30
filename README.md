@@ -622,8 +622,9 @@ ltx-video export-quantized \
 | `-h, --height` | `512` | Video height (divisible by 32) |
 | `-f, --frames` | `121` | Frame count (must be 8n+1) |
 | `--seed` | random | Random seed |
-| `--distilled` | off | Use distilled model (8 steps, fast). Default: dev (30 steps + CFG) |
-| `--steps` | `30` | Inference steps — dev model only (the distilled model runs a fixed trained 8-step schedule; custom counts there produce artifacts) |
+| `--model` | `dev` | Model variant: `distilled`, `dev`, `2.5-distilled`, `2.5-dev` |
+| `--distilled` | off | Older spelling of `--model distilled`. Mutually exclusive with `--model` |
+| `--steps` | `30` | Inference steps — dev checkpoints only (distilled runs a fixed trained 8-step schedule; custom counts there produce artifacts) |
 | `--enhance-prompt` | off | Enhance prompt with Gemma VLM |
 | `--prompt-enhancer-root` | none | LTX-2.5: use a Gemma 4 E2B-it checkpoint you already have as the enhancer |
 | `--prompt-enhancer-precision` | `bf16` | LTX-2.5: precision of the downloaded enhancer (`bf16` or `6bit`) |
