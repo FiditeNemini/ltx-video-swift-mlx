@@ -550,6 +550,18 @@ class Embeddings1DConnector: Module {
     }
 
     /// Replace padded positions with learnable register tokens
+    ///
+    /// Position-preserving: a padded position `t` gets `registers[t]` in
+    /// place, matching `Embeddings1DConnector._replace_padded_with_learnable_registers`
+    /// in ltx_core exactly (`binary_mask * hidden_states + (1 - binary_mask) * registers`,
+    /// no reordering). A prior version sorted valid tokens to the front and
+    /// filled the reversed-mask tail with registers instead — every real
+    /// prompt hits this, since `Gemma4TextEncoder.encode` left-pads
+    /// (`[0]*padding + [1]*ids.count`, most prompts far shorter than the
+    /// 1024-token window): 135% relative error against the reference,
+    /// confirmed by ConnectorParityTests (issue #57 sub-task 3). The 8-block
+    /// transformer math underneath (RoPE, gated attention, feed-forward) was
+    /// never at fault — it matches to ~1e-5 once fed a correct input.
     private func replacePaddedWithLearnableRegisters(
         hiddenStates: MLXArray,
         attentionMask: MLXArray
@@ -572,24 +584,9 @@ class Embeddings1DConnector: Module {
         // attention_mask is additive: 0 = attend, large negative = don't attend
         let maskSqueezed = attentionMask.squeezed(axes: [1, 2])  // [B, T]
         let isValid = maskSqueezed .>= -9000.0  // [B, T]
+        let binaryMask = isValid.asType(hiddenStates.dtype).expandedDimensions(axis: -1)
 
-        // Move valid tokens to the front (matching PyTorch behavior)
-        let idx = MLXArray(0..<seqLen).expandedDimensions(axis: 0)
-        let validInt = isValid.asType(.int32)
-        let sortKey = (1 - validInt) * seqLen + idx
-        let order = MLX.argSort(sortKey, axis: 1)
-
-        // Gather along axis 1
-        let orderExpanded = order.expandedDimensions(axis: -1)
-        let adjustedHiddenStates = MLX.takeAlong(hiddenStates, orderExpanded, axis: 1)
-
-        // Flip mask so registers fill the padded tail positions
-        // Reverse along axis 1
-        let reverseIndices = MLXArray(Array(stride(from: seqLen - 1, through: 0, by: -1)))
-        let reversed = MLX.take(isValid, reverseIndices, axis: 1)
-        let flippedMask = reversed.asType(hiddenStates.dtype).expandedDimensions(axis: -1)
-
-        let newHiddenStates = flippedMask * adjustedHiddenStates + (1 - flippedMask) * tiledRegisters
+        let newHiddenStates = binaryMask * hiddenStates + (1 - binaryMask) * tiledRegisters
 
         // Clear the attention mask (all positions now valid)
         let newMask = MLXArray.zeros(like: attentionMask)

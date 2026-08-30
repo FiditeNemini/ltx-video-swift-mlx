@@ -63,6 +63,7 @@ or re-litigated.
 * [The continuation-tail clip must be re-encoded](pitfalls/continuation-tail-clip-encoding.md) - an input seek leaves frame 0 off t=0 and the zero-tolerance extractor refuses it
 * [URLSession's per-task delegate never reports download progress](pitfalls/urlsession-task-delegate-has-no-download-progress.md) - download(for:delegate:) calls didWriteData zero times; needs a session delegate on an explicit downloadTask, which then puts error pages on disk
 * [The duration head ignores durations written in the prompt](pitfalls/duration-head-does-not-read-written-durations.md) - a "3 seconds." prefix returns byte-identical output to no prefix; it regresses from connector tokens and never sees the text
+* [The text connector's register replacement reordered tokens instead of substituting in place](pitfalls/connector-register-replacement-reorders-tokens.md) - every real (left-padded) prompt hit this; 135% relative error against the reference, 0.15% once fixed
 
 # Investigations
 

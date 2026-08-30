@@ -2,6 +2,18 @@
 
 ## 2026-08-30
 
+* **Creation**: [The text connector's register replacement reordered tokens
+  instead of substituting in place](/docs/knowledge/pitfalls/connector-register-replacement-reorders-tokens.md)
+  — sub-task 3 of issue #57's parity-harness breakdown (sub-task 1: conv VAE
+  decoder padding, PR #76; sub-task 2: conv VAE encoder, clean, PR #77). The
+  8-block transformer (RoPE, gated attention, feed-forward) was cleared first
+  via bisection — matches the reference to ~1e-5 — which localized the
+  defect to `replacePaddedWithLearnableRegisters`. Since every real prompt is
+  left-padded (`Gemma4TextEncoder.encode`) and far shorter than the
+  1024-token window, this was live on essentially every generation this repo
+  has produced: 135% relative error on the connector output, 0.15% after the
+  fix.
+
 * **Update**: Split the mid-run unload gating per component in
   [the unload-gating decision](/docs/knowledge/decisions/unload-gating-semantics.md).
   One flag for the prompt encoder and the transformer made LipDub fusion reuse
