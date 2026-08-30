@@ -47,6 +47,21 @@ struct ConvVAEEncoderParityTests {
     func loadEncoder() throws -> VideoEncoder {
         let encoder = VideoEncoder()
         let weights = try LTXWeightLoader.loadVAEEncoderWeights(from: env("LTX25_CONVVAE"))
+
+        // applyVAEEncoderWeights only *logs* unmatched/missing keys (behind
+        // LTXDebug.isEnabled) rather than failing — a broken key mapping
+        // would leave a parameter at random init and this test would keep
+        // "passing" against nothing.
+        // loadVAEEncoderWeights already returns mapped keys (down_blocks_N.*,
+        // not encoder.down_blocks.N.*) — compare directly, don't re-map.
+        let declared = Dictionary(uniqueKeysWithValues: encoder.parameters().flattened())
+        let missing = declared.keys.filter { weights[$0] == nil }.sorted()
+        guard missing.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "ConvVAEEncoderParityTests: \(missing.count) model parameters got no checkpoint "
+                + "value, e.g. \(missing.prefix(5).joined(separator: ", "))")
+        }
+
         try LTXWeightLoader.applyVAEEncoderWeights(weights, to: encoder)
         eval(encoder.parameters())
         return encoder
@@ -79,6 +94,13 @@ struct ConvVAEEncoderParityTests {
         let encoder = try loadEncoder()
         let decoder = VideoDecoder()
         let decoderWeights = try LTXWeightLoader.loadVAEWeights(from: env("LTX25_CONVVAE"))
+        let declaredDecoder = Dictionary(uniqueKeysWithValues: decoder.parameters().flattened())
+        let missingDecoder = declaredDecoder.keys.filter { decoderWeights[$0] == nil }.sorted()
+        guard missingDecoder.isEmpty else {
+            throw LTXError.weightLoadingFailed(
+                "ConvVAEEncoderParityTests: \(missingDecoder.count) decoder parameters got no "
+                + "checkpoint value, e.g. \(missingDecoder.prefix(5).joined(separator: ", "))")
+        }
         _ = decoder.update(parameters: ModuleParameters.unflattened(decoderWeights))
         eval(decoder.parameters())
 
