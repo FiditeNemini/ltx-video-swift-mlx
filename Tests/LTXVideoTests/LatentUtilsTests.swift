@@ -6,6 +6,9 @@
 //  NOTE: Most tests require Metal (MLXArray operations).
 
 import Testing
+import CoreGraphics
+import Foundation
+import ImageIO
 import MLX
 import MLXRandom
 @testable import LTXVideo
@@ -176,5 +179,113 @@ struct LatentUtilsMLXTests {
         #expect(mem > 0)
         // Basic sanity: latent = 1*128*16*16*24 * 4 bytes = ~25 MB
         #expect(mem > 10_000_000)  // > 10 MB
+    }
+}
+
+// MARK: - Pixel Conversion (loadImage / loadVideo)
+//
+// Locks the vectorized RGBA→float conversion (LatentUtils.swift) to the exact
+// values and channel order the scalar loop it replaced produced: 255 → 1.0,
+// 0 → -1.0, 128 → 128/127.5 - 1.0. A silent R/B channel swap would pass
+// unnoticed on a photographic image but not on these known quadrant colors.
+
+@Suite("Pixel conversion (loadImage / loadVideo)")
+struct PixelConversionTests {
+
+    /// Writes a 4x4 device-RGB PNG with four solid-color quadrants: red,
+    /// black, white, gray128. Device RGB (no ICC profile) on both the write
+    /// and the read side (`loadImage` also uses `CGColorSpaceCreateDeviceRGB`)
+    /// avoids any color-management pass that could shift byte values.
+    private func makeQuadrantPNG() throws -> URL {
+        let width = 4, height = 4
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width * 4, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else {
+            throw LTXError.videoProcessingFailed("Failed to create test PNG context")
+        }
+
+        context.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)     // red
+        context.fill(CGRect(x: 0, y: 2, width: 2, height: 2))
+        context.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)     // black
+        context.fill(CGRect(x: 2, y: 2, width: 2, height: 2))
+        context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)     // white
+        context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        context.setFillColor(red: 128.0 / 255.0, green: 128.0 / 255.0, blue: 128.0 / 255.0, alpha: 1)  // gray128
+        context.fill(CGRect(x: 2, y: 0, width: 2, height: 2))
+
+        guard let cgImage = context.makeImage() else {
+            throw LTXError.videoProcessingFailed("Failed to snapshot test PNG context")
+        }
+
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ltx-quadrant-\(UUID().uuidString).png")
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil
+        ) else {
+            throw LTXError.videoProcessingFailed("Failed to create PNG destination")
+        }
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw LTXError.videoProcessingFailed("Failed to write test PNG")
+        }
+        return url
+    }
+
+    @Test func testLoadImageExactNormalizedValues() throws {
+        let url = try makeQuadrantPNG()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let tensor = try loadImage(from: url.path, width: 4, height: 4)
+        eval(tensor)
+
+        #expect(tensor.shape == [1, 3, 1, 4, 4])
+
+        let byte255: Float = 255.0 / 127.5 - 1.0   // 1.0
+        let byte0: Float = 0.0 / 127.5 - 1.0       // -1.0
+        let byte128: Float = 128.0 / 127.5 - 1.0   // ≈ 0.003922
+
+        // Exact channel order: a red pixel must read (1.0, -1.0, -1.0) on
+        // (R, G, B) — an R/B swap would still look plausible on a gray pixel
+        // but not here. Quadrant → tensor (y, x) verified empirically (a
+        // CGContext's y-up drawing space maps to a top-down pixel buffer).
+        #expect(tensor[0, 0, 0, 0, 0].item(Float.self) == byte255)  // red quadrant, R
+        #expect(tensor[0, 1, 0, 0, 0].item(Float.self) == byte0)    // red quadrant, G
+        #expect(tensor[0, 2, 0, 0, 0].item(Float.self) == byte0)    // red quadrant, B
+
+        #expect(tensor[0, 0, 0, 0, 3].item(Float.self) == byte0)    // black quadrant, R
+        #expect(tensor[0, 1, 0, 0, 3].item(Float.self) == byte0)    // black quadrant, G
+        #expect(tensor[0, 2, 0, 0, 3].item(Float.self) == byte0)    // black quadrant, B
+
+        #expect(tensor[0, 0, 0, 3, 0].item(Float.self) == byte255)  // white quadrant, R
+        #expect(tensor[0, 1, 0, 3, 0].item(Float.self) == byte255)  // white quadrant, G
+        #expect(tensor[0, 2, 0, 3, 0].item(Float.self) == byte255)  // white quadrant, B
+
+        #expect(tensor[0, 0, 0, 3, 3].item(Float.self) == byte128)  // gray quadrant, R
+        #expect(tensor[0, 1, 0, 3, 3].item(Float.self) == byte128)  // gray quadrant, G
+        #expect(tensor[0, 2, 0, 3, 3].item(Float.self) == byte128)  // gray quadrant, B
+
+        // Every value stays in range regardless of which quadrant it lands in.
+        #expect(tensor.min().item(Float.self) >= -1.0)
+        #expect(tensor.max().item(Float.self) <= 1.0)
+    }
+
+    @Test func testLoadVideoShapeAndRange() async throws {
+        let path = "\(#filePath)"
+            .replacingOccurrences(of: "Tests/LTXVideoTests/LatentUtilsTests.swift", with: "")
+            + "docs/examples/lipdub/lipdub-teaser-french-ours-768x512-121f.mp4"
+        guard FileManager.default.fileExists(atPath: path) else {
+            Issue.record("Example video missing at \(path); skipping shape/range check")
+            return
+        }
+
+        let tensor = try await loadVideo(from: path, width: 128, height: 128, numFrames: 9)
+        eval(tensor)
+
+        #expect(tensor.shape == [1, 3, 9, 128, 128])
+        #expect(tensor.min().item(Float.self) >= -1.0)
+        #expect(tensor.max().item(Float.self) <= 1.0)
     }
 }
