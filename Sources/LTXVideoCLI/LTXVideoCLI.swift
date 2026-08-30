@@ -767,7 +767,7 @@ struct Retake: AsyncParsableCommand {
 
         // Step count is resolved earlier (before any weight load); just apply it here.
         let numSteps = steps ?? retakeModel.defaultSteps
-        if let s = steps { print("Inference steps: \(s) (dev)") }
+        if let s = steps { print("Inference steps: \(s) (\(retakeModel.rawValue))") }
 
         // Build config
         let config = LTXVideoGenerationConfig(
