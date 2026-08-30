@@ -13,6 +13,15 @@
   claim in [the D2S-residual pitfall](/docs/knowledge/pitfalls/decoder-d2s-residual-false.md),
   which had the padding modes backwards.
 
+* **Validation**: Sub-task 2 of issue #57 — `ConvVAEEncoderParityTests` pins the
+  conv VAE encoder (every retake, i2v conditioning image, and LipDub video
+  reference goes through it) against Lightricks' own `VideoEncoder`
+  (`scripts/conv_video_encoder_reference.py`). Unlike the decoder (sub-task 1,
+  PR #76), this one was clean on the first run: raw means and the fully
+  normalized output both match to ~3e-6. The encoder's `_res`-suffixed
+  space-to-depth downsamplers and `.zeros` padding, previously only
+  documented, are now verified rather than assumed.
+
 * **Creation**: [Vectorized RGBA pixel conversion vs. the scalar loop it
   replaced](/docs/knowledge/benchmarks/pixel-conversion-vectorization-2026-08.md)
   — `loadVideo` on a 121-frame 768x512 clip: ~8.15s to ~1.0s (~8x). The

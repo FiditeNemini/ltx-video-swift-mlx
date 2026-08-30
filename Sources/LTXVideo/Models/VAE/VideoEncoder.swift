@@ -228,7 +228,8 @@ class VideoEncoder: Module {
     public init(causal: Bool = true) {
         self.causal = causal
 
-        // Encoder uses zero spatial padding (decoder uses reflect)
+        // Both encoder and decoder pad with .zeros — one flat checkpoint key
+        // (vae.spatial_padding_mode) shared by both (see PR #76).
         let padMode: PaddingModeType = .zeros
 
         self._convIn.wrappedValue = CausalConv3dFull(
