@@ -22,6 +22,18 @@
   space-to-depth downsamplers and `.zeros` padding, previously only
   documented, are now verified rather than assumed.
 
+* **Creation**: [The text connector's register replacement reordered tokens
+  instead of substituting in place](/docs/knowledge/pitfalls/connector-register-replacement-reorders-tokens.md)
+  — sub-task 3 of issue #57's parity-harness breakdown (sub-task 1: conv VAE
+  decoder padding, PR #76; sub-task 2: conv VAE encoder, clean, PR #77). The
+  8-block transformer (RoPE, gated attention, feed-forward) was cleared first
+  via bisection — matches the reference to ~1e-5 — which localized the
+  defect to `replacePaddedWithLearnableRegisters`. Since every real prompt is
+  left-padded (`Gemma4TextEncoder.encode`) and far shorter than the
+  1024-token window, this was live on essentially every generation this repo
+  has produced: 135% relative error on the connector output, 0.15% after the
+  fix.
+
 * **Creation**: [Vectorized RGBA pixel conversion vs. the scalar loop it
   replaced](/docs/knowledge/benchmarks/pixel-conversion-vectorization-2026-08.md)
   — `loadVideo` on a 121-frame 768x512 clip: ~8.15s to ~1.0s (~8x). The

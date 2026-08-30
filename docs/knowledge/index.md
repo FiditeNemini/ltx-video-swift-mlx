@@ -65,6 +65,7 @@ or re-litigated.
 * [URLSession's per-task delegate never reports download progress](pitfalls/urlsession-task-delegate-has-no-download-progress.md) - download(for:delegate:) calls didWriteData zero times; needs a session delegate on an explicit downloadTask, which then puts error pages on disk
 * [The duration head ignores durations written in the prompt](pitfalls/duration-head-does-not-read-written-durations.md) - a "3 seconds." prefix returns byte-identical output to no prefix; it regresses from connector tokens and never sees the text
 * [The conv VAE decoder padded every conv with reflect instead of zeros](pitfalls/conv-decoder-wrong-spatial-padding.md) - every clip's default decode path; 17-27% relative error against the reference, ~1e-6 once fixed; found by the new element-wise parity harness (issue #57)
+* [The text connector's register replacement reordered tokens instead of substituting in place](pitfalls/connector-register-replacement-reorders-tokens.md) - every real (left-padded) prompt hit this; 135% relative error against the reference, 0.15% once fixed
 
 # Investigations
 
