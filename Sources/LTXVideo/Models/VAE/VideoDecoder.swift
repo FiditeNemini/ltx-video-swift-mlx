@@ -27,10 +27,10 @@ class VAEResBlock3d: Module {
     init(channels: Int) {
         self.channels = channels
         self._conv1.wrappedValue = CausalConv3dFull(
-            inChannels: channels, outChannels: channels, kernelSize: 3
+            inChannels: channels, outChannels: channels, kernelSize: 3, spatialPaddingMode: .zeros
         )
         self._conv2.wrappedValue = CausalConv3dFull(
-            inChannels: channels, outChannels: channels, kernelSize: 3
+            inChannels: channels, outChannels: channels, kernelSize: 3, spatialPaddingMode: .zeros
         )
     }
 
@@ -95,7 +95,7 @@ class VAEDepthToSpaceUpsample3d: Module {
 
         let convOutChannels = outChannels * factorProduct
         self._conv.wrappedValue = CausalConv3dFull(
-            inChannels: inChannels, outChannels: convOutChannels, kernelSize: 3
+            inChannels: inChannels, outChannels: convOutChannels, kernelSize: 3, spatialPaddingMode: .zeros
         )
     }
 
@@ -229,10 +229,10 @@ class VideoDecoder: Module {
         let actualOutChannels = 3 * patchSize * patchSize  // 48
 
         self._convIn.wrappedValue = CausalConv3dFull(
-            inChannels: 128, outChannels: 1024, kernelSize: 3
+            inChannels: 128, outChannels: 1024, kernelSize: 3, spatialPaddingMode: .zeros
         )
         self._convOut.wrappedValue = CausalConv3dFull(
-            inChannels: 128, outChannels: actualOutChannels, kernelSize: 3
+            inChannels: 128, outChannels: actualOutChannels, kernelSize: 3, spatialPaddingMode: .zeros
         )
 
         // 5 resblock groups: channels [1024, 512, 512, 256, 128], blocks [2, 2, 4, 6, 4]
