@@ -2,6 +2,15 @@
 
 ## 2026-08-30
 
+* **Validation**: Sub-task 2 of issue #57 — `ConvVAEEncoderParityTests` pins the
+  conv VAE encoder (every retake, i2v conditioning image, and LipDub video
+  reference goes through it) against Lightricks' own `VideoEncoder`
+  (`scripts/conv_video_encoder_reference.py`). Unlike the decoder (sub-task 1,
+  PR #76), this one was clean on the first run: raw means and the fully
+  normalized output both match to ~3e-6. The encoder's `_res`-suffixed
+  space-to-depth downsamplers and `.zeros` padding, previously only
+  documented, are now verified rather than assumed.
+
 * **Update**: Split the mid-run unload gating per component in
   [the unload-gating decision](/docs/knowledge/decisions/unload-gating-semantics.md).
   One flag for the prompt encoder and the transformer made LipDub fusion reuse
