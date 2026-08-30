@@ -422,6 +422,17 @@ public actor LTXPipeline {
         }
     }
 
+    /// Whether a retake runs the dev recipe — CFG 3.0, STG on block 28,
+    /// guidance rescale, configurable step count — rather than the distilled one.
+    ///
+    /// Capability, not identity: `.v25Dev` is a dev checkpoint too. Testing
+    /// `model == .dev` silently ran LTX-2.5 dev through the distilled 8-step
+    /// schedule, and made any other step count throw "use the dev model" on a
+    /// model that already was one.
+    nonisolated static func retakeUsesDevRecipe(_ model: LTXModel) -> Bool {
+        model.isForTraining
+    }
+
     /// x₀-space guidance combination shared by every dev-guided loop (retake,
     /// dev single-stage): CFG toward `neg`, STG toward `stg`, then variance
     /// rescale toward `cond` — matching the Lightricks order, all on x₀.
@@ -1856,7 +1867,7 @@ public actor LTXPipeline {
         // sigma schedule for any count, whereas the distilled model was trained
         // to jump the fixed 9-value sigma schedule — arbitrary counts there
         // produce artifacts (issue #33).
-        let useDevModel = (model == .dev)
+        let useDevModel = Self.retakeUsesDevRecipe(model)
         if !useDevModel && config.numSteps != LTXModel.distilled.defaultSteps {
             throw LTXError.invalidConfiguration(
                 "The distilled model runs a fixed \(LTXModel.distilled.defaultSteps)-step " +

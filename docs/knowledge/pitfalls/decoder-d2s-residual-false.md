@@ -21,7 +21,11 @@ after the fix = 0.98, smooth). Root-caused March 2026.
   (5 ResBlockGroup + 4 D2S), `conv_out` → 48 channels → unpatchify(4) → RGB,
   `output_frames = 8 * (latent_frames - 1) + 1`, **no timestep conditioning**
   (`timestep_conditioning: false` — no scale_shift_table or noise injection
-  in the decoder), encoder pads with `.zeros` / decoder with `.reflect`.
+  in the decoder). **Correction (2026-08-30):** both encoder and decoder pad
+  with `.zeros` (`vae.spatial_padding_mode` is one flat top-level checkpoint
+  key, shared by both) — "decoder with `.reflect`" here was the framework's
+  fallback-when-missing default, misread as the checkpoint's actual value; see
+  [conv-decoder-wrong-spatial-padding.md](conv-decoder-wrong-spatial-padding.md).
 
 # Citations
 

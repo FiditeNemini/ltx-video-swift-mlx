@@ -19,6 +19,7 @@ or re-litigated.
 * [Generation baselines on M3 Max 96 GB](benchmarks/generation-baselines-m3max.md) - healthy wall-clock numbers measured July 2026; anything far above them is contention/thermal/misconfiguration, not the engine
 * [LoRA training baselines on M3 Max 96 GB](benchmarks/lora-training-baselines-m3max.md) - wall-clock, peak memory and loss trajectories for the Disney overfit runs
 * [LTX-2.5 against MiniMax-H3 on a 10 s case](benchmarks/ltx25-vs-h3-starship-2026-08.md) - same machine and seed: phase table, per-step cost, and the 2.8× thermal spread that bounds any cost claim
+* [Vectorized RGBA pixel conversion vs. the scalar loop it replaced](benchmarks/pixel-conversion-vectorization-2026-08.md) - loadVideo on a 121-frame clip: ~8.15s to ~1.0s (~8x); the remaining time is AVFoundation decode, not conversion
 
 # Decisions
 
@@ -63,6 +64,7 @@ or re-litigated.
 * [The continuation-tail clip must be re-encoded](pitfalls/continuation-tail-clip-encoding.md) - an input seek leaves frame 0 off t=0 and the zero-tolerance extractor refuses it
 * [URLSession's per-task delegate never reports download progress](pitfalls/urlsession-task-delegate-has-no-download-progress.md) - download(for:delegate:) calls didWriteData zero times; needs a session delegate on an explicit downloadTask, which then puts error pages on disk
 * [The duration head ignores durations written in the prompt](pitfalls/duration-head-does-not-read-written-durations.md) - a "3 seconds." prefix returns byte-identical output to no prefix; it regresses from connector tokens and never sees the text
+* [The conv VAE decoder padded every conv with reflect instead of zeros](pitfalls/conv-decoder-wrong-spatial-padding.md) - every clip's default decode path; 17-27% relative error against the reference, ~1e-6 once fixed; found by the new element-wise parity harness (issue #57)
 * [The text connector's register replacement reordered tokens instead of substituting in place](pitfalls/connector-register-replacement-reorders-tokens.md) - every real (left-padded) prompt hit this; 135% relative error against the reference, 0.15% once fixed
 
 # Investigations

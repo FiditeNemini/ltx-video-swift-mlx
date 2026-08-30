@@ -2,6 +2,26 @@
 
 ## 2026-08-30
 
+* **Creation**: [The conv VAE decoder padded every conv with reflect instead
+  of zeros](/docs/knowledge/pitfalls/conv-decoder-wrong-spatial-padding.md) —
+  found by a new element-wise parity harness against Lightricks' own
+  `ConvVideoDecoder` (issue #57), the first of six planned sub-tasks. 17-27%
+  relative error on the default decode path used by every clip this repo has
+  ever produced, collapsing to ~1e-6 once the five conv sites in
+  `VideoDecoder.swift` got the checkpoint's actual `spatial_padding_mode:
+  "zeros"` instead of the framework's fallback default. Corrects a wrong
+  claim in [the D2S-residual pitfall](/docs/knowledge/pitfalls/decoder-d2s-residual-false.md),
+  which had the padding modes backwards.
+
+* **Validation**: Sub-task 2 of issue #57 — `ConvVAEEncoderParityTests` pins the
+  conv VAE encoder (every retake, i2v conditioning image, and LipDub video
+  reference goes through it) against Lightricks' own `VideoEncoder`
+  (`scripts/conv_video_encoder_reference.py`). Unlike the decoder (sub-task 1,
+  PR #76), this one was clean on the first run: raw means and the fully
+  normalized output both match to ~3e-6. The encoder's `_res`-suffixed
+  space-to-depth downsamplers and `.zeros` padding, previously only
+  documented, are now verified rather than assumed.
+
 * **Creation**: [The text connector's register replacement reordered tokens
   instead of substituting in place](/docs/knowledge/pitfalls/connector-register-replacement-reorders-tokens.md)
   — sub-task 3 of issue #57's parity-harness breakdown (sub-task 1: conv VAE
@@ -13,6 +33,12 @@
   1024-token window, this was live on essentially every generation this repo
   has produced: 135% relative error on the connector output, 0.15% after the
   fix.
+
+* **Creation**: [Vectorized RGBA pixel conversion vs. the scalar loop it
+  replaced](/docs/knowledge/benchmarks/pixel-conversion-vectorization-2026-08.md)
+  — `loadVideo` on a 121-frame 768x512 clip: ~8.15s to ~1.0s (~8x). The
+  remaining ~1s is AVFoundation decode overhead, not pixel conversion —
+  documented as the next lever if `loadVideo` needs to be faster still.
 
 * **Update**: Split the mid-run unload gating per component in
   [the unload-gating decision](/docs/knowledge/decisions/unload-gating-semantics.md).
