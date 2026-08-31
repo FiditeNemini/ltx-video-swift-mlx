@@ -72,7 +72,9 @@ than the retraction.
 
 * **float32, deliberately.** Upstream documents that bf16 accumulation across the
   ~108 sequential convolutions degrades spectral metrics by 40–90%. This is the
-  one stage where the pipeline departs from its bf16 default.
+  one stage where the pipeline departs from its bf16 default — though the cast
+  originally only reached the runtime input, not the checkpoint weights
+  themselves; see [vocoder-weights-stayed-bf16.md](vocoder-weights-stayed-bf16.md).
 * **No filter is recomputed.** Every Kaiser kernel and DFT basis is a persistent
   buffer in the checkpoint, so loading them verbatim removes any window-convention
   drift. The single exception is the BWE skip resampler (`persistent=False`

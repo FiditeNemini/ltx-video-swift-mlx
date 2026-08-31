@@ -1,5 +1,21 @@
 # Directory Update Log
 
+## 2026-08-31
+
+* **Creation**: [The vocoder's float32 policy only ever cast the runtime
+  input, never its checkpoint weights](/docs/knowledge/pitfalls/vocoder-weights-stayed-bf16.md) —
+  sub-task 4 of issue #57's breakdown. `AudioVAEVocoderParityTests`, the
+  first element-wise reference for the real audio decode chain
+  (`AudioVAE.decode` → mel → `LTXVocoderWithBWE`, against Lightricks' own
+  `AudioDecoder` + `VocoderWithBWE`), found the BigVGAN vocoder's `Conv1d`/
+  `ConvTransposed1d` weights still at the checkpoint's native bf16 despite a
+  comment claiming float32 execution throughout — only the runtime
+  activation was ever cast. 2.0-8.8% relative error on the vocoder/BWE taps
+  and the final waveform, collapsing to ~1e-5/1e-4 once
+  `BigVGANWeightLoader.load` casts every loaded parameter to float32. The
+  AudioVAE decoder upstream (sub-task's other half) was clean on the first
+  run: all six taps ~1e-7 against the reference.
+
 ## 2026-08-30
 
 * **Creation**: [The conv VAE decoder padded every conv with reflect instead
