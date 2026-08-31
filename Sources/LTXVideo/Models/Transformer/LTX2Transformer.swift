@@ -309,9 +309,11 @@ class LTX2Transformer: Module {
 
         // --- Cross-modal timestep embeddings ---
         // Python `MultiModalTransformerArgsPreprocessor.prepare(modality, cross_modality)`
-        // (transformer_args.py `_prepare_cross_attention_timestep`) feeds each cross-modal
-        // AdaLN pair asymmetrically, and DualStreamAudioParityTests.crossModalAdaLNInputsMatchReference
-        // pins down which side gets which:
+        // (`ltx-core/model/transformer/transformer_args.py:373-411`,
+        // `_prepare_cross_attention_timestep`; consumed at `transformer.py:292 / :302 /
+        // :325 / :334`) feeds each cross-modal AdaLN pair asymmetrically, and
+        // DualStreamAudioParityTests.crossModalAdaLNInputsMatchReference pins down
+        // which side gets which:
         //   scale_shift_timestep <- modality_timesteps   (THIS modality's OWN per-token timesteps)
         //   gate_noise_timestep  <- cross_modality.sigma  (the OTHER modality's scalar sigma)
         // i.e. av_ca_{video,audio}_scale_shift_adaln_single take their OWN stream's per-token
