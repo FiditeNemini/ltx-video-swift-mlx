@@ -130,9 +130,10 @@ struct AudioVAEVocoderParityTests {
         // prelude to reach the BWE generator's own input.
         var lowNLC = low.transposed(0, 2, 1)  // back to (B, T, 2) for the pad/reshape below
         let lowLength = lowNLC.dim(1)
-        let remainder = lowLength % 80
+        let hopLength = vocoder.hopLength
+        let remainder = lowLength % hopLength
         if remainder != 0 {
-            lowNLC = MLX.padded(lowNLC, widths: [.init((0, 0)), .init((0, 80 - remainder)), .init((0, 0))])
+            lowNLC = MLX.padded(lowNLC, widths: [.init((0, 0)), .init((0, hopLength - remainder)), .init((0, 0))])
         }
         let batch = lowNLC.dim(0)
         let channels = lowNLC.dim(2)
