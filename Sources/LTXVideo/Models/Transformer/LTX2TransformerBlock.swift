@@ -31,14 +31,31 @@ struct AudioTransformerArgs {
     var embeddedTimestep: MLXArray?
 
     // Cross-modal modulation (from global timestep embeddings)
+    //
+    // Scale/shift and gate are genuinely different shapes upstream — not a
+    // stylistic split. `_prepare_cross_attention_timestep` (ltx-core
+    // transformer_args.py) feeds the scale/shift AdaLN this modality's own
+    // PER-TOKEN timesteps (reshaped back to one value per token), but feeds
+    // the gate AdaLN the cross modality's scalar `sigma` (one value for the
+    // whole batch, broadcast to every token). Fusing them into one (B,1,5,D)
+    // tensor — as an earlier version of this struct did — silently forces
+    // the per-token scale/shift down to a single broadcast value too.
 
-    /// Video cross-modal scale/shift + gate: (B, 1, 5, D_video) for a2v/v2a modulation
-    /// Indices 0-3: scale/shift, index 4: gate (global timestep embedding)
+    /// Video cross-modal scale/shift: (B, T_video, 4, D_video), one value per
+    /// *video* token — own-modality per-token timesteps, not a global scalar.
     var crossVideoScaleShift: MLXArray
 
-    /// Audio cross-modal scale/shift + gate: (B, 1, 5, D_audio)
-    /// Indices 0-3: scale/shift, index 4: gate (global timestep embedding)
+    /// Video cross-modal gate: (B, 1, 1, D_video) — cross-modality (audio)
+    /// scalar sigma, broadcast uniformly over every video token.
+    var crossVideoGate: MLXArray
+
+    /// Audio cross-modal scale/shift: (B, T_audio, 4, D_audio), one value per
+    /// *audio* token.
     var crossAudioScaleShift: MLXArray
+
+    /// Audio cross-modal gate: (B, 1, 1, D_audio) — cross-modality (video)
+    /// scalar sigma, broadcast uniformly over every audio token.
+    var crossAudioGate: MLXArray
 
     /// Cross-modal video RoPE (for KV in v2a, Q in a2v cross-attention)
     var crossVideoRoPE: (cos: MLXArray, sin: MLXArray)
@@ -293,23 +310,32 @@ class LTX2TransformerBlock: Module {
         }
 
         // Phase 5-6: Cross-modal attention (A2V and V2A)
-        // Compute cross-modal modulation from per-block SST + global timestep embeddings
-        let videoCA = videoA2VCrossAttnSST.reshaped([1, 1, 5, videoDim]) + audioArgs.crossVideoScaleShift
-        let audioCA = audioA2VCrossAttnSST.reshaped([1, 1, 5, audioDim]) + audioArgs.crossAudioScaleShift
+        // Scale/shift (per-block learned table rows 0-3) combines with the
+        // PER-TOKEN own-modality embedding; gate (row 4) combines with the
+        // scalar cross-modality embedding — see AudioTransformerArgs' doc
+        // comment for why these can't be fused into one broadcast tensor.
+        let videoScaleShiftCA = videoA2VCrossAttnSST[0 ..< 4, 0...].reshaped([1, 1, 4, videoDim])
+            + audioArgs.crossVideoScaleShift
+        let videoGateCA = videoA2VCrossAttnSST[4 ..< 5, 0...].reshaped([1, 1, 1, videoDim])
+            + audioArgs.crossVideoGate
+        let audioScaleShiftCA = audioA2VCrossAttnSST[0 ..< 4, 0...].reshaped([1, 1, 4, audioDim])
+            + audioArgs.crossAudioScaleShift
+        let audioGateCA = audioA2VCrossAttnSST[4 ..< 5, 0...].reshaped([1, 1, 1, audioDim])
+            + audioArgs.crossAudioGate
 
         // Video modulation values
-        let vA2VScale = videoCA[0..., 0..., 0, 0...]
-        let vA2VShift = videoCA[0..., 0..., 1, 0...]
-        let vV2AScale = videoCA[0..., 0..., 2, 0...]
-        let vV2AShift = videoCA[0..., 0..., 3, 0...]
-        let vA2VGate = videoCA[0..., 0..., 4, 0...]
+        let vA2VScale = videoScaleShiftCA[0..., 0..., 0, 0...]
+        let vA2VShift = videoScaleShiftCA[0..., 0..., 1, 0...]
+        let vV2AScale = videoScaleShiftCA[0..., 0..., 2, 0...]
+        let vV2AShift = videoScaleShiftCA[0..., 0..., 3, 0...]
+        let vA2VGate = videoGateCA[0..., 0..., 0, 0...]
 
         // Audio modulation values
-        let aA2VScale = audioCA[0..., 0..., 0, 0...]
-        let aA2VShift = audioCA[0..., 0..., 1, 0...]
-        let aV2AScale = audioCA[0..., 0..., 2, 0...]
-        let aV2AShift = audioCA[0..., 0..., 3, 0...]
-        let aV2AGate = audioCA[0..., 0..., 4, 0...]
+        let aA2VScale = audioScaleShiftCA[0..., 0..., 0, 0...]
+        let aA2VShift = audioScaleShiftCA[0..., 0..., 1, 0...]
+        let aV2AScale = audioScaleShiftCA[0..., 0..., 2, 0...]
+        let aV2AShift = audioScaleShiftCA[0..., 0..., 3, 0...]
+        let aV2AGate = audioGateCA[0..., 0..., 0, 0...]
 
         // Norm video and audio for cross-modal
         let normVCA = audioToVideoNorm(videoX)
@@ -357,7 +383,9 @@ class LTX2TransformerBlock: Module {
                 contextMask: audioArgs.contextMask,
                 embeddedTimestep: audioArgs.embeddedTimestep,
                 crossVideoScaleShift: audioArgs.crossVideoScaleShift,
+                crossVideoGate: audioArgs.crossVideoGate,
                 crossAudioScaleShift: audioArgs.crossAudioScaleShift,
+                crossAudioGate: audioArgs.crossAudioGate,
                 crossVideoRoPE: audioArgs.crossVideoRoPE,
                 crossAudioRoPE: audioArgs.crossAudioRoPE,
                 videoPromptTimesteps: audioArgs.videoPromptTimesteps,

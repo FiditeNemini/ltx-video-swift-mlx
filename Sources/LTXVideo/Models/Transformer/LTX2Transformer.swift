@@ -281,47 +281,9 @@ class LTX2Transformer: Module {
             projectedAudioCtx = audioContext.reshaped([batchSize, -1, audioDim])
         }
 
-        // --- Prompt AdaLN for cross-attention (LTX-2.3) ---
-        // Prompt AdaLN modulates text context, so use scalar timestep
-        // even when video uses per-token timesteps (I2V conditioning mask)
-        var videoPromptTs: MLXArray? = nil
-        var audioPromptTs: MLXArray? = nil
-        if let promptAdaln = promptAdalnSingle {
-            let scalarVideoTs: MLXArray
-            if videoTimesteps.ndim > 1 {
-                scalarVideoTs = videoTimesteps.max(axis: 1)  // (B,)
-            } else {
-                scalarVideoTs = videoTimesteps  // Already scalar (B,)
-            }
-            let scaledTs = scalarVideoTs * Float(config.timestepScaleMultiplier)
-            let (pEmb, _) = promptAdaln(scaledTs.flattened())
-            videoPromptTs = pEmb.reshaped([batchSize, -1, 2, videoDim])
-        }
-        if let audioPromptAdaln = audioPromptAdalnSingle {
-            let scalarAudioTs: MLXArray
-            if audioTimesteps.ndim > 1 {
-                scalarAudioTs = audioTimesteps.max(axis: 1)
-            } else {
-                scalarAudioTs = audioTimesteps
-            }
-            let scaledTs = scalarAudioTs * Float(config.timestepScaleMultiplier)
-            let (apEmb, _) = audioPromptAdaln(scaledTs.flattened())
-            audioPromptTs = apEmb.reshaped([batchSize, -1, 2, audioDim])
-        }
-
-        // --- Cross-modal timestep embeddings ---
-        // Python `MultiModalTransformerArgsPreprocessor.prepare(modality, cross_modality)`:
-        // each modality's cross-modal AdaLN is fed the OPPOSITE modality's scalar `sigma`
-        // (Modality.sigma, shape (B,)) — NOT this modality's per-token `timesteps` (B, T).
-        // The model output is `(B, 1, 4, D)` (broadcast over all tokens of *this* modality).
-        // Reference: ltx-core/model/transformer/transformer_args.py:241-258 — `cross_timestep =
-        // cross_modality.sigma.view(...)`. The result is stored on `modality.cross_*_timestep`
-        // and consumed by transformer.py:292 / :302 / :325 / :334.
-        //
-        // Additionally, Python applies `av_ca_factor = av_ca_timestep_scale_multiplier /
-        // timestep_scale_multiplier` to the GATE input only (see transformer_args.py:284).
-        // With defaults (av_ca_mult=1, ts_mult=1000), gate input is `sigma * 1`, while
-        // scale_shift input is `sigma * 1000`.
+        // Both the prompt AdaLN below and the cross-modal gate AdaLNs further down
+        // need each modality's per-token timesteps collapsed to one scalar per
+        // batch — computed once here and shared, rather than twice.
         let scalarVideoSigma: MLXArray = videoTimesteps.ndim > 1
             ? videoTimesteps.max(axis: 1)
             : videoTimesteps
@@ -329,8 +291,49 @@ class LTX2Transformer: Module {
             ? audioTimesteps.max(axis: 1)
             : audioTimesteps
 
-        let avCaScaleShiftInputV = (scalarAudioSigma * Float(config.timestepScaleMultiplier)).flattened()
-        let avCaScaleShiftInputA = (scalarVideoSigma * Float(config.timestepScaleMultiplier)).flattened()
+        // --- Prompt AdaLN for cross-attention (LTX-2.3) ---
+        // Prompt AdaLN modulates text context, so use scalar timestep
+        // even when video uses per-token timesteps (I2V conditioning mask)
+        var videoPromptTs: MLXArray? = nil
+        var audioPromptTs: MLXArray? = nil
+        if let promptAdaln = promptAdalnSingle {
+            let scaledTs = scalarVideoSigma * Float(config.timestepScaleMultiplier)
+            let (pEmb, _) = promptAdaln(scaledTs.flattened())
+            videoPromptTs = pEmb.reshaped([batchSize, -1, 2, videoDim])
+        }
+        if let audioPromptAdaln = audioPromptAdalnSingle {
+            let scaledTs = scalarAudioSigma * Float(config.timestepScaleMultiplier)
+            let (apEmb, _) = audioPromptAdaln(scaledTs.flattened())
+            audioPromptTs = apEmb.reshaped([batchSize, -1, 2, audioDim])
+        }
+
+        // --- Cross-modal timestep embeddings ---
+        // Python `MultiModalTransformerArgsPreprocessor.prepare(modality, cross_modality)`
+        // (`ltx-core/model/transformer/transformer_args.py:373-411`,
+        // `_prepare_cross_attention_timestep`; consumed at `transformer.py:292 / :302 /
+        // :325 / :334`) feeds each cross-modal AdaLN pair asymmetrically, and
+        // DualStreamAudioParityTests.crossModalAdaLNInputsMatchReference pins down
+        // which side gets which:
+        //   scale_shift_timestep <- modality_timesteps   (THIS modality's OWN per-token timesteps)
+        //   gate_noise_timestep  <- cross_modality.sigma  (the OTHER modality's scalar sigma)
+        // i.e. av_ca_{video,audio}_scale_shift_adaln_single take their OWN stream's per-token
+        // timesteps (own-sigma relative error ~3e-6/8e-7 against the reference vs. ~0.55/0.26
+        // for the opposite sigma) — reshaped back to `(B, T, 4, D)`, ONE VALUE PER TOKEN, not a
+        // single value broadcast over the modality (`transformer_args.py`: the flattened
+        // per-token input round-trips through `.view(batch_size, -1, ...)`, preserving T).
+        // av_ca_{a2v,v2a}_gate_adaln_single instead take the OTHER stream's scalar `sigma`
+        // (cross-sigma error ~1.5e-7/3.4e-8 vs. ~0.066/0.015 for their own), broadcast uniformly
+        // over every token of `(B, 1, 1, D)` — there is no separate `sigma` input here, so it is
+        // approximated as `timesteps.max(axis: 1)`: real per-token denoising tokens all share
+        // the step's current sigma, while conditioning/guide tokens are pinned below it, so the
+        // max recovers the active sigma exactly.
+        //
+        // Additionally, Python applies `av_ca_factor = av_ca_timestep_scale_multiplier /
+        // timestep_scale_multiplier` to the GATE input only (see transformer_args.py:284).
+        // With defaults (av_ca_mult=1, ts_mult=1000), gate input is `sigma * 1`, while
+        // scale_shift input is `sigma * 1000`.
+        let avCaScaleShiftInputV = (videoTimesteps * Float(config.timestepScaleMultiplier)).flattened()
+        let avCaScaleShiftInputA = (audioTimesteps * Float(config.timestepScaleMultiplier)).flattened()
         // Gate input scaled by av_ca_factor (= av_ca_mult / ts_mult; default 1/1000).
         // av_ca_timestep_scale_multiplier is hard-coded to 1 (Python default; never set in
         // any LTX-2.3 config). With ts_mult = config.timestepScaleMultiplier:
@@ -339,20 +342,14 @@ class LTX2Transformer: Module {
         let avCaGateInputA = scalarVideoSigma.flattened()
 
         let (crossVideoSSEmb, _) = avCrossAttnVideoScaleShift(avCaScaleShiftInputV)
-        let crossVideoSSReshaped = crossVideoSSEmb.reshaped([batchSize, 1, 4, videoDim])
+        let crossVideoSSReshaped = crossVideoSSEmb.reshaped([batchSize, -1, 4, videoDim])
         let (crossVideoGateEmb, _) = avCrossAttnVideoA2VGate(avCaGateInputV)
-        let crossVideoSSFull = MLX.concatenated([
-            crossVideoSSReshaped,
-            crossVideoGateEmb.reshaped([batchSize, 1, 1, videoDim])
-        ], axis: 2)
+        let crossVideoGateReshaped = crossVideoGateEmb.reshaped([batchSize, 1, 1, videoDim])
 
         let (crossAudioSSEmb, _) = avCrossAttnAudioScaleShift(avCaScaleShiftInputA)
-        let crossAudioSSReshaped = crossAudioSSEmb.reshaped([batchSize, 1, 4, audioDim])
+        let crossAudioSSReshaped = crossAudioSSEmb.reshaped([batchSize, -1, 4, audioDim])
         let (crossAudioGateEmb, _) = avCrossAttnAudioV2AGate(avCaGateInputA)
-        let crossAudioSSFull = MLX.concatenated([
-            crossAudioSSReshaped,
-            crossAudioGateEmb.reshaped([batchSize, 1, 1, audioDim])
-        ], axis: 2)
+        let crossAudioGateReshaped = crossAudioGateEmb.reshaped([batchSize, 1, 1, audioDim])
 
         // --- Prepare attention masks ---
         let preparedVideoMask = prepareAttentionMask(videoContextMask)
@@ -444,8 +441,10 @@ class LTX2Transformer: Module {
             positionalEmbeddings: audioRoPE,
             contextMask: preparedAudioMask,
             embeddedTimestep: audioEmbeddedTs,
-            crossVideoScaleShift: crossVideoSSFull,
-            crossAudioScaleShift: crossAudioSSFull,
+            crossVideoScaleShift: crossVideoSSReshaped,
+            crossVideoGate: crossVideoGateReshaped,
+            crossAudioScaleShift: crossAudioSSReshaped,
+            crossAudioGate: crossAudioGateReshaped,
             crossVideoRoPE: crossVideoRoPE,
             crossAudioRoPE: crossAudioRoPE,
             videoPromptTimesteps: videoPromptTs,

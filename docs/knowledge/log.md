@@ -1,5 +1,46 @@
 # Directory Update Log
 
+## 2026-08-31 (3)
+
+* **Correction (2nd)**: [Cross-modal AdaLN sigma swap](/docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md) —
+  a `/code-review` gap-sweep on the PR carrying the sub-task 5 fix above
+  caught a second, independent defect in the same lines, verified against
+  `ltx_core`'s `_prepare_cross_attention_timestep`: the cross-modal
+  scale/shift AdaLN input was collapsed to one value per modality via
+  `.max(axis: 1)` and broadcast to every token, when the reference keeps it
+  genuinely per-token. Only the gate is a true scalar. Matters wherever
+  `AppendedGuideTokens.swift`'s `buildExtendedTimestep` already builds
+  non-uniform per-token timesteps in production — every keyframe, IC-LoRA and
+  LipDub-audio-reference generation. Required splitting
+  `AudioTransformerArgs.crossVideoScaleShift`/`crossAudioScaleShift` (now
+  per-token `(B,T,4,D)`) from new `crossVideoGate`/`crossAudioGate` fields
+  (scalar-broadcast `(B,1,1,D)`) — the two could no longer share one fused
+  `(B,1,5,D)` tensor. The parity harness's fixture (both Python and Swift)
+  was updated to non-uniform per-token timesteps to actually exercise this;
+  reverting the fix locally confirmed the new fixture catches it (clean
+  ~1e-6 → 1.1e-3/5.4e-3 collapsed), which also revealed the suite's original
+  2% threshold was too loose to have caught either regression — tightened to
+  2e-4, matching `TransformerParityTests`'s video-only precision.
+
+## 2026-08-31 (2)
+
+* **Correction**: [Cross-modal AdaLN sigma swap](/docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md) —
+  sub-task 5 of issue #57's breakdown. The first element-wise reference for
+  `LTX2Transformer`'s dual video/audio blocks (`DualStreamAudioParityTests`,
+  extending `scripts/transformer_reference.py` with an "av" variant, small
+  dims, *deliberately different* sigmas per stream — equal sigmas make a
+  sigma swap a no-op) found the May 2026 fix for this exact file was itself
+  half-backwards: only the cross-modal GATE AdaLNs want the opposite
+  modality's sigma; the SCALE/SHIFT AdaLNs want their own. The May fix
+  pointed both the same way, correctly fixing the gate but breaking
+  scale/shift. Per-module isolation: scale/shift own-sigma error 3e-6/8e-7
+  vs cross-sigma 0.55/0.26; gate cross-sigma error 1.5e-7/3.4e-8 vs own-sigma
+  0.066/0.015. Full output error 3.6e-3/8.2e-3 → 2.1e-6/1.2e-6 — both already
+  under the 2% pass/fail threshold even with the bug present, confirming the
+  plan's warning that output-only thresholds aren't sensitive enough for this
+  component. Real end-to-end check (`retake --modality audio`, before/after,
+  same seed): RMS 0.045 → 0.0097, 0-2 kHz band down 16.6 dB.
+
 ## 2026-08-31
 
 * **Creation**: [The vocoder's float32 policy only ever cast the runtime

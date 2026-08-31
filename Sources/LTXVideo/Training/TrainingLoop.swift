@@ -386,8 +386,14 @@ public class LoRATrainer {
             let sigmaFlat = sigma.squeezed(axis: 1)  // (batchSize,) for use as scalar timestep
 
             if let ltx2 = model as? LTX2Transformer {
-                // LTX2 requires both video+audio inputs; pass zero audio for video-only training
-                // Audio timestep = 0 disables cross-modal gates, preventing audio pollution
+                // LTX2 requires both video+audio inputs; pass zero audio for video-only training.
+                // Audio timestep = 0 disables the a2v/v2a cross-modal GATES (fed the other
+                // modality's sigma) — the cross-modal scale/shift AdaLNs are unaffected either
+                // way, since they take each modality's own timesteps, not the other's
+                // (docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md). Before
+                // that fix, video's scale/shift AdaLN was ALSO fed audio's fixed zero here,
+                // pinning it at a training-step-invariant value instead of tracking the real
+                // noise schedule — the fix incidentally closes that train/inference mismatch too.
                 let dummyAudioLatent = MLXArray.zeros([batchSize, 1, 128]).asType(DType.bfloat16)
                 let zeroTimestep = MLXArray.zeros([batchSize]).asType(sigmaFlat.dtype)
                 let (predVideo, _) = ltx2(
