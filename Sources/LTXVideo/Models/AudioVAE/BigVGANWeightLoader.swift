@@ -63,6 +63,12 @@ enum BigVGANWeightLoader {
                 + unmatched.sorted().prefix(5).joined(separator: ", "))
         }
 
+        // The reference forces float32 for this entire stage — its own docstring:
+        // bf16 accumulation across ~108 sequential convolutions degrades spectral
+        // metrics 40-90%. Casting only the runtime input (as callAsFunction did)
+        // still leaves every conv weight at the checkpoint's native bf16, so the
+        // convolutions themselves keep accumulating at reduced precision.
+        for key in updates.keys { updates[key] = updates[key]!.asType(.float32) }
         model.update(parameters: ModuleParameters.unflattened(updates))
         eval(model.parameters())
         LTXDebug.log("[Vocoder] applied \(updates.count) BigVGAN weights")

@@ -93,7 +93,7 @@ final class LTXVocoderWithBWE: Module, LTXVocoding {
 
     let inputSampleRate: Int
     let outputSampleRate: Int
-    private let hopLength: Int
+    let hopLength: Int
     private let resampler: UpSample1d
 
     init(inputSampleRate: Int = 16000, outputSampleRate: Int = 48000, hopLength: Int = 80) {
