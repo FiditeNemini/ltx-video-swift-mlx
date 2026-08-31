@@ -310,13 +310,17 @@ class LTX2Transformer: Module {
         }
 
         // --- Cross-modal timestep embeddings ---
-        // Python `MultiModalTransformerArgsPreprocessor.prepare(modality, cross_modality)`:
-        // each modality's cross-modal AdaLN is fed the OPPOSITE modality's scalar `sigma`
-        // (Modality.sigma, shape (B,)) — NOT this modality's per-token `timesteps` (B, T).
-        // The model output is `(B, 1, 4, D)` (broadcast over all tokens of *this* modality).
-        // Reference: ltx-core/model/transformer/transformer_args.py:241-258 — `cross_timestep =
-        // cross_modality.sigma.view(...)`. The result is stored on `modality.cross_*_timestep`
-        // and consumed by transformer.py:292 / :302 / :325 / :334.
+        // Python `MultiModalTransformerArgsPreprocessor.prepare(modality, cross_modality)`
+        // (transformer_args.py `_prepare_cross_attention_timestep`) feeds each cross-modal
+        // AdaLN pair asymmetrically, and DualStreamAudioParityTests.crossModalAdaLNInputsMatchReference
+        // pins down which side gets which:
+        //   scale_shift_timestep <- modality_timesteps   (THIS modality's own sigma)
+        //   gate_noise_timestep  <- cross_modality.sigma  (the OTHER modality's sigma)
+        // i.e. av_ca_{video,audio}_scale_shift_adaln_single take their OWN stream's sigma
+        // (own-sigma relative error ~3e-6/8e-7 against the reference vs. ~0.55/0.26 for the
+        // opposite sigma), while av_ca_{a2v,v2a}_gate_adaln_single take the OTHER stream's
+        // (cross-sigma error ~1.5e-7/3.4e-8 vs. ~0.066/0.015 for their own). The model output
+        // is `(B, 1, 4, D)` (broadcast over all tokens of *this* modality).
         //
         // Additionally, Python applies `av_ca_factor = av_ca_timestep_scale_multiplier /
         // timestep_scale_multiplier` to the GATE input only (see transformer_args.py:284).
@@ -329,8 +333,8 @@ class LTX2Transformer: Module {
             ? audioTimesteps.max(axis: 1)
             : audioTimesteps
 
-        let avCaScaleShiftInputV = (scalarAudioSigma * Float(config.timestepScaleMultiplier)).flattened()
-        let avCaScaleShiftInputA = (scalarVideoSigma * Float(config.timestepScaleMultiplier)).flattened()
+        let avCaScaleShiftInputV = (scalarVideoSigma * Float(config.timestepScaleMultiplier)).flattened()
+        let avCaScaleShiftInputA = (scalarAudioSigma * Float(config.timestepScaleMultiplier)).flattened()
         // Gate input scaled by av_ca_factor (= av_ca_mult / ts_mult; default 1/1000).
         // av_ca_timestep_scale_multiplier is hard-coded to 1 (Python default; never set in
         // any LTX-2.3 config). With ts_mult = config.timestepScaleMultiplier:

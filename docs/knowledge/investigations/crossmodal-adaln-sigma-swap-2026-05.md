@@ -1,7 +1,7 @@
 ---
 type: Investigation
 title: LipDub mouth-modulation failure — cross-modal AdaLN sigma swap (May 2026)
-description: Each cross-modal AdaLN was fed its OWN modality's sigma instead of the OTHER's, and the gate input was scaled 1000× wrong; two plausible hypotheses (RoPE negatives, LoRA delta) were numerically refuted along the way.
+description: Each cross-modal AdaLN was fed its OWN modality's sigma instead of the OTHER's, and the gate input was scaled 1000× wrong; two plausible hypotheses (RoPE negatives, LoRA delta) were numerically refuted along the way. Follow-up (2026-08-31): the scale/shift half of the fix was backwards — see the update at the end.
 tags: [lipdub, adaln, cross-modal, debugging, root-cause]
 timestamp: 2026-07-16T00:00:00Z
 ---
@@ -48,3 +48,46 @@ preservation, not lip-sync, and is numerical accumulation, not a code bug.
 
 The [stereo pitfall](/docs/knowledge/pitfalls/audio-must-stay-stereo.md) was
 root-caused in the same campaign.
+
+# Update (2026-08-31): the "wrong sigma source" fix above was half-backwards
+
+Issue #57 sub-task 5 built the first *element-wise* reference for this exact
+code — a small `LTXModel(model_type=AudioVideo)` run through Lightricks' own
+forward pass, with **deliberately different sigmas per stream** (0.7 video,
+0.3 audio; equal sigmas make a swap a no-op, which is exactly why this needed
+a harness rather than eyeballing a real generation). It found that bullet 1
+above was itself wrong: only the **gate** AdaLNs
+(`av_ca_{a2v,v2a}_gate_adaln_single`) take the *opposite* modality's sigma.
+The **scale/shift** AdaLNs (`av_ca_{video,audio}_scale_shift_adaln_single`)
+take the modality's **own** sigma — the May fix pointed both pairs the same
+way, so it corrected the gate (previously own-sigma, now fixed) but broke the
+scale/shift pair (previously already correct via the original bug's
+symmetry, now cross-sigma and wrong).
+
+Measured directly against each AdaLN module in isolation
+(`DualStreamAudioParityTests.crossModalAdaLNInputsMatchReference`):
+
+| module | own-sigma error | cross-sigma error | reference uses |
+|---|---|---|---|
+| `av_ca_video_scale_shift_adaln_single` | 3.1e-6 | 0.545 | own |
+| `av_ca_audio_scale_shift_adaln_single` | 7.9e-7 | 0.262 | own |
+| `av_ca_a2v_gate_adaln_single` | 0.066 | 1.5e-7 | cross |
+| `av_ca_v2a_gate_adaln_single` | 0.015 | 3.4e-8 | cross |
+
+On the full forward pass this dropped the video/audio output relative error
+from 3.6e-3 / 8.2e-3 to 2.1e-6 / 1.2e-6 — both were already under the
+harness's 2% pass/fail threshold even with the bug present, which is exactly
+the plan's warning that a combined-output threshold is not sensitive enough
+here: the fix would have shipped unverified on output magnitude alone.
+
+**Real end-to-end sanity check**: `retake --modality audio` (video frozen at
+σ=0, audio denoising from σ=1 — the same divergent-sigma shape as LipDub) on
+the same source clip and seed, before and after, at the real 22B scale: RMS
+0.045 → 0.0097 (−4.6×), peak 0.125 → 0.040, and the 0-2 kHz band down 16.6 dB.
+A real, large, audible difference in exactly the scenario this bug requires
+divergent sigma to express — consistent with the May investigation's own
+account of why plain T2V+audio (matched sigma) never showed it.
+
+Fix: `Sources/LTXVideo/Models/Transformer/LTX2Transformer.swift`, swap only
+the scale/shift assignment back to own-modality sigma, leaving the gate
+assignment (already fixed in May) untouched.

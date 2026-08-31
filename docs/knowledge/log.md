@@ -1,5 +1,24 @@
 # Directory Update Log
 
+## 2026-08-31 (2)
+
+* **Correction**: [Cross-modal AdaLN sigma swap](/docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md) —
+  sub-task 5 of issue #57's breakdown. The first element-wise reference for
+  `LTX2Transformer`'s dual video/audio blocks (`DualStreamAudioParityTests`,
+  extending `scripts/transformer_reference.py` with an "av" variant, small
+  dims, *deliberately different* sigmas per stream — equal sigmas make a
+  sigma swap a no-op) found the May 2026 fix for this exact file was itself
+  half-backwards: only the cross-modal GATE AdaLNs want the opposite
+  modality's sigma; the SCALE/SHIFT AdaLNs want their own. The May fix
+  pointed both the same way, correctly fixing the gate but breaking
+  scale/shift. Per-module isolation: scale/shift own-sigma error 3e-6/8e-7
+  vs cross-sigma 0.55/0.26; gate cross-sigma error 1.5e-7/3.4e-8 vs own-sigma
+  0.066/0.015. Full output error 3.6e-3/8.2e-3 → 2.1e-6/1.2e-6 — both already
+  under the 2% pass/fail threshold even with the bug present, confirming the
+  plan's warning that output-only thresholds aren't sensitive enough for this
+  component. Real end-to-end check (`retake --modality audio`, before/after,
+  same seed): RMS 0.045 → 0.0097, 0-2 kHz band down 16.6 dB.
+
 ## 2026-08-31
 
 * **Creation**: [The vocoder's float32 policy only ever cast the runtime
