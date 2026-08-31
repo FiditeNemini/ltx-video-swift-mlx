@@ -1,5 +1,27 @@
 # Directory Update Log
 
+## 2026-08-31 (3)
+
+* **Correction (2nd)**: [Cross-modal AdaLN sigma swap](/docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md) —
+  a `/code-review` gap-sweep on the PR carrying the sub-task 5 fix above
+  caught a second, independent defect in the same lines, verified against
+  `ltx_core`'s `_prepare_cross_attention_timestep`: the cross-modal
+  scale/shift AdaLN input was collapsed to one value per modality via
+  `.max(axis: 1)` and broadcast to every token, when the reference keeps it
+  genuinely per-token. Only the gate is a true scalar. Matters wherever
+  `AppendedGuideTokens.swift`'s `buildExtendedTimestep` already builds
+  non-uniform per-token timesteps in production — every keyframe, IC-LoRA and
+  LipDub-audio-reference generation. Required splitting
+  `AudioTransformerArgs.crossVideoScaleShift`/`crossAudioScaleShift` (now
+  per-token `(B,T,4,D)`) from new `crossVideoGate`/`crossAudioGate` fields
+  (scalar-broadcast `(B,1,1,D)`) — the two could no longer share one fused
+  `(B,1,5,D)` tensor. The parity harness's fixture (both Python and Swift)
+  was updated to non-uniform per-token timesteps to actually exercise this;
+  reverting the fix locally confirmed the new fixture catches it (clean
+  ~1e-6 → 1.1e-3/5.4e-3 collapsed), which also revealed the suite's original
+  2% threshold was too loose to have caught either regression — tightened to
+  2e-4, matching `TransformerParityTests`'s video-only precision.
+
 ## 2026-08-31 (2)
 
 * **Correction**: [Cross-modal AdaLN sigma swap](/docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md) —

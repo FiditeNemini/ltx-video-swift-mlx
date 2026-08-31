@@ -50,6 +50,27 @@ struct DualStreamAudioParityTests {
     static let sigmaVideo: Float = 0.7
     static let sigmaAudio: Float = 0.3
 
+    /// Mirrors `scripts/transformer_reference.py`'s "av" branch exactly: half the
+    /// video tokens and one of five audio tokens held below the modality's active
+    /// sigma, simulating I2V/keyframe/LipDub conditioning tokens mixed with real
+    /// denoising ones. Uniform per-token timesteps can't distinguish a port that
+    /// collapses them to one broadcast value from one that doesn't — see the
+    /// cross_scale_shift_video/audio taps this feeds into
+    /// `crossModalAdaLNInputsMatchReference`.
+    static func nonUniformTimesteps() -> (video: MLXArray, audio: MLXArray) {
+        let videoTokens = videoShape.frames * videoShape.height * videoShape.width
+        let half = videoTokens / 2
+        let video = MLX.concatenated([
+            MLXArray.full([1, half], values: MLXArray(sigmaVideo * 0.4)),
+            MLXArray.full([1, videoTokens - half], values: MLXArray(sigmaVideo))
+        ], axis: 1)
+        let audio = MLX.concatenated([
+            MLXArray.full([1, 1], values: MLXArray(Float(0))),
+            MLXArray.full([1, audioFrames - 1], values: MLXArray(sigmaAudio))
+        ], axis: 1)
+        return (video, audio)
+    }
+
     func relativeError(_ a: MLXArray, _ b: MLXArray) -> Float {
         let diff = MLX.abs(a.asType(.float32) - b.asType(.float32)).mean().item(Float.self)
         let scale = MLX.abs(b.asType(.float32)).mean().item(Float.self)
@@ -107,9 +128,7 @@ struct DualStreamAudioParityTests {
         let expectedVideo = try #require(tensors["output.video_velocity"]).asType(.float32)
         let expectedAudio = try #require(tensors["output.audio_velocity"]).asType(.float32)
 
-        let tokens = Self.videoShape.frames * Self.videoShape.height * Self.videoShape.width
-        let videoTimesteps = MLXArray.full([1, tokens], values: MLXArray(Self.sigmaVideo))
-        let audioTimesteps = MLXArray.full([1, Self.audioFrames], values: MLXArray(Self.sigmaAudio))
+        let (videoTimesteps, audioTimesteps) = Self.nonUniformTimesteps()
 
         let (videoOut, audioOut) = model(
             videoLatent: videoLatent,
@@ -130,60 +149,54 @@ struct DualStreamAudioParityTests {
         let audioErr = relativeError(audioOut, expectedAudio)
         print("PARITY av video output: relative error \(videoErr)")
         print("PARITY av audio output: relative error \(audioErr)")
-        #expect(videoErr < 0.02, "video stream diverges from the reference: \(videoErr)")
-        #expect(audioErr < 0.02, "audio stream diverges from the reference: \(audioErr)")
+        // 2e-4, matching TransformerParityTests's video-only threshold, not the
+        // family's usual 2%: this is a pure float32 synthetic model with no
+        // legitimate large noise source, and 2% was measured to still pass with
+        // the scale-shift collapsed-to-scalar regression present (1.1e-3 /
+        // 5.4e-3 against a clean baseline of ~1e-6) — exactly the insensitivity
+        // that let that bug ship unnoticed.
+        #expect(videoErr < 2e-4, "video stream diverges from the reference: \(videoErr)")
+        #expect(audioErr < 2e-4, "audio stream diverges from the reference: \(audioErr)")
     }
 
     /// Isolates the cross-modal AdaLN modules from the rest of the block stack:
     /// each is called exactly once per forward pass (shared by every block), so
     /// this pins down whether a divergence in the full-forward test above
-    /// originates in the AdaLN inputs (a sigma swap, a missing av_ca_factor) or
-    /// somewhere downstream in the block math itself. Feeds each module both
-    /// candidate inputs (this modality's own sigma, and the other modality's) so
-    /// a failure here names which one the reference actually used.
+    /// originates in the AdaLN inputs (own/cross sigma, a missing av_ca_factor,
+    /// a wrongly-collapsed per-token tensor) or somewhere downstream in the
+    /// block math itself. Feeds each module *exactly* the formula
+    /// `LTX2Transformer.callAsFunction` computes internally, so a shape
+    /// mismatch alone (own modality's token count vs. the reference's) is
+    /// enough to catch a regression back to a scalar-collapsed scale/shift.
     @Test func crossModalAdaLNInputsMatchReference() throws {
         let (tensors, _) = try MLX.loadArraysAndMetadata(
             url: URL(fileURLWithPath: Self.referencePath!))
         let model = try loadModel(tensors)
 
-        let scaleShiftMultiplier = MLXArray(Float(Self.config.timestepScaleMultiplier))
-        let ownVideo = MLXArray([Self.sigmaVideo]) * scaleShiftMultiplier
-        let ownAudio = MLXArray([Self.sigmaAudio]) * scaleShiftMultiplier
-        // av_ca_timestep_scale_multiplier defaults to 1 on both sides (matching
-        // the reference script), so the gate input is un-scaled sigma.
-        let gateVideo = MLXArray([Self.sigmaVideo])
-        let gateAudio = MLXArray([Self.sigmaAudio])
+        let (videoTimesteps, audioTimesteps) = Self.nonUniformTimesteps()
+        let scaleShiftMultiplier = Float(Self.config.timestepScaleMultiplier)
+        // Scale/shift: THIS modality's own per-token timesteps, unreduced.
+        let videoScaleShiftInput = (videoTimesteps * scaleShiftMultiplier).flattened()
+        let audioScaleShiftInput = (audioTimesteps * scaleShiftMultiplier).flattened()
+        // Gate: the OTHER modality's active scalar sigma (av_ca_factor = 1
+        // with the reference script's defaults, so no further scaling).
+        let scalarVideoSigma = videoTimesteps.max(axis: 1).flattened()
+        let scalarAudioSigma = audioTimesteps.max(axis: 1).flattened()
 
-        // Both candidates are checked and printed for every module — not just the
-        // one this test asserts on — so a future regression that swaps a pair
-        // back reads as a clean "matches the other candidate instead" rather
-        // than a bare threshold failure.
-        func checkAgainst(
-            _ name: String, own: MLXArray, cross: MLXArray, module: AdaLayerNormSingle, correctIsOwn: Bool
-        ) throws {
+        func check(_ name: String, _ module: AdaLayerNormSingle, _ input: MLXArray) throws {
             let ref = try #require(tensors["stage.\(name)"]).asType(.float32)
-            let (ownEmb, _) = module(own)
-            let (crossEmb, _) = module(cross)
-            MLX.eval(ownEmb, crossEmb)
-            let ownErr = relativeError(ownEmb, ref)
-            let crossErr = relativeError(crossEmb, ref)
-            print("PARITY av \(name): own-sigma relative error \(ownErr), cross-sigma relative error \(crossErr)")
-            let matchErr = correctIsOwn ? ownErr : crossErr
-            let expectedSide = correctIsOwn ? "own" : "cross"
-            let message = "\(name) should match \(expectedSide)-modality sigma: own \(ownErr), cross \(crossErr)"
-            #expect(matchErr < 0.02, "\(message)")
+            let (embedding, _) = module(input)
+            MLX.eval(embedding)
+            #expect(embedding.shape == ref.shape, "\(name) shape \(embedding.shape) vs ref \(ref.shape)")
+            guard embedding.shape == ref.shape else { return }
+            let err = relativeError(embedding, ref)
+            print("PARITY av \(name): relative error \(err)")
+            #expect(err < 2e-4, "\(name) diverges from the reference: \(err)")
         }
 
-        // Scale/shift AdaLNs take THIS modality's own sigma; the gate AdaLNs
-        // take the OTHER modality's — see the matching comment in
-        // LTX2Transformer.swift's cross-modal timestep embeddings section.
-        try checkAgainst("cross_scale_shift_video", own: ownVideo, cross: ownAudio,
-                          module: model.avCrossAttnVideoScaleShift, correctIsOwn: true)
-        try checkAgainst("cross_scale_shift_audio", own: ownAudio, cross: ownVideo,
-                          module: model.avCrossAttnAudioScaleShift, correctIsOwn: true)
-        try checkAgainst("cross_gate_a2v", own: gateVideo, cross: gateAudio,
-                          module: model.avCrossAttnVideoA2VGate, correctIsOwn: false)
-        try checkAgainst("cross_gate_v2a", own: gateAudio, cross: gateVideo,
-                          module: model.avCrossAttnAudioV2AGate, correctIsOwn: false)
+        try check("cross_scale_shift_video", model.avCrossAttnVideoScaleShift, videoScaleShiftInput)
+        try check("cross_scale_shift_audio", model.avCrossAttnAudioScaleShift, audioScaleShiftInput)
+        try check("cross_gate_a2v", model.avCrossAttnVideoA2VGate, scalarAudioSigma)
+        try check("cross_gate_v2a", model.avCrossAttnAudioV2AGate, scalarVideoSigma)
     }
 }

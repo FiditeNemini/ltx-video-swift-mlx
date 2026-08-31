@@ -180,10 +180,25 @@ else:  # VARIANT == "av"
     audio_latent = torch.randn(1, audio_tokens, AUDIO_CHANNELS, dtype=torch.float32)
     audio_context = torch.randn(1, TEXT_TOKENS, AUDIO_CAPTION_DIM, dtype=torch.float32)
 
+    # Per-token timesteps are deliberately NON-uniform (half the video tokens,
+    # and one of five audio tokens, held below the modality's active sigma —
+    # simulating I2V/keyframe/LipDub conditioning tokens mixed with real
+    # denoising ones). The cross-modal scale/shift AdaLN takes this full
+    # per-token tensor; a port that collapses it to one broadcast value (e.g.
+    # via max()) cannot reproduce this and would pass only by coincidence with
+    # uniform timesteps. `sigma` (the gate's input) is the modality's own
+    # *active* step sigma: SIGMA_VIDEO/SIGMA_AUDIO, matching the max of each
+    # per-token tensor — a real denoising token always carries the current
+    # step's sigma, while conditioning tokens sit strictly below it.
+    video_timesteps = torch.full((1, video_tokens), SIGMA_VIDEO, dtype=torch.float32)
+    video_timesteps[:, : video_tokens // 2] = SIGMA_VIDEO * 0.4
+    audio_timesteps = torch.full((1, audio_tokens), SIGMA_AUDIO, dtype=torch.float32)
+    audio_timesteps[:, 0] = 0.0
+
     video = Modality(
         latent=video_latent,
         sigma=torch.tensor([SIGMA_VIDEO], dtype=torch.float32),
-        timesteps=torch.full((1, video_tokens), SIGMA_VIDEO, dtype=torch.float32),
+        timesteps=video_timesteps,
         positions=video_state.positions,
         context=video_context,
         context_mask=torch.ones(1, TEXT_TOKENS, dtype=torch.float32),
@@ -191,7 +206,7 @@ else:  # VARIANT == "av"
     audio = Modality(
         latent=audio_latent,
         sigma=torch.tensor([SIGMA_AUDIO], dtype=torch.float32),
-        timesteps=torch.full((1, audio_tokens), SIGMA_AUDIO, dtype=torch.float32),
+        timesteps=audio_timesteps,
         positions=audio_state.positions,
         context=audio_context,
         context_mask=torch.ones(1, TEXT_TOKENS, dtype=torch.float32),

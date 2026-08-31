@@ -277,7 +277,13 @@ While debugging, two real bugs were discovered and fixed in `LTX2Transformer.for
 
 1. **Wrong source modality**: each cross-modal AdaLN was being fed its OWN modality's
    sigma. Python `MultiModalTransformerArgsPreprocessor.prepare(modality, cross_modality)`
-   actually feeds `cross_modality.sigma` (the OPPOSITE modality's scalar sigma).
+   actually feeds `cross_modality.sigma` (the OPPOSITE modality's scalar sigma) — **but
+   only for the GATE half of each AdaLN pair; the SCALE/SHIFT half wants the modality's
+   OWN sigma**. This fix pointed both halves the same way, which is itself wrong for
+   scale/shift — corrected 2026-08-31, see
+   [`docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md`](../../knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md)
+   for the full follow-up (including a second, independent fix: scale/shift also needs
+   to stay per-token instead of collapsing to one broadcast value per modality).
 2. **Missing `av_ca_factor` on gate input**: gate AdaLN was receiving `sigma * 1000`
    instead of `sigma * 1` (Python applies `av_ca_timestep_scale_multiplier /
    timestep_scale_multiplier = 1/1000` to the gate input only).
