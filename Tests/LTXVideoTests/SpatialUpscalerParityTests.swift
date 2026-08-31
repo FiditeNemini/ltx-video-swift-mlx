@@ -31,7 +31,8 @@ import MLXNN
 @testable import LTXVideo
 
 @Suite("Spatial upscaler parity vs the reference implementation",
-       .enabled(if: ProcessInfo.processInfo.environment["LTX25_SPATIAL_UPSCALER_REF"] != nil))
+       .enabled(if: ProcessInfo.processInfo.environment["LTX25_SPATIAL_UPSCALER_REF"] != nil),
+       .serialized)
 struct SpatialUpscalerParityTests {
 
     func env(_ key: String) -> String { ProcessInfo.processInfo.environment[key]! }
@@ -84,36 +85,48 @@ struct SpatialUpscalerParityTests {
     }
 
     /// Walks initial_conv, each pre-upsample res block, the resampler, each
-    /// post-upsample res block — reporting where the port first departs from
-    /// the reference. Intermediates stay in the port's native NDHWC layout;
-    /// the reference's NCDHW/NCHW taps are transposed to match before
-    /// comparing, never the other way, so a wrong transpose in this test
-    /// couldn't accidentally cancel a wrong transpose in the port.
+    /// post-upsample res block, and final_conv — reporting where the port
+    /// first departs from the reference. Intermediates stay in the port's
+    /// native NDHWC layout; the reference's NCDHW/NCHW taps are transformed
+    /// to match before comparing, never the other way, so a wrong transpose
+    /// in this test couldn't accidentally cancel a wrong transpose in the
+    /// port. `latent` is batch=2: the resampler's (batch, frame) fold below
+    /// is bit-identical under a swapped fold order at batch=1, so a real
+    /// N/D mix-up needs batch>1 to show up at all.
     @Test func bisectFirstDivergence() throws {
         let reference = try MLX.loadArrays(url: URL(fileURLWithPath: env("LTX25_SPATIAL_UPSCALER_REF")))
         let model = try loadUpscaler()
         let latent = reference["latent"]!.asType(.float32)  // (B, C, F, H, W), NCDHW
 
-        func checkTap5D(_ name: String, _ oursNDHWC: MLXArray) {
-            guard let refNCDHW = reference[name]?.asType(.float32) else { return }
-            let ref = refNCDHW.transposed(0, 2, 3, 4, 1)  // -> NDHWC
-            MLX.eval(oursNDHWC)
-            #expect(oursNDHWC.shape == ref.shape, "\(name) shape \(oursNDHWC.shape) vs ref \(ref.shape)")
-            guard oursNDHWC.shape == ref.shape else { return }
-            let err = relativeError(oursNDHWC, ref)
+        // 2e-4, not the family's usual 2%: this is a pure float32 model with
+        // no legitimate large noise source, and docs/knowledge/log.md's
+        // DualStreamAudioParityTests entry measured a real regression
+        // (0.11-0.54%) that a 2% threshold would have missed entirely.
+        let threshold: Float = 2e-4
+
+        func check(_ name: String, _ ours: MLXArray, ref refIn: MLXArray?) {
+            guard let ref = refIn else { return }
+            MLX.eval(ours)
+            #expect(ours.shape == ref.shape, "\(name) shape \(ours.shape) vs ref \(ref.shape)")
+            guard ours.shape == ref.shape else { return }
+            let err = relativeError(ours, ref)
             print("PARITY \(name): relative error \(err)")
-            #expect(err < 0.02, "\(name) diverges from the reference: \(err)")
+            #expect(err < threshold, "\(name) diverges from the reference: \(err)")
+        }
+        // Reference taps are NCDHW/NCHW; the port stays NDHWC/NHWC throughout.
+        func check5D(_ name: String, _ oursNDHWC: MLXArray) {
+            check(name, oursNDHWC, ref: reference[name]?.asType(.float32).transposed(0, 2, 3, 4, 1))
         }
 
         var h = latent.transposed(0, 2, 3, 4, 1)  // NCDHW -> NDHWC
         h = model.initialConv(h)
-        checkTap5D("initial_conv", h)  // reference hooks the bare Conv3d, before norm+SiLU
+        check5D("initial_conv", h)  // reference hooks the bare Conv3d, before norm+SiLU
         h = model.initialNorm(h)
         h = MLXNN.silu(h)
 
         for (i, block) in model.resBlocks.enumerated() {
             h = block(h)
-            checkTap5D("res_block\(i)", h)
+            check5D("res_block\(i)", h)
         }
 
         h = model.upsampler(h)  // (N, D, H*2, W*2, C), NDHWC
@@ -121,22 +134,16 @@ struct SpatialUpscalerParityTests {
         // fold N and D together and transpose to NHWC to match.
         let n = h.dim(0), d = h.dim(1), hh = h.dim(2), ww = h.dim(3), c = h.dim(4)
         let upsamplerPerFrame = h.reshaped([n * d, hh, ww, c])
-        if let refUpsampler = reference["upsampler"]?.asType(.float32) {
-            let ref = refUpsampler.transposed(0, 2, 3, 1)  // NCHW -> NHWC
-            MLX.eval(upsamplerPerFrame)
-            #expect(upsamplerPerFrame.shape == ref.shape,
-                    "upsampler shape \(upsamplerPerFrame.shape) vs ref \(ref.shape)")
-            if upsamplerPerFrame.shape == ref.shape {
-                let err = relativeError(upsamplerPerFrame, ref)
-                print("PARITY upsampler: relative error \(err)")
-                #expect(err < 0.02, "upsampler diverges from the reference: \(err)")
-            }
-        }
+        check("upsampler", upsamplerPerFrame,
+              ref: reference["upsampler"]?.asType(.float32).transposed(0, 2, 3, 1))
 
         for (i, block) in model.postResBlocks.enumerated() {
             h = block(h)
-            checkTap5D("post_res_block\(i)", h)
+            check5D("post_res_block\(i)", h)
         }
+
+        h = model.finalConv(h)
+        check5D("final_conv", h)
     }
 
     @Test func outputMatchesReference() throws {
@@ -148,8 +155,9 @@ struct SpatialUpscalerParityTests {
         MLX.eval(output)
         let refOutput = reference["output"]!.asType(.float32)
         #expect(output.shape == refOutput.shape, "output \(output.shape) vs ref \(refOutput.shape)")
+        guard output.shape == refOutput.shape else { return }
         let err = relativeError(output, refOutput)
         print("PARITY output relative error: \(err)")
-        #expect(err < 0.02, "spatial upscaler diverges from the reference: \(err)")
+        #expect(err < 2e-4, "spatial upscaler diverges from the reference: \(err)")
     }
 }

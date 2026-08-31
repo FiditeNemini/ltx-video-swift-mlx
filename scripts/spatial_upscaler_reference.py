@@ -43,7 +43,11 @@ assert not missing, "reference upsampler load incomplete — comparison would be
 model.eval().to(torch.float32)
 
 torch.manual_seed(0)
-latent = torch.randn(1, cfg["in_channels"], 3, 8, 8, dtype=torch.float32)
+# Batch=2, not 1: the resampler tap folds (batch, frames) into one axis on the
+# Swift side to compare against this per-frame (batch*frames, ...) tap — with
+# batch=1 that fold is bit-identical to a swapped fold order, so it can't
+# actually catch an N/D mix-up. Batch=2 makes the two orderings diverge.
+latent = torch.randn(2, cfg["in_channels"], 3, 8, 8, dtype=torch.float32)
 
 intermediates = {}
 def capture(name):
@@ -57,6 +61,7 @@ for i, block in enumerate(model.res_blocks):
 model.upsampler.register_forward_hook(capture("upsampler"))
 for i, block in enumerate(model.post_upsample_res_blocks):
     block.register_forward_hook(capture(f"post_res_block{i}"))
+model.final_conv.register_forward_hook(capture("final_conv"))
 
 with torch.no_grad():
     out = model(latent)

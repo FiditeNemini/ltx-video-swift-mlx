@@ -17,7 +17,16 @@
   *after* `initial_norm` + SiLU against a reference hook that fires on the
   bare `Conv3d` alone (73% relative error) — a reminder that a bisection
   harness's own tap placement needs the same scrutiny as the port it's
-  checking.
+  checking. A `/code-review` pass on the PR (no bugs found in the port
+  itself — three angles independently re-derived every transpose) hardened
+  the harness before merge: `final_conv` gained its own tap (previously
+  exercised only via the aggregate output number), the fixture moved to
+  batch=2 (batch=1 made the resampler's batch/frame fold order
+  undiscriminating — any fold order looks identical at batch=1), the
+  threshold tightened from 2% to 2e-4 (matching the lesson already on
+  record in this file's DualStreamAudioParityTests entries), and the
+  output-shape check gained a guard against a crash on mismatch instead of
+  a clean failure.
 
 ## 2026-08-31 (3)
 
