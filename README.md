@@ -36,13 +36,27 @@ Grab the latest release binary from the [Releases page](https://github.com/Vince
 
 > **Important**: Use `xcodebuild` (not `swift build`) to run the CLI. MLX requires Metal shaders (`default.metallib`) that are only bundled correctly by `xcodebuild`. `swift build` works for syntax checking but the resulting binary will fail at runtime with a "metallib not found" error. See [#3](https://github.com/VincentGourbin/ltx-video-swift-mlx/issues/3).
 
+A plain Xcode install may not include the Metal Toolchain component the build needs. Install it first, then verify:
+
+```bash
+sudo xcodebuild -downloadComponent MetalToolchain
+xcrun metal --version
+```
+
+If it's missing, the build fails with `error: cannot execute tool 'metal' due to missing Metal Toolchain`.
+
 ```bash
 git clone https://github.com/VincentGourbin/ltx-video-swift-mlx.git
 cd ltx-video-swift-mlx
 
-# Build Release
+# Build Release. The two -skip flags are required for a non-interactive build:
+# mlx-swift ships a build plugin and mlx-swift-lm ships macros, both of which
+# need approval that a non-interactive build can't give — without them the
+# build stops asking to validate the "CudaBuild" plugin or enable the
+# "MLXHuggingFaceMacros" macro.
 xcodebuild -scheme ltx-video -configuration Release -derivedDataPath .xcodebuild \
-  -destination 'platform=macOS' build
+  -destination 'platform=macOS' \
+  -skipPackagePluginValidation -skipMacroValidation build
 
 # Run from the build directory (required — the metallib bundle must be alongside the binary)
 .xcodebuild/Build/Products/Release/ltx-video generate "A cat" -w 768 -h 512 -f 121
