@@ -53,13 +53,35 @@ implement.
 
 # Fix
 
-`BigVGANWeightLoader.load` now casts every loaded parameter to float32 after
-`model.update(parameters:)`, immediately before the coverage `eval`:
+`BigVGANWeightLoader.load` now casts every checkpoint value to float32 before
+the single `model.update(parameters:)` call:
 
 ```swift
-let float32Params = model.parameters().flattened().map { ($0.0, $0.1.asType(.float32)) }
-model.update(parameters: ModuleParameters.unflattened(Dictionary(uniqueKeysWithValues: float32Params)))
+for key in updates.keys { updates[key] = updates[key]!.asType(.float32) }
+model.update(parameters: ModuleParameters.unflattened(updates))
 ```
+
+# Real end-to-end sanity check
+
+Built the Release binary at both the pre-fix commit (a `git worktree` at
+`dd90c67d`) and the fix, and ran the identical real generation on each —
+`generate "A woman singing a short melody in a sunlit room, close-up of her
+mouth" --model 2.5-distilled --audio --frames 49 --width 512 --height 512
+--seed 42`, same weights, same seed. Unlike
+[wrong-vocoder-lost-the-top-octave.md](wrong-vocoder-lost-the-top-octave.md)
+— a *structural* bug (the wrong module entirely) that showed up as missing
+frequency bands — this is a *precision* bug (bf16 rounding noise compounding
+through the conv chain), and the two read very differently on a real
+waveform: per-band FFT energy across 0-24 kHz matched to within 0.02-0.04 dB
+in every band except the top octave (20-24 kHz, where absolute energy is
+three orders of magnitude below the bass band and dB is correspondingly
+noisy), and RMS/peak were unchanged to 4 decimal places. The two waveforms
+still differ sample-by-sample — mean absolute difference relative to the
+fixed waveform's own mean magnitude is 1.56%, the same order as the
+pre-fix `waveform` parity error (2.05e-2) measured against the Python
+reference — but that difference reads as *added grain*, not missing content:
+plausible enough on a single listen that this class of bug can live
+undetected exactly as long as it did.
 
 # Citations
 
