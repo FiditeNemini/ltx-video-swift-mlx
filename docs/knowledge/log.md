@@ -1,5 +1,33 @@
 # Directory Update Log
 
+## 2026-08-31 (4)
+
+* **Validation**: Sub-task 6 of issue #57 — the last of the six —
+  `SpatialUpscalerParityTests` pins `SpatialUpscaler` (the second stage of
+  every two-stage generation, LipDub, and the IC-LoRA v2v path) against
+  Lightricks' own config-driven `LatentUpsampler`
+  (`scripts/spatial_upscaler_reference.py`). This was the component the
+  plan flagged as most likely to hide a sub-task-1-style dimension-order
+  bug (the pixel-shuffle resampler's H/W-vs-shuffle-factor pairing can be
+  wrong without the output *shape* changing at all) — clean on the real
+  run: every stage (initial_conv, all 8 res blocks, the resampler, final
+  output) held at 7e-7-4e-6 against the reference. The only bug this
+  sub-task found was in the test itself, not the port: the first written
+  version of `bisectFirstDivergence` compared its `initial_conv` tap
+  *after* `initial_norm` + SiLU against a reference hook that fires on the
+  bare `Conv3d` alone (73% relative error) — a reminder that a bisection
+  harness's own tap placement needs the same scrutiny as the port it's
+  checking. A `/code-review` pass on the PR (no bugs found in the port
+  itself — three angles independently re-derived every transpose) hardened
+  the harness before merge: `final_conv` gained its own tap (previously
+  exercised only via the aggregate output number), the fixture moved to
+  batch=2 (batch=1 made the resampler's batch/frame fold order
+  undiscriminating — any fold order looks identical at batch=1), the
+  threshold tightened from 2% to 2e-4 (matching the lesson already on
+  record in this file's DualStreamAudioParityTests entries), and the
+  output-shape check gained a guard against a crash on mismatch instead of
+  a clean failure.
+
 ## 2026-08-31 (3)
 
 * **Correction (2nd)**: [Cross-modal AdaLN sigma swap](/docs/knowledge/investigations/crossmodal-adaln-sigma-swap-2026-05.md) —
