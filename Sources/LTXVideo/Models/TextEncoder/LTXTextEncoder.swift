@@ -602,6 +602,22 @@ class Embeddings1DConnector: Module {
         var x = hiddenStates
         var mask = attentionMask
 
+        // M5/macOS-26.2+-only workaround for mlx#3797 (see
+        // MLXNAXSplitKWorkaround): this connector's feed-forward down
+        // projection sits exactly on the buggy kernel's dispatch threshold.
+        // Casting to float32 makes the input match the split-K accumulator's
+        // hardcoded float32 dtype, sidestepping the mismatch. Every other
+        // machine keeps the exact bf16 path `ConnectorParityTests` measures.
+        // The cast is applied once, here — `replacePaddedWithLearnableRegisters`
+        // below derives its own output dtype from `hiddenStates.dtype` (already
+        // float32 at that point on affected hardware), and MLX's automatic
+        // dtype promotion (bf16 × float32 → float32) carries it through the
+        // rest of this function, so a second cast after that call would be a
+        // provable no-op, not additional safety.
+        if MLXNAXSplitKWorkaround.isAffectedHardware {
+            x = x.asType(.float32)
+        }
+
         // Replace padded positions with learnable registers (in original dtype)
         if let m = mask {
             let (newX, _) = try replacePaddedWithLearnableRegisters(
@@ -643,6 +659,17 @@ class Embeddings1DConnector: Module {
         x = MLXFast.rmsNorm(x, weight: normWeight, eps: normEps)
 
         let outMask = mask ?? MLXArray.zeros([x.dim(0), 1, 1, x.dim(1)])
+
+        // Restore the caller's dtype. On affected hardware `x` was widened to
+        // float32 above (NAX workaround); every sibling function in this file
+        // (normAndConcatPaddedBatch, normAndConcatPerTokenRMS) casts back to
+        // inputDtype before returning, and callers downstream of this one
+        // (VideoGemmaTextEncoderModel, LTXDurationHead, and the training loop's
+        // cached embeddings) rely on that contract — some of them, unlike the
+        // main generation pipeline, have no defensive re-cast of their own. A
+        // no-op (via MLXArray.asType's dtype-match short-circuit) whenever the
+        // workaround didn't fire, so this doesn't affect unaffected hardware.
+        x = x.asType(inputDtype)
 
         return (x, outMask)
     }
