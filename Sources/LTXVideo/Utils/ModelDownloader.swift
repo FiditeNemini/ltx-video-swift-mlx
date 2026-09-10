@@ -983,18 +983,44 @@ public actor ModelDownloader {
         }
     }
 
-    /// Get cache size in bytes
+    /// Get cache size in bytes.
+    ///
+    /// Walks with `atPath:` APIs (not the `URL`-based family) because a relocated
+    /// model's large weight files are replaced with file symlinks to an external
+    /// disk: `resourceValues(forKeys: [.fileSizeKey])` on a symlink reports the
+    /// link's own size (a few bytes), not its target's. Each symlinked entry is
+    /// resolved before reading its size; a symlink whose target is missing (e.g.
+    /// an unmounted external disk) contributes 0 rather than throwing.
     public func cacheSize() throws -> Int64 {
-        guard FileManager.default.fileExists(atPath: cacheDirectory.path) else {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: cacheDirectory.path) else {
             return 0
         }
 
-        let enumerator = FileManager.default.enumerator(at: cacheDirectory, includingPropertiesForKeys: [.fileSizeKey])
+        guard let enumerator = fm.enumerator(atPath: cacheDirectory.path) else {
+            return 0
+        }
 
         var totalSize: Int64 = 0
-        while let fileURL = enumerator?.nextObject() as? URL {
-            let attributes = try fileURL.resourceValues(forKeys: [.fileSizeKey])
-            totalSize += Int64(attributes.fileSize ?? 0)
+        for case let relativePath as String in enumerator {
+            let itemPath = cacheDirectory.appendingPathComponent(relativePath).path
+            guard let attrs = try? fm.attributesOfItem(atPath: itemPath) else { continue }
+
+            if (attrs[.type] as? FileAttributeType) == .typeSymbolicLink {
+                // `resolvingSymlinksInPath()` silently no-ops (returns the symlink's own
+                // path) when the target doesn't exist on disk — e.g. an unmounted
+                // external disk — which would leak the symlink's own near-zero size
+                // into the total. Read the link's raw target instead (no existence
+                // check) and resolve relative targets against the symlink's directory.
+                guard let rawTarget = try? fm.destinationOfSymbolicLink(atPath: itemPath) else { continue }
+                let targetPath = rawTarget.hasPrefix("/")
+                    ? rawTarget
+                    : URL(fileURLWithPath: itemPath).deletingLastPathComponent().appendingPathComponent(rawTarget).path
+                guard let targetAttrs = try? fm.attributesOfItem(atPath: targetPath) else { continue }
+                totalSize += (targetAttrs[.size] as? Int64) ?? 0
+            } else {
+                totalSize += (attrs[.size] as? Int64) ?? 0
+            }
         }
 
         return totalSize
